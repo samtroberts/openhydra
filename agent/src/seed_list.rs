@@ -38,6 +38,11 @@ use crate::tokenizer_index::{read_capped, refresh_delay, write_atomic};
 /// `.github/workflows/seed-list.yml` from `agent/data/seed-providers.json`.
 pub const DEFAULT_SEED_URL: &str = "https://dl.openhydra.co/seeds/index.json";
 
+/// The oldest seed list this build accepts, cached or fetched. A release raises it to the list
+/// published with it, so an older signed list (one still naming a seed since removed, served by a
+/// compromised bucket or CDN) can't be what a fresh install starts from.
+pub const MIN_SEQUENCE: u64 = 1;
+
 /// How often a gateway checks for a newer list after a good fetch (a conditional request).
 pub const REFRESH_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -215,6 +220,14 @@ fn retry_delay(failures: u32) -> Duration {
     }
 }
 
+/// `list`, unless it's older than `min` (see [`MIN_SEQUENCE`]).
+fn current_enough(list: SeedList, min: u64) -> Result<SeedList, String> {
+    if list.sequence < min {
+        return Err(format!("seed list #{} is older than this release accepts (#{min} or newer)", list.sequence));
+    }
+    Ok(list)
+}
+
 /// The gateway's current seed list: the newest of none, the last one fetched (kept in `cache`), and
 /// what [`SeedStore::refresh`] fetches.
 pub struct SeedStore {
@@ -233,7 +246,7 @@ impl SeedStore {
         let mut etag = None;
         if let Some(path) = &cache {
             if let Ok(text) = std::fs::read_to_string(path) {
-                match verify(&text, pinned) {
+                match verify(&text, pinned).and_then(|l| current_enough(l, MIN_SEQUENCE)) {
                     Ok(cached) => {
                         current = cached;
                         etag = std::fs::read_to_string(path.with_extension("etag")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -256,7 +269,7 @@ impl SeedStore {
 
     /// Adopt a published list if it verifies and is newer than the current one. Whether it was.
     pub fn offer(&self, published: &str, etag: Option<String>) -> Result<bool, String> {
-        let list = verify(published, &self.pinned)?;
+        let list = current_enough(verify(published, &self.pinned)?, MIN_SEQUENCE)?;
         let mut cur = self.current.write().unwrap_or_else(|e| e.into_inner());
         if list.sequence <= cur.sequence {
             if list.sequence == cur.sequence && etag.is_some() {
@@ -428,6 +441,16 @@ mod tests {
     }
 
     #[test]
+    fn a_list_older_than_the_release_accepts_is_refused() {
+        assert!(current_enough(list(3, vec![]), 3).is_ok());
+        assert!(current_enough(list(2, vec![seed(1, "removed")]), 3).unwrap_err().contains("#2 is older"));
+        // Fetched or cached, a list below this build's floor never becomes the current one.
+        let store = SeedStore::new(&pinned(), "https://example.invalid/seeds.json", None);
+        assert!(store.offer(&sign(&list(MIN_SEQUENCE - 1, vec![seed(1, "old")]), &key()).unwrap(), None).is_err());
+        assert!(store.current().seeds.is_empty());
+    }
+
+    #[test]
     fn a_failed_fetch_is_retried_soon_and_never_later_than_a_normal_refresh() {
         assert_eq!(retry_delay(0), REFRESH_EVERY);
         assert_eq!(retry_delay(1), Duration::from_secs(30));
@@ -438,6 +461,7 @@ mod tests {
     fn the_list_to_publish_is_signed_by_the_pinned_key_and_valid() {
         // What the seed-list workflow publishes: a gateway must accept it as is.
         let list = verify(include_str!("../data/seed-providers.json"), crate::tokenizer_index::PINNED_INDEX_KEY).unwrap();
-        assert!(list.sequence >= 1 && !list.seeds.is_empty());
+        // …and this build accepts it: MIN_SEQUENCE never runs ahead of the list it ships with.
+        assert!(list.sequence >= MIN_SEQUENCE && !list.seeds.is_empty());
     }
 }
