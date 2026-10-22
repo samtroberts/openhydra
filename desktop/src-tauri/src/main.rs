@@ -3602,13 +3602,15 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// Every screen was checked at 900×600 (2026-10-19): below it Share and Engines overflow.
+    /// Every screen was checked at 900×600 (2026-10-19; below 900 wide Share and Engines overflow),
+    /// and at 900×500 (2026-10-22): a 1366×768 screen at 125% leaves ~534 px for the content, so the
+    /// height stays at or under that.
     #[test]
     fn the_window_cant_shrink_below_the_size_every_screen_fits() {
         let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let w = &conf["app"]["windows"][0];
         let n = |k: &str| w[k].as_u64().unwrap_or_else(|| panic!("{k} missing"));
-        assert!(n("minWidth") >= 900 && n("minHeight") >= 600, "minimum {}×{}", n("minWidth"), n("minHeight"));
+        assert!(n("minWidth") >= 900 && (500..=530).contains(&n("minHeight")), "minimum {}×{}", n("minWidth"), n("minHeight"));
         assert!(n("width") >= n("minWidth") && n("height") >= n("minHeight"), "the default fits the minimum");
     }
 
