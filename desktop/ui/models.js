@@ -6,7 +6,7 @@
 // seenCount is read by the Providers view.
 import { $ } from "./dom";
 import { state, snap, engines } from "./state";
-import { AUTO_MODEL, pickerSelection, pickerLabel } from "./picker.js";
+import { AUTO_MODEL, pickerSelection, pickerLabel, looksLikeAuto } from "./picker.js";
 
 const STICKY_MS = 180000;
 const IDLE_MS = 130000;  // seen within this = "live"; IDLE_MS..STICKY_MS = "idle" (dimmed).
@@ -52,11 +52,12 @@ export function modelIdle(m) {
 export function netModels() {
   const now = Date.now();
   const net = Object.keys(seenModels).filter((m) => now - seenModels[m] < STICKY_MS);
-  return [...new Set([...net, ...localSharedModels()])].sort();
+  return [...new Set([...net, ...localSharedModels()])].filter((m) => !looksLikeAuto(m)).sort();
 }
 // Human-readable model name. Path-addressed engines (llama.cpp) report the model as an absolute
-// path (`/home/alice/models/Qwen3.5-9B-Q4_K_M.gguf`); show the GGUF basename minus the extension so
-// the operator's home dir / OS username never appears and the row stays readable. Ollama-style tags
+// path (`/home/alice/models/Qwen3.5-9B-Q4_K_M.gguf`); show the GGUF file name so the operator's
+// home dir / OS username never appears and the row stays readable. The `.gguf` stays: a peer's
+// `x/qwen3:8b.gguf` must not show as the `qwen3:8b` everyone else serves. Ollama-style tags
 // (`llama3.2:1b`) and other clean ids pass through untouched. Display-only — the raw id remains the
 // routing key everywhere it matters (see `curModel`, which reads the stored value, not the label).
 export function displayModelName(id) {
@@ -66,8 +67,7 @@ export function displayModelName(id) {
   // must pass through unchanged.
   const isPath = /\.gguf$/i.test(id) || /^([/~]|[A-Za-z]:[/\\])/.test(id);
   if (isPath) {
-    const base = id.split(/[/\\]/).pop() || id;
-    return base.replace(/\.gguf$/i, "");
+    return id.split(/[/\\]/).pop() || id;
   }
   return id;
 }

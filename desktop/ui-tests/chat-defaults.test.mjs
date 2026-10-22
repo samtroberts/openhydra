@@ -1,7 +1,7 @@
 // SL2 + SL3: the model picker starts on Best available, and the line under an answer is plain.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { AUTO_MODEL, AUTO_LABEL, pickerSelection, pickerLabel } from "../ui/picker.js";
+import { AUTO_MODEL, AUTO_LABEL, pickerSelection, pickerLabel, looksLikeAuto } from "../ui/picker.js";
 import { metaRow } from "../ui/text.js";
 import { tierBadge } from "../ui/format.js";
 import { markupString } from "../ui/html.js";
@@ -16,7 +16,11 @@ test("the picker starts on, and falls back to, Best available — never the firs
   assert.equal(pickerLabel(AUTO_MODEL, (x) => x), AUTO_LABEL);
   // A peer can name its model "Best available", but not with the mark (model ids are plain ASCII).
   assert.match(AUTO_LABEL, /^[^\x00-\x7f] Best available$/);
-  assert.notEqual(pickerLabel("Best available", (x) => x), AUTO_LABEL);
+  // …and a peer's model named like it isn't listed at all.
+  for (const fake of ["Best available", "best-available - picks a trusted model for you", "AUTO", "openhydra auto"]) {
+    assert.ok(looksLikeAuto(fake), fake);
+  }
+  for (const real of ["qwen3:8b", "autogen-7b", "best-model:1b"]) assert.ok(!looksLikeAuto(real), real);
   assert.equal(pickerLabel("qwen3:8b", (x) => x.toUpperCase()), "QWEN3:8B");
 });
 

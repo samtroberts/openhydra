@@ -6,6 +6,14 @@ export const AUTO_MODEL = "openhydra/auto";
 // in), so a peer that names its model "Best available" can't pass for it.
 export const AUTO_LABEL = "\u2726 Best available";
 
+/** Whether a model name reads like the auto choice ("best available", "auto", "openhydra/auto",
+ * in any case or punctuation): a peer's model named so is left out of the pickers, as it could
+ * only be there to pass for it. */
+export function looksLikeAuto(id) {
+  const n = String(id).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  return n.startsWith("best available") || n === "auto" || n === "openhydra auto";
+}
+
 /** The selection to keep, given the current one and the models live now: nothing when none is
  * live; the current one while it's still live (or is Best available); otherwise Best available. */
 export function pickerSelection(cur, models) {
