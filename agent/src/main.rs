@@ -781,6 +781,13 @@ struct ServeArgs {
     #[arg(long = "tokenizer-index-url")]
     tokenizer_index_url: Option<String>,
 
+    /// Where to fetch the signed list of OpenHydra's own providers from (`openhydra/auto` can pick a
+    /// model they serve for a user with no history yet; checked every 6 h; HTTPS, or http:// to
+    /// localhost). `off` trusts no seed. Default: OpenHydra's (dl.openhydra.co), or `off` with
+    /// `--public-relays off`.
+    #[arg(long = "seed-list-url")]
+    seed_list_url: Option<String>,
+
     /// Hugging Face base URL tokenizers are downloaded from (a mirror; HTTPS, or http:// to localhost).
     #[arg(long = "tokenizer-hf-base", default_value = openhydra_agent::hf_tokenizer::HF_BASE, hide = true)]
     tokenizer_hf_base: String,
@@ -793,6 +800,27 @@ struct ServeArgs {
 
     #[command(flatten)]
     byok: ByokArgs,
+}
+
+/// SL1: the signed list of OpenHydra's own providers (the last one fetched, refreshed every 6 h).
+/// `off` → none: `openhydra/auto` trusts no seed.
+fn seed_list(url: &str) -> Result<Option<std::sync::Arc<openhydra_agent::seed_list::SeedStore>>, String> {
+    use openhydra_agent::{seed_list, tokenizer_index};
+    if url == "off" {
+        return Ok(None);
+    }
+    if !openhydra_agent::registry_client::registry_url_allowed(url) {
+        return Err(format!("--seed-list-url {url}: HTTPS, or http:// to localhost"));
+    }
+    let store = std::sync::Arc::new(seed_list::SeedStore::new(
+        tokenizer_index::PINNED_INDEX_KEY,
+        url,
+        Some(tokenizer_index::openhydra_dir().join("seed-providers.json")),
+    ));
+    store.spawn_refresher(openhydra_agent::hf_tokenizer::download_client()?);
+    let list = store.current();
+    eprintln!("openhydra-agent: {} OpenHydra seed provider(s) in seed list #{}", list.seeds.len(), list.sequence);
+    Ok(Some(store))
 }
 
 /// W4: the signed tokenizer index (built-in copy, the last one fetched, refreshed daily) and the
@@ -1157,6 +1185,9 @@ fn run() -> Result<(), String> {
             // A private deployment fetches no index from OpenHydra unless told where to.
             if args.tokenizer_index_url.is_none() && private_deployment {
                 args.tokenizer_index_url = Some("off".into());
+            }
+            if args.seed_list_url.is_none() && private_deployment {
+                args.seed_list_url = Some("off".into());
             }
             serve(net, stats, economy, args)
         }
@@ -1695,6 +1726,7 @@ fn serve(
     settlement_chain_for(peg, true)?;
     let index_url = args.tokenizer_index_url.as_deref().unwrap_or(openhydra_agent::tokenizer_index::DEFAULT_INDEX_URL);
     let hf_tokenizers = hf_tokenizers(index_url, &args.tokenizer_hf_base, !args.no_tokenizer_downloads)?;
+    let seeds = seed_list(args.seed_list_url.as_deref().unwrap_or(openhydra_agent::seed_list::DEFAULT_SEED_URL))?;
     // Track A2-Logprob reference sets (opt-in). A bad file is a startup error, not a silent skip.
     let mut logprob_refs = Vec::new();
     for path in &args.logprob_reference {
@@ -1740,6 +1772,6 @@ fn serve(
             if args.assurance == "gate" { "enforced" } else { "reported, not enforced" }
         );
     }
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, args.audit_replay == "on", assurance)
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, seeds, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, args.audit_replay == "on", assurance)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

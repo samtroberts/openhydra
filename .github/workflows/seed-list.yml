@@ -1,0 +1,58 @@
+name: Seed list
+
+# Publish the signed seed list (agent/data/seed-providers.json, built with
+# `openhydra-agent registry seeds sign`) to the download bucket as seeds/index.json, which gateways
+# fetch every 6 h from https://dl.openhydra.co/seeds/index.json (SL1). Runs when the file changes on
+# main, or by hand. Gateways check the signature against the key built into them and only move to a
+# higher sequence; the job checks both first (.github/scripts/check-seed-list.sh), so a bad or stale
+# file is never put in place. Same R2 secrets and S3 endpoint as the tokenizer-index workflow.
+
+on:
+  push:
+    branches: [main]
+    paths: [agent/data/seed-providers.json]
+  workflow_dispatch:
+
+# Least privilege: the token only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: seed-list
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish seeds/index.json
+    # Only the public repository holds the R2 secrets (the private CI mirror has none).
+    if: github.repository == 'samtroberts/openhydra'
+    # Pinned: the check needs OpenSSL 3 and the upload the aws CLI, both on this image.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the signature, and that the sequence is above the published one
+        id: check
+        run: |
+          set -euo pipefail
+          out=$(.github/scripts/check-seed-list.sh agent/data/seed-providers.json agent/src/seed_list.rs \
+            agent/src/tokenizer_index.rs https://dl.openhydra.co/seeds/index.json)
+          echo "$out"
+          echo "action=$(echo "$out" | tail -1)" >> "$GITHUB_OUTPUT"
+      - name: Upload
+        if: steps.check.outputs.action == 'publish'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # Short cache: gateways revalidate with the ETag (a 304 when unchanged).
+          aws s3 cp agent/data/seed-providers.json "s3://${R2_BUCKET}/seeds/index.json" \
+            --endpoint-url "$EP" --content-type application/json --cache-control "public, max-age=300"
+          aws s3api head-object --bucket "$R2_BUCKET" --key seeds/index.json --endpoint-url "$EP" \
+            --query '{etag: ETag, size: ContentLength}'

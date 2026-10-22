@@ -305,20 +305,80 @@ fn is_auto_model(model: &str) -> bool {
     m.eq_ignore_ascii_case("auto") || m.eq_ignore_ascii_case(AUTO_MODEL_ID)
 }
 
+/// What a request needs from the model `openhydra/auto` picks for it (SL1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AutoNeeds {
+    /// The request offers tools (a coding agent): a model too small to call them reliably won't do.
+    tools: bool,
+}
+
+/// Which trusted source `openhydra/auto` took its model from (most trusted first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoStep {
+    Preferred,
+    OwnMachine,
+    Card,
+    Reputation,
+    Verified,
+    Seed,
+}
+
+impl AutoStep {
+    fn label(self) -> &'static str {
+        match self {
+            AutoStep::Preferred => "preferred",
+            AutoStep::OwnMachine => "own-machine",
+            AutoStep::Card => "card",
+            AutoStep::Reputation => "reputation",
+            AutoStep::Verified => "verified",
+            AutoStep::Seed => "seed",
+        }
+    }
+}
+
+/// Why `openhydra/auto` found nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoMiss {
+    /// No trusted source serves anything.
+    Nothing,
+    /// The request offers tools and every model a trusted source serves is too small for them
+    /// (sorted, deduplicated).
+    TooSmallForTools(Vec<String>),
+}
+
+/// Too small to call tools reliably: a model whose name gives its size as 4B parameters or fewer
+/// (the [`CostTier::Nano`](openhydra_protocol::weight::CostTier::Nano) class at 4-bit). A name with
+/// no size isn't judged: it may be anything, so it stays a candidate (after the sized ones).
+fn too_small_for_tools(model: &str) -> bool {
+    openhydra_protocol::weight::size_class_for_handle(model) == Some(openhydra_protocol::weight::CostTier::Nano)
+}
+
+/// Larger first: the size class a model's name gives, one above unsized names (0).
+fn size_rank(model: &str) -> u8 {
+    openhydra_protocol::weight::size_class_for_handle(model).map_or(0, |t| t.index() + 1)
+}
+
 /// Pure selection for `openhydra/auto`, most trusted source first:
 /// 1. the operator's preferred model (`OPENHYDRA_AUTO_MODEL`), if it is served;
 /// 2. a model this machine's own provider serves;
 /// 3. a model from an imported card;
 /// 4. a model served by a provider this node has earned reputation with (above neutral);
 /// 5. a model served by a provider this node has verified at A1 or above (its own audits and
-///    checks; a hardware-attested provider needs no history).
+///    checks; a hardware-attested provider needs no history);
+/// 6. a model a provider on the signed seed list serves (OpenHydra's own providers, SL1): what a
+///    brand-new user, with none of the above, starts from.
 ///
 /// When routing will hard-gate the request at an authenticity floor (`c.floor`), only providers at
 /// or above it count, at every step: picking a model whose providers all fall below it would only
-/// end in a refusal. Ties break alphabetically. `None` means nothing qualifies: the caller asks for
-/// an explicit model. There is no "most providers" step: announcing a model from several peer ids
-/// costs nothing, so a count is not trust.
-fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
+/// end in a refusal. A request that offers tools (`needs.tools`) skips models too small to call
+/// them ([`too_small_for_tools`]) at every step but the operator's own preference. Within a step
+/// the larger model wins (by the size its name gives), then the name. There is no "most providers"
+/// step: announcing a model from several peer ids costs nothing, so a count is not trust.
+fn pick_auto(
+    c: &crate::consumer::AutoCandidates,
+    preferred: Option<&str>,
+    needs: AutoNeeds,
+) -> Result<(String, AutoStep), AutoMiss> {
     use openhydra_protocol::model_id::is_valid_model_id;
     use openhydra_protocol::trust::AuthenticityTier;
     use std::collections::BTreeSet;
@@ -341,42 +401,92 @@ fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>)
         .collect();
     if let Some(p) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
         if cards.contains(p) || served(p) {
-            return Some(p.to_string());
+            return Ok((p.to_string(), AutoStep::Preferred));
         }
+    }
+    // Models a trusted source offered that were only skipped as too small for tools.
+    let mut too_small: BTreeSet<String> = BTreeSet::new();
+    let mut fits = |m: &str| {
+        if needs.tools && too_small_for_tools(m) {
+            too_small.insert(m.to_string());
+            return false;
+        }
+        true
+    };
+    // The best of `models` by (step key, size, name): the largest key, then the largest size, then
+    // the first name.
+    fn best<'a, K: PartialOrd + Copy>(models: impl Iterator<Item = (K, &'a str)>) -> Option<&'a str> {
+        let mut out: Option<(K, u8, &str)> = None;
+        for (k, m) in models {
+            let s = size_rank(m);
+            let better = out.is_none_or(|(bk, bs, bm)| k > bk || (k == bk && (s > bs || (s == bs && m < bm))));
+            if better {
+                out = Some((k, s, m));
+            }
+        }
+        out.map(|(_, _, m)| m)
     }
     if let Some(me) = c.self_provider.as_deref().filter(|s| !s.is_empty()) {
-        if let Some(own) = providers.iter().filter(|k| k.libp2p_peer_id == me).map(|k| &k.model_id).min() {
-            return Some(own.clone());
+        let own: Vec<&str> = providers.iter().filter(|k| k.libp2p_peer_id == me).map(|k| k.model_id.as_str()).filter(|m| fits(m)).collect();
+        if let Some(m) = best(own.into_iter().map(|m| ((), m))) {
+            return Ok((m.to_string(), AutoStep::OwnMachine));
         }
     }
-    if let Some(card) = cards.iter().next() {
-        return Some((*card).to_string());
+    let carded: Vec<&str> = cards.iter().copied().filter(|m| fits(m)).collect();
+    if let Some(m) = best(carded.into_iter().map(|m| ((), m))) {
+        return Ok((m.to_string(), AutoStep::Card));
     }
     let neutral = openhydra_protocol::verify::NEUTRAL_REPUTATION;
-    let mut best_rep: Option<(f64, &str)> = None;
-    for k in &providers {
-        let Some(&score) = c.earned.get(&(k.libp2p_peer_id.clone(), k.model_id.clone())) else {
-            continue;
-        };
-        if score > neutral
-            && best_rep.map_or(true, |(s, m)| score > s || (score == s && k.model_id.as_str() < m))
-        {
-            best_rep = Some((score, k.model_id.as_str()));
-        }
+    let reputed: Vec<(f64, &str)> = providers
+        .iter()
+        .filter_map(|k| c.earned.get(&(k.libp2p_peer_id.clone(), k.model_id.clone())).map(|&s| (s, k.model_id.as_str())))
+        .filter(|&(s, m)| s > neutral && fits(m))
+        .collect();
+    if let Some(m) = best(reputed.into_iter()) {
+        return Ok((m.to_string(), AutoStep::Reputation));
     }
-    if let Some((_, m)) = best_rep {
-        return Some(m.to_string());
+    let verified: Vec<(AuthenticityTier, &str)> = providers
+        .iter()
+        .map(|k| (tier_of(k), k.model_id.as_str()))
+        .filter(|&(t, m)| t >= AuthenticityTier::ReputationRedundant && fits(m))
+        .collect();
+    if let Some(m) = best(verified.into_iter()) {
+        return Ok((m.to_string(), AutoStep::Verified));
     }
-    let mut best_tier: Option<(AuthenticityTier, &str)> = None;
-    for k in &providers {
-        let t = tier_of(k);
-        if t >= AuthenticityTier::ReputationRedundant
-            && best_tier.map_or(true, |(bt, m)| t > bt || (t == bt && k.model_id.as_str() < m))
-        {
-            best_tier = Some((t, k.model_id.as_str()));
-        }
+    let seeded: Vec<&str> = providers
+        .iter()
+        .filter(|k| c.seeds.contains(&k.public_key.to_ascii_lowercase()))
+        .map(|k| k.model_id.as_str())
+        .filter(|m| fits(m))
+        .collect();
+    if let Some(m) = best(seeded.into_iter().map(|m| ((), m))) {
+        return Ok((m.to_string(), AutoStep::Seed));
     }
-    best_tier.map(|(_, m)| m.to_string())
+    if too_small.is_empty() {
+        Err(AutoMiss::Nothing)
+    } else {
+        Err(AutoMiss::TooSmallForTools(too_small.into_iter().collect()))
+    }
+}
+
+/// [`pick_auto`] for a request with no special needs: just the model.
+#[cfg(test)]
+fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
+    pick_auto(c, preferred, AutoNeeds::default()).ok().map(|(m, _)| m)
+}
+
+/// The reply when every model `auto` trusts is too small for a request's tools.
+fn too_small_for_tools_message(models: &[String]) -> String {
+    let mut list: Vec<String> = models.iter().take(10).map(|m| format!("`{m}`")).collect();
+    if models.len() > list.len() {
+        list.push("…".to_string());
+    }
+    format!(
+        "openhydra/auto: this request offers tools, and the only models it can trust are too small to \
+         call tools reliably (4B parameters or fewer: {}). Choose a larger model explicitly, or try \
+         again once one is online",
+        list.join(", ")
+    )
 }
 
 /// The reply when `auto` has nothing it trusts: name the models it could use instead.
@@ -399,6 +509,53 @@ fn no_auto_model_message(known: &[String]) -> String {
     )
 }
 
+/// How a request's model was chosen, sent back as [`ROUTE_HEADER`] (SL1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// The model the request named, served as asked.
+    Requested,
+    /// A BYOK-mapped model, served by its hosted backend.
+    Byok,
+    /// The `/model` pin of this session.
+    SessionPin,
+    /// `openhydra/auto` (or, on the Anthropic surface, an id OpenHydra doesn't serve): from this
+    /// source, and whether the request's tools ruled out models too small for them.
+    Auto(AutoStep, AutoNeeds),
+}
+
+/// The response header that says how the model was chosen (`requested`, `byok`, `session-pin`,
+/// `auto:<source>`, plus `; tools` when a tool request ruled out small models).
+pub const ROUTE_HEADER: &str = "x-openhydra-route";
+/// The response header naming the model that served (also in the body's `model`).
+pub const MODEL_HEADER: &str = "x-openhydra-model";
+
+impl Route {
+    fn header_value(self) -> String {
+        match self {
+            Route::Requested => "requested".into(),
+            Route::Byok => "byok".into(),
+            Route::SessionPin => "session-pin".into(),
+            Route::Auto(step, needs) => format!("auto:{}{}", step.label(), if needs.tools { "; tools" } else { "" }),
+        }
+    }
+}
+
+/// Add the route headers to a response. A model name that isn't a plain header value (a client's
+/// own odd id echoed back) is left out rather than sent mangled.
+fn with_route(mut resp: Response, model: &str, route: Route) -> Response {
+    use axum::http::HeaderValue;
+    let headers = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&route.header_value()) {
+        headers.insert(ROUTE_HEADER, v);
+    }
+    if model.len() <= 256 && model.bytes().all(|b| b.is_ascii_graphic()) {
+        if let Ok(v) = HeaderValue::from_str(model) {
+            headers.insert(MODEL_HEADER, v);
+        }
+    }
+    resp
+}
+
 /// Resolve the request's `model` to a concrete, served one. `known_models` is a blocking swarm
 /// read, so it runs on a blocking thread.
 ///
@@ -414,17 +571,18 @@ async fn resolve_model(
     fallback_unservable: bool,
     session_override: Option<&str>,
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
-) -> Result<String, String> {
+    needs: AutoNeeds,
+) -> Result<(String, Route), String> {
     let auto = is_auto_model(requested);
     // A concrete BYOK-mapped model is served directly (never announced on the swarm) — pass it
     // through untouched, and skip the discovery query entirely.
     if !auto && state.byok.provider_for(requested).is_some() {
-        return Ok(requested.to_string());
+        return Ok((requested.to_string(), Route::Byok));
     }
     // Fast path: a concrete model on the strict (OpenAI) surface needs no discovery query.
     // An explicit concrete model in the request always wins over any `/model` session pin.
     if !auto && !fallback_unservable {
-        return Ok(requested.to_string());
+        return Ok((requested.to_string(), Route::Requested));
     }
     let node = state.node.clone();
     let known = tokio::task::spawn_blocking(move || node.known_models())
@@ -433,14 +591,14 @@ async fn resolve_model(
         .map_err(|e| e)?;
     // A concrete model that's actually served is used as-is (also wins over a session pin).
     if !auto && known.iter().any(|m| m == requested) {
-        return Ok(requested.to_string());
+        return Ok((requested.to_string(), Route::Requested));
     }
     // Now we're picking (request said `auto`, or an unservable id on the Anthropic surface):
     // a `/model <id>` session pin wins next — but only if it's a concrete model currently served
     // (a stale/typo'd pin falls through to the auto default rather than erroring).
     if let Some(sel) = session_override.map(str::trim).filter(|s| !s.is_empty()) {
         if !is_auto_model(sel) && known.iter().any(|m| m == sel) {
-            return Ok(sel.to_string());
+            return Ok((sel.to_string(), Route::SessionPin));
         }
     }
     // …else the auto default (see `pick_auto_model` for the order).
@@ -449,7 +607,11 @@ async fn resolve_model(
     let candidates = tokio::task::spawn_blocking(move || node.auto_candidates(min_authenticity))
         .await
         .map_err(|_| "model resolution failed".to_string())??;
-    pick_auto_model(&candidates, preferred.as_deref()).ok_or_else(|| no_auto_model_message(&known))
+    match pick_auto(&candidates, preferred.as_deref(), needs) {
+        Ok((model, step)) => Ok((model, Route::Auto(step, needs))),
+        Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
+        Err(AutoMiss::TooSmallForTools(small)) => Err(too_small_for_tools_message(&small)),
+    }
 }
 
 // ── Slash-commands (`/models`, `/model <id>`, `/help`) ───────────────────────
@@ -939,7 +1101,7 @@ async fn chat_completions(
     let session_pin = state.sessions.get(&skey);
     let think = req.effective_think();
     let max_tokens = req.effective_max_tokens();
-    let (model, rx, started) = match spawn_dispatch(
+    let (model, route, rx, started) = match spawn_dispatch(
         &state,
         &headers,
         &req.model,
@@ -957,11 +1119,13 @@ async fn chat_completions(
         Err(e) => return dispatch_err_openai(e),
     };
 
-    if stream {
+    let served = model.clone();
+    let resp = if stream {
         stream_response(id, model, created, want_usage, rx, started, state.metrics.clone())
     } else {
         buffered_response(id, model, created, rx, started, state.metrics.clone()).await
-    }
+    };
+    with_route(resp, &served, route)
 }
 
 /// A dispatch failure that each API surface renders in its own error shape (OpenAI vs Anthropic).
@@ -1013,7 +1177,7 @@ async fn spawn_dispatch(
     temperature: Option<f64>,
     tools: Vec<Value>,
     think: Option<bool>,
-) -> Result<(String, EventRx, std::time::Instant), DispatchErr>
+) -> Result<(String, Route, EventRx, std::time::Instant), DispatchErr>
 {
     // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
     if let AupDecision::Deny(reason) = state.aup.evaluate(&messages, max_tokens) {
@@ -1039,7 +1203,8 @@ async fn spawn_dispatch(
     };
     // Resolve `openhydra/auto` (and, on the Anthropic surface, an unservable id) to a concrete
     // model. BYOK-mapped ids are recognised inside `resolve_model` so they're never rewritten.
-    let model = resolve_model(state, requested_model, fallback_unservable, session_override, min_authenticity)
+    let needs = AutoNeeds { tools: !tools.is_empty() };
+    let (model, route) = resolve_model(state, requested_model, fallback_unservable, session_override, min_authenticity, needs)
         .await
         .map_err(DispatchErr::NoModels)?;
     // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing the
@@ -1063,7 +1228,7 @@ async fn spawn_dispatch(
     } else {
         spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, gen_permit)
     };
-    Ok((model, rx, started))
+    Ok((model, route, rx, started))
 }
 
 /// Render a [`DispatchErr`] as an OpenAI-shaped error response.
@@ -1636,7 +1801,7 @@ async fn messages(
     // usual. A `/model` session pin steers that bridged/`auto` case. All inside spawn_dispatch (the
     // permit bounds the discovery query). Resolved model echoed back in the response.
     let session_pin = state.sessions.get(&skey);
-    let (model, rx, started) = match spawn_dispatch(
+    let (model, route, rx, started) = match spawn_dispatch(
         &state,
         &headers,
         &req.model,
@@ -1656,11 +1821,13 @@ async fn messages(
         Err(e) => return dispatch_err_anthropic(e),
     };
 
-    if stream {
+    let served = model.clone();
+    let resp = if stream {
         anthropic_stream_response(id, model, rx, started, state.metrics.clone())
     } else {
         anthropic_buffered_response(id, model, rx, started, state.metrics.clone()).await
-    }
+    };
+    with_route(resp, &served, route)
 }
 
 async fn anthropic_buffered_response(
@@ -2171,6 +2338,7 @@ pub fn router(
     embeddings_cfg: EmbeddingConfig,
     self_provider: Option<String>,
     cards: Option<Arc<crate::cards::CardStore>>,
+    seeds: Option<Arc<crate::seed_list::SeedStore>>,
     creds: Option<Arc<crate::swarms::CredentialStore>>,
     provider_attest: Option<Vec<[u8; 32]>>,
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
@@ -2205,6 +2373,7 @@ pub fn router(
         .with_stats(stats)
         .with_self_provider(self_provider)
         .with_cards(cards)
+        .with_seeds(seeds)
         .with_credentials(creds)
         .with_settlement_peg(settlement_peg)
         // The on-chain deployment paying receipts settle on (validated at startup in `serve`).
@@ -2312,6 +2481,7 @@ pub fn serve_http(
     embeddings_cfg: EmbeddingConfig,
     self_provider: Option<String>,
     cards: Option<Arc<crate::cards::CardStore>>,
+    seeds: Option<Arc<crate::seed_list::SeedStore>>,
     creds: Option<Arc<crate::swarms::CredentialStore>>,
     provider_attest: Option<Vec<[u8; 32]>>,
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
@@ -2324,7 +2494,7 @@ pub fn serve_http(
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local = listener.local_addr()?;
-        let mut app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, audit_replay, assurance);
+        let mut app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, seeds, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, audit_replay, assurance);
         // A loopback-only gateway answers only requests addressed to loopback (DNS rebinding:
         // a web page can point its own host name at 127.0.0.1, but not change the Host header the
         // browser sends). A gateway bound to a LAN/public address is reached by other names, so it
@@ -2483,6 +2653,7 @@ mod tests {
             false,
             ByokConfig::empty(),
             EmbeddingConfig::empty(),
+            None,
             None,
             None,
             None,
@@ -2676,6 +2847,83 @@ mod tests {
         assert_eq!(pick_auto_model(&c, None).as_deref(), Some("strong"));
         c.floor = Some(HardwareAttested);
         assert_eq!(pick_auto_model(&c, None), None);
+    }
+
+    fn seed_kp(model: &str, lib: &str, key: &str) -> openhydra_network::types::KnownProvider {
+        openhydra_network::types::KnownProvider { public_key: key.into(), ..kp(model, lib, lib) }
+    }
+
+    #[test]
+    fn a_tool_request_skips_models_too_small_for_tools() {
+        let tools = AutoNeeds { tools: true };
+        let mut c = cands(vec![kp("llama3.2:1b", "a", "12D3A"), kp("qwen3:8b", "b", "12D3B")]);
+        c.earned.insert(("12D3A".into(), "llama3.2:1b".into()), 90.0);
+        c.earned.insert(("12D3B".into(), "qwen3:8b".into()), 60.0);
+        // Without tools the better-reputed provider's model wins, however small.
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Ok(("llama3.2:1b".into(), AutoStep::Reputation)));
+        // A coding agent's request (tools) never lands on the 1B model.
+        assert_eq!(pick_auto(&c, None, tools), Ok(("qwen3:8b".into(), AutoStep::Reputation)));
+        // Only small models trusted: a clear refusal naming them, not a 1B answer.
+        c.earned.remove(&("12D3B".to_string(), "qwen3:8b".to_string()));
+        assert_eq!(pick_auto(&c, None, tools), Err(AutoMiss::TooSmallForTools(vec!["llama3.2:1b".into()])));
+        assert!(too_small_for_tools_message(&["llama3.2:1b".into()]).contains("`llama3.2:1b`"));
+        // A name with no size isn't judged; 4B and below is too small; above isn't.
+        assert!(!too_small_for_tools("llama3.2") && too_small_for_tools("qwen3:4b") && !too_small_for_tools("qwen3:8b"));
+        // The operator's own preference is honoured as asked.
+        assert_eq!(pick_auto(&c, Some("llama3.2:1b"), tools), Ok(("llama3.2:1b".into(), AutoStep::Preferred)));
+    }
+
+    #[test]
+    fn within_a_source_the_larger_model_wins() {
+        let mut c = cands(vec![kp("llama3.2:1b", "me", "12D3Me"), kp("qwen3:14b", "me", "12D3Me"), kp("aaa-unsized", "me", "12D3Me")]);
+        c.self_provider = Some("12D3Me".into());
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("qwen3:14b"), "not the alphabetically first");
+        c.self_provider = None;
+        c.card_models = vec!["gemma3:1b".into(), "qwen3:8b".into()];
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("qwen3:8b"));
+    }
+
+    #[test]
+    fn a_newcomer_gets_a_model_an_openhydra_seed_serves() {
+        let seed_key = "ab".repeat(32);
+        let mut c = cands(vec![
+            seed_kp("qwen3:8b", "12D3Seed", &seed_key),
+            kp("qwen3:32b", "evil", "12D3Evil"),
+            kp("llama3.2:1b", "x", "12D3X"),
+        ]);
+        // No seed list: nothing is trusted, as before.
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Err(AutoMiss::Nothing));
+        // With it, the seed's model — never the bigger one an unknown peer announces.
+        c.seeds.insert(seed_key.clone());
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Ok(("qwen3:8b".into(), AutoStep::Seed)));
+        assert_eq!(pick_auto(&c, None, AutoNeeds { tools: true }), Ok(("qwen3:8b".into(), AutoStep::Seed)));
+        // A key announced in upper case still matches.
+        c.providers[0].public_key = seed_key.to_uppercase();
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("qwen3:8b"));
+        // The user's own history comes first.
+        c.earned.insert(("12D3X".into(), "llama3.2:1b".into()), 70.0);
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Ok(("llama3.2:1b".into(), AutoStep::Reputation)));
+        // …unless it's too small for the request's tools: then the seed's model.
+        assert_eq!(pick_auto(&c, None, AutoNeeds { tools: true }), Ok(("qwen3:8b".into(), AutoStep::Seed)));
+        // A seed below the request's authenticity floor is skipped like any provider.
+        c.floor = Some(openhydra_protocol::trust::AuthenticityTier::ReputationRedundant);
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Err(AutoMiss::Nothing));
+    }
+
+    #[test]
+    fn the_route_header_says_how_the_model_was_chosen() {
+        assert_eq!(Route::Requested.header_value(), "requested");
+        assert_eq!(Route::Byok.header_value(), "byok");
+        assert_eq!(Route::SessionPin.header_value(), "session-pin");
+        assert_eq!(Route::Auto(AutoStep::Seed, AutoNeeds::default()).header_value(), "auto:seed");
+        assert_eq!(Route::Auto(AutoStep::OwnMachine, AutoNeeds { tools: true }).header_value(), "auto:own-machine; tools");
+        let resp = with_route(StatusCode::OK.into_response(), "qwen3:8b", Route::Auto(AutoStep::Card, AutoNeeds::default()));
+        assert_eq!(resp.headers()[ROUTE_HEADER], "auto:card");
+        assert_eq!(resp.headers()[MODEL_HEADER], "qwen3:8b");
+        // A client's odd model id is not echoed into a header.
+        let resp = with_route(StatusCode::OK.into_response(), "my model\u{7}", Route::Requested);
+        assert!(resp.headers().get(MODEL_HEADER).is_none());
+        assert_eq!(resp.headers()[ROUTE_HEADER], "requested");
     }
 
     #[test]

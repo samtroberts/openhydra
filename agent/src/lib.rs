@@ -47,6 +47,7 @@ pub mod provider;
 pub mod ratelimit;
 pub mod receipt;
 pub mod registry_client;
+pub mod seed_list;
 pub mod serve;
 pub mod settlement_config;
 pub mod share_policy;

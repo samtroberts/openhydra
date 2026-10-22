@@ -28,6 +28,7 @@ use clap::{Args, Subcommand};
 use ed25519_dalek::SigningKey;
 use openhydra_agent::prompt_score::load_reference;
 use openhydra_agent::registry_client::pack_reply;
+use openhydra_agent::seed_list;
 use openhydra_agent::tokenizer_index::{self, TokenizerIndex};
 use openhydra_protocol::logprob::{normalize_weights_digest, ModelIdentity};
 use openhydra_protocol::refpool::{sign_pack, BatchStatus, PoolError, RefPool};
@@ -67,6 +68,67 @@ enum RegistryAction {
     /// Build, sign and check the tokenizer index (which Hugging Face tokenizer counts each model's
     /// tokens; gateways fetch it from the CDN).
     Index(IndexArgs),
+    /// Build and sign the seed list: the providers OpenHydra runs, whose models `openhydra/auto`
+    /// may pick for a user with no history yet (gateways fetch it from the CDN).
+    Seeds(SeedsArgs),
+}
+
+#[derive(Args)]
+struct SeedsArgs {
+    #[command(subcommand)]
+    action: SeedsAction,
+}
+
+#[derive(Subcommand)]
+enum SeedsAction {
+    /// Add a provider (or relabel one) in the working file (created if missing).
+    Add(SeedsAddArgs),
+    /// Remove a provider from the working file.
+    Remove(SeedsRemoveArgs),
+    /// Sign the working file with the registry key (raising its sequence) into the file to publish.
+    Sign(SeedsSignArgs),
+}
+
+#[derive(Args)]
+struct SeedsFileArg {
+    /// The working (unsigned) seed list.
+    #[arg(long)]
+    file: PathBuf,
+}
+
+#[derive(Args)]
+struct SeedsAddArgs {
+    #[command(flatten)]
+    file: SeedsFileArg,
+    /// The provider's identity file (the `--identity` it runs with); only its public key is read.
+    #[arg(long, conflicts_with = "public_key", required_unless_present = "public_key")]
+    identity: Option<PathBuf>,
+    /// The provider's Ed25519 public key (64 hex digits), instead of --identity.
+    #[arg(long)]
+    public_key: Option<String>,
+    /// What it is ("OpenHydra seed, us-east-1").
+    #[arg(long)]
+    label: String,
+}
+
+#[derive(Args)]
+struct SeedsRemoveArgs {
+    #[command(flatten)]
+    file: SeedsFileArg,
+    /// The provider's Ed25519 public key (64 hex digits).
+    #[arg(long)]
+    public_key: String,
+}
+
+#[derive(Args)]
+struct SeedsSignArgs {
+    #[command(flatten)]
+    dir: DirArg,
+    #[command(flatten)]
+    file: SeedsFileArg,
+    /// The signed list to write (publish this file).
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(Args)]
@@ -317,6 +379,7 @@ pub fn run(args: RegistryArgs) -> Result<(), String> {
         },
         RegistryAction::Serve(a) => serve(a),
         RegistryAction::Index(i) => index(i.action),
+        RegistryAction::Seeds(a) => seeds(a.action),
     }
 }
 
@@ -393,6 +456,66 @@ fn index(action: IndexAction) -> Result<(), String> {
                 println!("{m}");
             }
             eprintln!("registry: {} of {} model names have no tokenizer entry", missing.len(), models.len());
+            Ok(())
+        }
+    }
+}
+
+// ── seed list ──
+
+fn read_working_seeds(path: &Path) -> Result<seed_list::SeedList, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(seed_list::SeedList::empty()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn seeds(action: SeedsAction) -> Result<(), String> {
+    match action {
+        SeedsAction::Add(a) => {
+            let public_key = match (&a.identity, &a.public_key) {
+                (Some(path), _) => {
+                    // Read-only: a missing file is an error, never a new identity.
+                    let id = openhydra_network::identity::Identity::load(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                    let ed = id.keypair.public().try_into_ed25519().map_err(|e| format!("{}: not an Ed25519 key ({e})", path.display()))?;
+                    eprintln!("registry: {} is peer {}", path.display(), id.libp2p_peer_id);
+                    hex::encode(ed.to_bytes())
+                }
+                (None, Some(k)) => k.clone(),
+                (None, None) => unreachable!("clap requires one"),
+            };
+            let mut list = read_working_seeds(&a.file.file)?;
+            list.upsert(seed_list::Seed { public_key, label: a.label })?;
+            write_json(&a.file.file, &serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?)?;
+            eprintln!("registry: {} seed(s) in {}", list.seeds.len(), a.file.file.display());
+            Ok(())
+        }
+        SeedsAction::Remove(a) => {
+            let mut list = read_working_seeds(&a.file.file)?;
+            if !list.remove(&a.public_key) {
+                return Err(format!("{} lists no seed {}", a.file.file.display(), a.public_key));
+            }
+            write_json(&a.file.file, &serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?)
+        }
+        SeedsAction::Sign(a) => {
+            let key = load_key(&a.dir.dir)?;
+            let mut list = read_working_seeds(&a.file.file)?;
+            // Always above what was published last: gateways never take a lower sequence.
+            let published = std::fs::read_to_string(&a.out)
+                .ok()
+                .and_then(|t| seed_list::verify(&t, &hex::encode(key.verifying_key().to_bytes())).ok())
+                .map_or(0, |p| p.sequence);
+            list.sequence = list.sequence.max(published) + 1;
+            list.issued_ms = now_ms();
+            let signed = seed_list::sign(&list, &key)?;
+            write_json(&a.file.file, &serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?)?;
+            write_json(&a.out, &signed)?;
+            let pinned = hex::encode(key.verifying_key().to_bytes());
+            if pinned != tokenizer_index::PINNED_INDEX_KEY {
+                eprintln!("registry: note — this key ({pinned}) isn't the one this build pins; gateways will refuse the list");
+            }
+            eprintln!("registry: signed seed list #{} ({} seeds) → {}", list.sequence, list.seeds.len(), a.out.display());
             Ok(())
         }
     }

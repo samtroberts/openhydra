@@ -1681,6 +1681,10 @@ pub struct ConsumerNode {
     /// M2: imported `.openhydra` cards — verified providers pinned locally and dialable by peer id
     /// without live discovery. Merged into the candidate set in `serve_once`. `None` = no store.
     cards: Option<Arc<crate::cards::CardStore>>,
+    /// SL1: the signed list of providers OpenHydra runs ([`crate::seed_list`]). A model a seed
+    /// serves is one `openhydra/auto` may pick, and a seed starts a little above an unknown provider
+    /// in ranking. `None` = no list (a private deployment).
+    seeds: Option<Arc<crate::seed_list::SeedStore>>,
     /// M4-base: our held swarm membership credentials, attached to a serve request so a provider will
     /// serve its private (swarm-scoped) model. `None` = we hold none / private routing off.
     creds: Option<Arc<crate::swarms::CredentialStore>>,
@@ -1767,6 +1771,11 @@ pub struct ConsumerNode {
     served_paid: Mutex<HashMap<String, u64>>,
 }
 
+/// SL1: the reputation a seed provider is ranked at before this node has any history with it —
+/// above neutral (50), so it goes ahead of an unknown provider of the same model, and far below
+/// what a provider that has served this node well earns.
+pub const SEED_START_REPUTATION: f64 = 60.0;
+
 /// Inputs to the gateway's `openhydra/auto` choice ([`ConsumerNode::auto_candidates`]).
 #[derive(Debug, Clone, Default)]
 pub struct AutoCandidates {
@@ -1785,6 +1794,8 @@ pub struct AutoCandidates {
     /// The authenticity floor routing will hard-gate this request on (the node's policy, raised by
     /// the request's own), if any: a model whose providers all fall below it would be refused.
     pub floor: Option<AuthenticityTier>,
+    /// The public keys (lower-case hex) of the providers on the signed seed list (SL1).
+    pub seeds: std::collections::HashSet<String>,
 }
 
 /// Why a serve is being settled: a request the user made, or a check this node ran on its own (an
@@ -1907,6 +1918,7 @@ impl ConsumerNode {
             self_provider: None,
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
+            seeds: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
@@ -2216,6 +2228,17 @@ impl ConsumerNode {
         self
     }
 
+    /// SL1: attach the seed list (builder form). `None` leaves seeds untrusted.
+    pub fn with_seeds(mut self, seeds: Option<Arc<crate::seed_list::SeedStore>>) -> Self {
+        self.seeds = seeds;
+        self
+    }
+
+    /// The public keys (lower-case hex) of the providers on the current seed list.
+    fn seed_keys(&self) -> std::collections::HashSet<String> {
+        self.seeds.as_ref().map(|s| s.current().public_keys()).unwrap_or_default()
+    }
+
     /// M4-base: attach our swarm membership credential store, so `serve_once` presents a credential to
     /// reach a provider's private model (builder form). `None` leaves private routing off.
     pub fn with_credentials(mut self, creds: Option<Arc<crate::swarms::CredentialStore>>) -> Self {
@@ -2269,6 +2292,7 @@ impl ConsumerNode {
             self_provider: None,
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
+            seeds: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
@@ -2894,7 +2918,7 @@ impl ConsumerNode {
         let policy = request_policy(self.assurance, requested);
         let floor = (policy.mode == PolicyMode::HardGate && policy.min_authenticity > AuthenticityTier::SelfReported)
             .then_some(policy.min_authenticity);
-        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, earned, tiers, floor }
+        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, earned, tiers, floor, seeds: self.seed_keys() }
     }
 
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
@@ -3061,11 +3085,19 @@ impl ConsumerNode {
             .filter(|p| self.is_self_serve(&p.libp2p_peer_id))
             .map(|p| provider_state_id(&p.peer_id, &p.public_key))
             .collect();
+        // SL1: a provider on the signed seed list starts a little above an unknown one; this node's
+        // own history with it (`earned_reputation`) overrides that, as it does neutral.
+        let seed_keys = self.seed_keys();
+        let seeds: std::collections::HashSet<String> = peers
+            .iter()
+            .filter(|p| seed_keys.contains(&p.public_key.to_ascii_lowercase()))
+            .map(|p| provider_state_id(&p.peer_id, &p.public_key))
+            .collect();
         let mut candidates = rank_providers_with_assurance(
             &peers,
             "",
             self.tier,
-            &|pid, mkey| self.earned_reputation(pid, mkey, now),
+            &|pid, mkey| self.earned_reputation(pid, mkey, now).or_else(|| seeds.contains(pid).then_some(SEED_START_REPUTATION)),
             &|pid, mkey| if own.contains(pid) { AuthenticityTier::HardwareAttested } else { self.authenticity_of(pid, mkey, now) },
             policy,
         );
@@ -6520,6 +6552,24 @@ mod tests {
         let ranked = rank_providers_with_reputation(&peers, TPL_A, 2, &earned);
         let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
         assert_eq!(ids, vec!["good", "bad"], "low earned reputation must rank a provider last");
+    }
+
+    #[test]
+    fn a_seed_ranks_above_an_unknown_provider_but_below_one_that_served_us_well() {
+        // serve_once's lookup: this node's history, else the seed start for a seed, else neutral.
+        let peers = vec![discovered("unknown", TPL_A, 20.0), discovered("seed", TPL_A, 20.0), discovered("good", TPL_A, 20.0)];
+        let lookup = |history: Option<f64>| {
+            move |pid: &str, _m: &str| match pid {
+                "good" => history,
+                "seed" => Some(SEED_START_REPUTATION),
+                _ => None,
+            }
+        };
+        let ids = |r: Vec<SelectedProvider>| r.into_iter().map(|p| p.peer_id).collect::<Vec<_>>();
+        let first = |h| ids(rank_providers_with_reputation(&peers, TPL_A, 2, &lookup(h)))[0].clone();
+        assert_eq!(first(None), "seed", "a seed goes ahead of providers this node knows nothing about");
+        assert_eq!(first(Some(90.0)), "good", "history this node earned outranks the seed start");
+        assert!(SEED_START_REPUTATION > openhydra_protocol::verify::NEUTRAL_REPUTATION);
     }
 
     #[test]
