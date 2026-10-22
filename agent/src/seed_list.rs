@@ -38,9 +38,11 @@ use crate::tokenizer_index::{read_capped, refresh_delay, write_atomic};
 /// `.github/workflows/seed-list.yml` from `agent/data/seed-providers.json`.
 pub const DEFAULT_SEED_URL: &str = "https://dl.openhydra.co/seeds/index.json";
 
-/// The oldest seed list this build accepts, cached or fetched. A release raises it to the list
-/// published with it, so an older signed list (one still naming a seed since removed, served by a
-/// compromised bucket or CDN) can't be what a fresh install starts from.
+/// The oldest seed list this build accepts, cached or fetched: the sequence of the list committed
+/// with it (agent/data/seed-providers.json, which a test holds it equal to), so an older signed list
+/// (one still naming a seed since removed, served by a compromised bucket or CDN) can't be what a
+/// fresh install starts from. Signing a new list means raising this in the same commit; the
+/// seed-list workflow publishes the list on the push to main, before any release tag needs it.
 pub const MIN_SEQUENCE: u64 = 1;
 
 /// How often a gateway checks for a newer list after a good fetch (a conditional request).
@@ -448,6 +450,11 @@ mod tests {
         let store = SeedStore::new(&pinned(), "https://example.invalid/seeds.json", None);
         assert!(store.offer(&sign(&list(MIN_SEQUENCE - 1, vec![seed(1, "old")]), &key()).unwrap(), None).is_err());
         assert!(store.current().seeds.is_empty());
+        // A cached list below it is ignored at start, as an unverifiable one is.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("seed-providers.json");
+        std::fs::write(&cache, sign(&list(MIN_SEQUENCE - 1, vec![seed(1, "old")]), &key()).unwrap()).unwrap();
+        assert!(SeedStore::new(&pinned(), "https://example.invalid/seeds.json", Some(cache)).current().seeds.is_empty());
     }
 
     #[test]
@@ -461,7 +468,8 @@ mod tests {
     fn the_list_to_publish_is_signed_by_the_pinned_key_and_valid() {
         // What the seed-list workflow publishes: a gateway must accept it as is.
         let list = verify(include_str!("../data/seed-providers.json"), crate::tokenizer_index::PINNED_INDEX_KEY).unwrap();
-        // …and this build accepts it: MIN_SEQUENCE never runs ahead of the list it ships with.
-        assert!(list.sequence >= MIN_SEQUENCE && !list.seeds.is_empty());
+        // …and it is this build's floor: raised with each list signed, never ahead of it.
+        assert_eq!(MIN_SEQUENCE, list.sequence, "set MIN_SEQUENCE to the sequence of agent/data/seed-providers.json");
+        assert!(!list.seeds.is_empty());
     }
 }
