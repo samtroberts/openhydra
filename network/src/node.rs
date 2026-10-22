@@ -116,6 +116,14 @@ pub fn start_node(
 
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
     let mut bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
+    // SL5: given none (a fresh CLI install), start from OpenHydra's own on the public network.
+    if bootstrap_peers.is_empty() {
+        let defaults = crate::relay::default_bootstraps(config.public_relays);
+        if !defaults.is_empty() {
+            info!(n = defaults.len(), "no --bootstrap given: starting from OpenHydra's public bootstraps");
+            bootstrap_peers = parse_bootstrap_peers(&defaults)?;
+        }
+    }
     // A private deployment never contacts OpenHydra's own bootstraps, even ones it was given.
     if config.public_relays == crate::relay::PublicRelays::Off {
         let (kept, dropped) = crate::relay::without_public_bootstraps(bootstrap_peers);

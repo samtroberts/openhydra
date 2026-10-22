@@ -62,6 +62,18 @@ pub const BOOTSTRAP_RELAYS: &[&str] = &[
     "/ip6/2a03:4000:41:ed1:384a:c3ff:fef1:2c58/tcp/4001/p2p/12D3KooWHNQ9nMedT3ZaMjj4xX7Mf4dxmTZ3cAX3tnJfyERV9Bua",
 ];
 
+/// The bootstraps a node starts from when it was given none (SL5): OpenHydra's own, the production
+/// relays above, on the public network; none for a private deployment (`--public-relays off`). Without
+/// one, a fresh CLI install's Kademlia never bootstraps ("No known peers") and it only finds the
+/// network once a relay connection brings it in (measured: ~30 s, against ~9 s with a bootstrap).
+pub fn default_bootstraps(public: PublicRelays) -> Vec<String> {
+    if public == PublicRelays::Off {
+        Vec::new()
+    } else {
+        BOOTSTRAP_RELAYS.iter().map(|s| s.to_string()).collect()
+    }
+}
+
 /// IP addresses of the production bootstrap relay servers.
 /// Used by the event loop to detect when a ConnectionEstablished endpoint
 /// routes through a relay's IP — such connections should NOT be classified
@@ -508,6 +520,17 @@ impl CircuitMonitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_node_given_no_bootstrap_starts_from_openhydras_unless_private() {
+        use super::{default_bootstraps, PublicRelays};
+        assert!(default_bootstraps(PublicRelays::Off).is_empty(), "a private deployment contacts nothing of OpenHydra's");
+        for mode in [PublicRelays::Auto, PublicRelays::On] {
+            let b = default_bootstraps(mode);
+            assert_eq!(b.len(), super::BOOTSTRAP_RELAYS.len());
+            assert!(b.iter().all(|a| a.parse::<libp2p::Multiaddr>().is_ok() && a.contains("/p2p/12D3KooW")), "{b:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
