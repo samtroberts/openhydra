@@ -115,7 +115,10 @@ function setMode(m) { app.dataset.mode = m; $$("#modeswitch button").forEach((b)
 let hist = ["home"], hi = 0;
 function updNavBtns() { $("#navback").classList.toggle("dis", hi <= 0); $("#navfwd").classList.toggle("dis", hi >= hist.length - 1); }
 function go(v, noHist) {
+  const changed = v !== activeView;
   setActiveView(v); const vm = VIEWMODE[v]; if (vm) setMode(vm);
+  // SL4: a new screen starts at its top, not wherever the last one was scrolled to.
+  if (changed) { const c = $(".content"); if (c) c.scrollTop = 0; }
   $$(".nav").forEach((x) => x.classList.toggle("on", x.dataset.v === v || (v === "chat" && x.dataset.chat === curChat)));
   $$(".view").forEach((x) => x.classList.toggle("on", x.id === "v-" + v));
   $("#htitle").textContent = titles[v];
@@ -610,7 +613,7 @@ document.addEventListener("focusin", (e) => {
 $("#search").oninput = () => { if (activeView === "providers") renderProviders(); else if (activeView === "peers") { const q = $("#search").value.toLowerCase(); $$("#peertable tbody tr").forEach((r) => r.style.display = r.textContent.toLowerCase().includes(q) ? "" : "none"); renderLogs(); } };
 // ⌘K (Ctrl+K elsewhere) or the button: a "Go to …" menu. Diagnostics is listed only when advanced
 // views are on (it's hidden otherwise).
-function openGoto() { menu($("#cmdk"), Object.keys(titles).filter((v) => v !== "peers" || app.hasAttribute("data-adv")).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); }
+function openGoto() { menu($("#cmdk"), Object.keys(titles).filter((v) => v !== "peers" || app.hasAttribute("data-adv")).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) })), { filter: true }); }
 $("#cmdk").onclick = (e) => { e.stopPropagation(); openGoto(); };
 document.addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {

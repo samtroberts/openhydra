@@ -2,6 +2,7 @@
 // state (the toast element/timer, the currently-open menu anchor); no app state.
 import { $, $$ } from "./dom";
 import { html, setHTML } from "./html";
+import { nextQuery, matches } from "./menufilter.js";
 
 let toastEl, toastT;
 export function toast(m) { if (!toastEl) { toastEl = document.createElement("div"); toastEl.className = "toast"; document.body.appendChild(toastEl); } toastEl.textContent = m; toastEl.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove("show"), 1600); }
@@ -13,9 +14,22 @@ document.addEventListener("keydown", (e) => {
   // While typing, only Escape reaches the menu (Enter sends the message, arrows move the caret).
   const a = document.activeElement, typing = a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
   if (typing && e.key !== "Escape") return;
-  const items = [...m.querySelectorAll(".mi")]; if (!items.length) return;
-  let i = items.findIndex((x) => x.classList.contains("kb"));
   if (e.key === "Escape") { e.preventDefault(); closeMenus(); return; }
+  // A filterable menu (⌘K): typing narrows it; the first match is ready for Enter.
+  if (m.dataset.filter) {
+    const q = nextQuery(m.dataset.q || "", e);
+    if (q !== null) {
+      e.preventDefault();
+      m.dataset.q = q;
+      const qline = m.querySelector(".mq"); if (qline) qline.textContent = q ? "Filter: " + q : "Type to filter";
+      const all = [...m.querySelectorAll(".mi")];
+      all.forEach((x) => { x.style.display = matches(x.textContent, q) ? "" : "none"; x.classList.remove("kb"); });
+      const first = all.find((x) => x.style.display !== "none"); if (first) first.classList.add("kb");
+      return;
+    }
+  }
+  const items = [...m.querySelectorAll(".mi")].filter((x) => x.style.display !== "none"); if (!items.length) return;
+  let i = items.findIndex((x) => x.classList.contains("kb"));
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
     e.preventDefault();
     i = e.key === "ArrowDown" ? (i + 1) % items.length : (i <= 0 ? items.length - 1 : i - 1);
@@ -28,10 +42,11 @@ document.addEventListener("keydown", (e) => {
 export const isCancelled = (e) => String(e) === "Cancelled";
 export function failToast(what, e) { if (!isCancelled(e)) toast(`${what}: ${e}`); }
 export function closeMenus() { $$(".menu").forEach((m) => m.remove()); menuFor = null; }
-export function menu(anchor, items) {
+export function menu(anchor, items, opts = {}) {
   if (menuFor === anchor) { closeMenus(); return; }
   closeMenus(); menuFor = anchor;
   const m = document.createElement("div"); m.className = "menu";
+  if (opts.filter) { m.dataset.filter = "1"; const q = document.createElement("div"); q.className = "mq"; q.textContent = "Type to filter"; m.appendChild(q); }
   items.forEach((it) => { if (it.sep) { const s = document.createElement("div"); s.className = "msep"; m.appendChild(s); return; } const mi = document.createElement("div"); mi.className = "mi"; setHTML(mi, html`<span class="ck">${it.on ? "✓" : ""}</span>${it.label}`); mi.onclick = (e) => { e.stopPropagation(); closeMenus(); it.fn && it.fn(); }; m.appendChild(mi); });
   document.body.appendChild(m);
   const r = anchor.getBoundingClientRect(); m.style.left = Math.max(8, Math.min(r.left, innerWidth - m.offsetWidth - 10)) + "px"; let t = r.bottom + 5; if (t + m.offsetHeight > innerHeight - 8) t = r.top - m.offsetHeight - 5; m.style.top = Math.max(8, t) + "px";

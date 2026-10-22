@@ -1,15 +1,16 @@
 
   :root{
+    /* SL4: light-theme brand, success, warning, danger and muted text are dark enough for 4.5:1 (WCAG AA) as text and under white text (checked by script). */
     --background:0 0% 100%; --foreground:240 10% 3.9%;
     --card:0 0% 100%; --card-foreground:240 10% 3.9%;
     --popover:0 0% 100%;
-    --muted:240 4.8% 95.9%; --muted-foreground:240 3.8% 46.1%;
+    --muted:240 4.8% 95.9%; --muted-foreground:240 3.8% 44.5%;
     --border:240 5.9% 90%; --input:240 5.9% 90%;
     --primary:240 5.9% 10%; --primary-foreground:0 0% 98%;
     --accentbg:240 4.8% 95.5%;
     --sidebar:240 6% 97.6%;
-    --ring:174 72% 40%; --brand:174 74% 35%; --brand-fg:0 0% 100%;
-    --success:142 68% 42%; --warning:35 92% 46%; --danger:0 72% 51%;
+    --ring:174 72% 40%; --brand:174 74% 26%; --brand-fg:0 0% 100%;
+    --success:142 68% 27%; --warning:35 92% 31.5%; --danger:0 72% 47%; --danger-fg:0 0% 100%;
     --radius:0.5rem;
     --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
@@ -22,7 +23,7 @@
     --primary:0 0% 98%; --primary-foreground:240 5.9% 10%;
     --accentbg:240 3.7% 14%; --sidebar:240 9% 4.6%;
     --ring:173 66% 47%; --brand:173 66% 47%; --brand-fg:240 10% 3.9%;
-    --success:142 64% 52%; --warning:35 92% 55%; --danger:0 72% 60%;
+    --success:142 64% 52%; --warning:35 92% 55%; --danger:0 72% 60%; --danger-fg:240 10% 3.9%;
   }}
   :root[data-theme="dark"]{
     --background:240 10% 3.9%; --foreground:0 0% 98%;
@@ -32,17 +33,17 @@
     --primary:0 0% 98%; --primary-foreground:240 5.9% 10%;
     --accentbg:240 3.7% 14%; --sidebar:240 9% 4.6%;
     --ring:173 66% 47%; --brand:173 66% 47%; --brand-fg:240 10% 3.9%;
-    --success:142 64% 52%; --warning:35 92% 55%; --danger:0 72% 60%;
+    --success:142 64% 52%; --warning:35 92% 55%; --danger:0 72% 60%; --danger-fg:240 10% 3.9%;
   }
   :root[data-theme="light"]{
     --background:0 0% 100%; --foreground:240 10% 3.9%;
     --card:0 0% 100%; --card-foreground:240 10% 3.9%; --popover:0 0% 100%;
-    --muted:240 4.8% 95.9%; --muted-foreground:240 3.8% 46.1%;
+    --muted:240 4.8% 95.9%; --muted-foreground:240 3.8% 44.5%;
     --border:240 5.9% 90%; --input:240 5.9% 90%;
     --primary:240 5.9% 10%; --primary-foreground:0 0% 98%;
     --accentbg:240 4.8% 95.5%; --sidebar:240 6% 97.6%;
-    --ring:174 72% 40%; --brand:174 74% 35%; --brand-fg:0 0% 100%;
-    --success:142 68% 42%; --warning:35 92% 46%; --danger:0 72% 51%;
+    --ring:174 72% 40%; --brand:174 74% 26%; --brand-fg:0 0% 100%;
+    --success:142 68% 27%; --warning:35 92% 31.5%; --danger:0 72% 47%; --danger-fg:0 0% 100%;
   }
   *{box-sizing:border-box}
   html,body{margin:0}
@@ -194,7 +195,7 @@
   .msg{border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.55}
   .msg.me{margin-left:auto;max-width:78%;background:hsl(var(--muted));border-radius:14px}
   .msg.ai{margin-right:0;padding:4px 2px}
-  .btn.stop,.btn.primary.stop:hover{background:hsl(var(--danger));border-color:hsl(var(--danger));color:#fff}
+  .btn.stop,.btn.primary.stop:hover{background:hsl(var(--danger));border-color:hsl(var(--danger));color:hsl(var(--danger-fg))}
   .attachrow{display:flex;flex-wrap:wrap;gap:6px;padding:4px 4px 2px}
   .achip{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;background:hsl(var(--muted));border-radius:6px;padding:2px 4px 2px 8px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .achip button{border:none;background:none;cursor:pointer;color:hsl(var(--muted-foreground));font-size:13px;line-height:1;padding:0 2px}
@@ -211,6 +212,7 @@
   .md hr{border:none;border-top:1px solid hsl(var(--border));margin:10px 0}
   .msgmeta{display:flex;flex-wrap:wrap;gap:5px 12px;align-items:center;font-size:10.5px;color:hsl(var(--muted-foreground));margin-top:8px}
   .msgmeta .num{font-family:var(--mono)}
+  .menu .mq{padding:4px 10px 6px;font-size:11px;color:hsl(var(--muted-foreground));border-bottom:1px solid hsl(var(--border));margin-bottom:4px}
   /* SL3: the numbers under an answer show on hover; kept in the layout (and for screen readers), only faded out. */
   .msgmeta .det{opacity:0;transition:opacity .15s}
   .msg:hover .msgmeta .det,.msgmeta:focus-within .det{opacity:1}
@@ -258,7 +260,7 @@
   .reach-pill .rp+.rp{border-left:1px solid hsl(var(--border))}
   .reach-pill .rp:hover{background:hsl(var(--accentbg))}
   .reach-pill .rp.sel{background:hsl(var(--muted));color:hsl(var(--foreground))}
-  .reach-pill .rp.sel[data-to="global"]{background:hsl(var(--brand));color:#fff}
+  .reach-pill .rp.sel[data-to="global"]{background:hsl(var(--brand));color:hsl(var(--brand-fg))}
   /* M2: per-row "export card" action + import-preview failure text. */
   .cardbtn{border:0;background:transparent;cursor:pointer;font-size:13px;opacity:.6;padding:0 2px;line-height:1}
   .cardbtn:hover{opacity:1}
