@@ -776,15 +776,15 @@ struct ServeArgs {
 
     /// Where to fetch the signed tokenizer index from (checked daily; HTTPS, or http:// to
     /// localhost). `off` keeps the copy built into this binary (and the last one fetched). Default:
-    /// OpenHydra's (dl.openhydra.co), or `off` with `--public-relays off` (a private deployment
-    /// contacts nothing of OpenHydra's).
+    /// OpenHydra's (dl.openhydra.co), or `off` on a private deployment (`--public-relays off`, or
+    /// only bootstraps of its own), which contacts nothing of OpenHydra's.
     #[arg(long = "tokenizer-index-url")]
     tokenizer_index_url: Option<String>,
 
     /// Where to fetch the signed list of OpenHydra's own providers from (`openhydra/auto` can pick a
     /// model they serve for a user with no history yet; checked every 6 h; HTTPS, or http:// to
-    /// localhost). `off` trusts no seed. Default: OpenHydra's (dl.openhydra.co), or `off` with
-    /// `--public-relays off`.
+    /// localhost). `off` trusts no seed. Default: OpenHydra's (dl.openhydra.co), or `off` on a
+    /// private deployment (as for `--tokenizer-index-url`).
     #[arg(long = "seed-list-url")]
     seed_list_url: Option<String>,
 
@@ -1138,7 +1138,7 @@ fn run() -> Result<(), String> {
     };
     let status_bind = cli.node.status_bind.clone();
     let config = cli.node.into_config();
-    let private_deployment = config.public_relays == openhydra_network::relay::PublicRelays::Off;
+    let private_deployment = !openhydra_network::node::joins_public_network(&config);
     // Start the swarm first; both roles need the live node.
     let net = NetworkHandle::start(config)?;
     eprintln!(

@@ -237,6 +237,15 @@ pub fn check_bootstrap_addr(addr: &str) -> Result<(), String> {
     parse_bootstrap_peers(&[addr.to_string()]).map(|_| ())
 }
 
+/// Whether a node with `config` joins the public network ([`crate::relay::uses_public_network`]):
+/// no bootstraps, or one of OpenHydra's, under `--public-relays auto`. A node that doesn't is a
+/// private deployment, and must not contact OpenHydra's services either (the tokenizer index, the
+/// seed list). An unparsable bootstrap fails the node's start anyway.
+pub fn joins_public_network(config: &NodeConfig) -> bool {
+    let bootstraps = parse_bootstrap_peers(&config.bootstrap_peers).unwrap_or_default();
+    crate::relay::uses_public_network(&bootstraps, config.public_relays)
+}
+
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.
 fn parse_bootstrap_peers(addrs: &[String]) -> Result<Vec<(PeerId, Multiaddr)>, String> {
     let mut result = Vec::new();
