@@ -159,10 +159,42 @@ enum Role {
     /// score them on the reference, honest and substitute engine configurations, then assemble a
     /// reference with a calibrated cut-off for `serve --logprob-reference`. No swarm.
     Refbuild(refbuild::RefbuildArgs),
+    /// Look at the public network from outside, for monitoring (for network operators): joins it,
+    /// checks every OpenHydra bootstrap answers and grants a relay reservation, which seed models
+    /// are online, and optionally sends one short request to a seed. Prints JSON; exits 1 when
+    /// something needs a person, so a timer can alert on it.
+    Probe(ProbeArgs),
     /// Run a reference registry (for network operators): holds reference texts built with
     /// `refbuild` and hands gateways signed round packs, issuing every text once network-wide.
     /// See `registry init`. No swarm.
     Registry(registry_cli::RegistryArgs),
+}
+
+/// `probe` — see [`Role::Probe`].
+#[derive(Args)]
+struct ProbeArgs {
+    /// Seconds to let the node connect and reserve before judging (it stops early once every
+    /// bootstrap is connected and reserved).
+    #[arg(long = "settle-secs", default_value_t = 40)]
+    settle_secs: u64,
+    /// Seconds to listen before counting peers, models and providers (they announce every two
+    /// minutes; ~150 for a full count). 0: count as soon as the bootstraps are checked.
+    #[arg(long = "observe-secs", default_value_t = 0)]
+    observe_secs: u64,
+    /// How many seed models must have a seed provider online; fewer is a problem. Leave at 0 while
+    /// no seed is meant to run.
+    #[arg(long = "expect-seeds", default_value_t = 0)]
+    expect_seeds: usize,
+    /// Don't send the short test request to a seed model.
+    #[arg(long = "no-test-request")]
+    no_test_request: bool,
+    /// Also count models and providers through the bootstrap registry (about 170 lookups: for a
+    /// daily count, not every alert run).
+    #[arg(long = "count-models")]
+    count_models: bool,
+    /// Where the signed seed list is fetched from.
+    #[arg(long = "seed-list-url", default_value = openhydra_agent::seed_list::DEFAULT_SEED_URL)]
+    seed_list_url: String,
 }
 
 /// `swarm <action>` — the membership CLI (M3/M4). State lives under `--swarms-dir`.
@@ -823,6 +855,32 @@ fn seed_list(url: &str) -> Result<Option<std::sync::Arc<openhydra_agent::seed_li
     Ok(Some(store))
 }
 
+/// `probe`: run [`openhydra_agent::probe`] on the started node, print its JSON report, and exit 1
+/// when it found problems.
+fn probe(net: NetworkHandle, args: ProbeArgs) -> Result<(), String> {
+    use openhydra_agent::{probe, seed_list, tokenizer_index};
+    if !openhydra_agent::registry_client::registry_url_allowed(&args.seed_list_url) {
+        return Err(format!("--seed-list-url {}: HTTPS, or http:// to localhost", args.seed_list_url));
+    }
+    // No cache: each probe judges what the CDN serves now.
+    let store = std::sync::Arc::new(seed_list::SeedStore::new(tokenizer_index::PINNED_INDEX_KEY, &args.seed_list_url, None));
+    let client = openhydra_agent::hf_tokenizer::download_client()?;
+    let opts = probe::ProbeOptions {
+        settle: std::time::Duration::from_secs(args.settle_secs),
+        observe: std::time::Duration::from_secs(args.observe_secs),
+        expect_seeds: args.expect_seeds,
+        test_request: !args.no_test_request,
+        count_models: args.count_models,
+    };
+    let report = probe::run(net, store, &client, &opts)?;
+    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    if report.problems.is_empty() {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
+}
+
 /// W4: the signed tokenizer index (built-in copy, the last one fetched, refreshed daily) and the
 /// Hugging Face tokenizers it names, downloaded on first use unless `--no-tokenizer-downloads`.
 fn hf_tokenizers(index_url: &str, hf_base: &str, downloads: bool) -> Result<Option<std::sync::Arc<openhydra_agent::hf_tokenizer::HfTokenizers>>, String> {
@@ -1134,7 +1192,7 @@ fn run() -> Result<(), String> {
             }
             return Ok(());
         }
-        other => other, // Provide | Serve — need the swarm
+        other => other, // Provide | Serve | Probe — need the swarm
     };
     let status_bind = cli.node.status_bind.clone();
     let config = cli.node.into_config();
@@ -1162,6 +1220,7 @@ fn run() -> Result<(), String> {
         let role_str = match &role {
             Role::Provide(_) => "provider",
             Role::Serve(_) => "gateway",
+            Role::Probe(_) => "probe",
             _ => unreachable!("no-swarm roles return before the status server"),
         };
         let local = StatusServer {
@@ -1191,6 +1250,7 @@ fn run() -> Result<(), String> {
             }
             serve(net, stats, economy, args)
         }
+        Role::Probe(args) => probe(net, args),
         _ => unreachable!("no-swarm roles handled before the swarm starts"),
     }
 }

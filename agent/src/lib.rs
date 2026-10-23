@@ -42,6 +42,7 @@ pub mod hf_tokenizer;
 pub mod http;
 pub mod lmstudio;
 pub mod metrics;
+pub mod probe;
 pub mod prompt_score;
 pub mod provider;
 pub mod ratelimit;
