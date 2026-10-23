@@ -1,0 +1,10 @@
+[Unit]
+Description=Run openhydra-probe.service (every 5 minutes)
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=20
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=OpenHydra network probe (bootstraps, relays, seeds) → Healthchecks
+Documentation=https://github.com/samtroberts/openhydra/tree/main/ops/monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=openhydra-monitor
+Group=openhydra-monitor
+EnvironmentFile=-/etc/openhydra/monitor.env
+ExecStart=/opt/openhydra-monitor/probe-run.sh
+StateDirectory=openhydra-monitor
+TimeoutStartSec=4min
+
+# Hardening: it only makes outbound connections and writes its state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SyslogIdentifier=openhydra-probe
