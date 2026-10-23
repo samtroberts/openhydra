@@ -2,7 +2,8 @@
 
 What's already known in the current release, and what to do about it. If you hit something that isn't
 here, please [report it](https://github.com/samtroberts/openhydra/issues/new/choose): the desktop app's
-**Feedback** link (bottom right) fills in your version for you.
+**Feedback** link (bottom right) fills in your version for you. For questions and setup help, ask on
+[Discord](https://discord.gg/vNn3fWxAqP).
 
 ## Using the network
 
