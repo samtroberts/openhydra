@@ -5,6 +5,8 @@ defaults
 auth           on
 tls            on
 tls_trust_file /etc/ssl/certs/ca-certificates.crt
+# Give up after 20 s rather than hang the probe run (some hosts block outbound mail ports).
+timeout        20
 
 account        google
 host           smtp.gmail.com
