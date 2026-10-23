@@ -27,30 +27,29 @@ code=$?
 problems=$(printf '%s' "$report" | python3 -I -c 'import json,sys; print("\n".join(json.load(sys.stdin)["problems"]))' 2>/dev/null)
 [ "$code" -ne 0 ] && [ -z "$problems" ] && problems="the probe failed to run (exit $code): $(tail -3 "$STATE/probe.log")"
 
-mail() { # subject, body
+mail() { # subject, body; fails if the email wasn't sent, so it's tried again next run
   printf 'To: %s\nSubject: [OpenHydra probe %s] %s\nContent-Type: text/plain; charset=utf-8\n\n%s\n\n-- \nLast report: %s/last.json on %s\n' \
-    "$ALERT_TO" "$HOST" "$1" "$2" "$STATE" "$HOST" | $MAILER || echo "couldn't send the email: $1" >&2
+    "$ALERT_TO" "$HOST" "$1" "$2" "$STATE" "$HOST" | $MAILER && return 0
+  echo "couldn't send the email: $1" >&2
+  return 1
 }
 age() { [ -e "$1" ] && echo $(( now - $(cat "$1") )) || echo 999999999; }
 
 if [ "$code" -eq 0 ]; then
-  if [ -e "$STATE/alerted" ]; then
-    mail "RECOVERED" "The last run found no problems."
+  if [ ! -e "$STATE/alerted" ] || mail "RECOVERED" "The last run found no problems."; then
+    rm -f "$STATE/failing" "$STATE/alerted"
   fi
-  rm -f "$STATE/failing" "$STATE/alerted"
 elif [ ! -e "$STATE/failing" ]; then
   echo "$now" > "$STATE/failing"
   echo "first failure, emailing if it repeats: $problems" >&2
 elif [ "$(age "$STATE/alerted")" -ge "$REMIND_SECS" ]; then
   subject="PROBLEM"; [ -e "$STATE/alerted" ] && subject="still failing since $(date -u -d "@$(cat "$STATE/failing")" +%FT%TZ 2>/dev/null || cat "$STATE/failing")"
-  mail "$subject" "$problems"
-  echo "$now" > "$STATE/alerted"
+  mail "$subject" "$problems" && echo "$now" > "$STATE/alerted"
 fi
 if [ "$(age "$STATE/weekly")" -ge "$WEEKLY_SECS" ]; then
   mail "still watching" "Weekly check-in: this probe runs every 5 minutes. If this email stops arriving, the probe on $HOST has stopped.
 
 Last report:
-$report"
-  echo "$now" > "$STATE/weekly"
+$report" && echo "$now" > "$STATE/weekly"
 fi
 exit 0
