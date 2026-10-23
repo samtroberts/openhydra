@@ -15,9 +15,12 @@ Watches OpenHydra's public network from outside and emails a person when it need
   Aggregates only, no peer ids, no prompts, and a lower bound: a peer-to-peer network can't be
   counted completely.
 
-Run it on **two hosts** (netcup and one Linode bootstrap): each probe checks every bootstrap, so
-if one host dies, the other's probe emails "bootstrap … unreachable". No outside service is
-involved: mail goes out through Google Workspace with an app password.
+It runs on **two hosts**, which watch each other: the netcup bootstrap host, and
+`openhydra-monitor-use1`, an AWS t4g.micro spot instance in us-east-1 (interruption behaviour
+*stop*, so it resumes with its disk when capacity returns; SSH only from the operator). Each probe
+checks every bootstrap, so a dead netcup shows in the AWS probe's email; a stopped AWS probe shows
+as a missing weekly email. No outside service is involved: mail goes out through Google Workspace
+with an app password.
 
 The last report is kept in `/var/lib/openhydra-monitor/last.json`.
 
