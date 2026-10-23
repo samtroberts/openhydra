@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenHydra network probe (bootstraps, relays, seeds) → Healthchecks
+Description=OpenHydra network probe (bootstraps, relays, seeds) with email alerts
 Documentation=https://github.com/samtroberts/openhydra/tree/main/ops/monitor
 After=network-online.target
 Wants=network-online.target

@@ -1,0 +1,16 @@
+# /etc/openhydra/msmtprc — how probe-run.sh sends its emails (msmtp, through Google Workspace).
+# The password is an app password (Google Account › Security › App passwords), kept in
+# /etc/openhydra/smtp-password, readable only by root and the openhydra-monitor group.
+defaults
+auth           on
+tls            on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+
+account        google
+host           smtp.gmail.com
+port           587
+from           sam@openhydra.co
+user           sam@openhydra.co
+passwordeval   cat /etc/openhydra/smtp-password
+
+account default : google

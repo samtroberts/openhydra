@@ -1,33 +1,56 @@
 #!/usr/bin/env bash
 # OpenHydra network probe (SL10), run by openhydra-probe.timer every 5 minutes.
 #
-# Runs `openhydra-agent probe`, keeps its last report, and tells Healthchecks
-# (https://healthchecks.io) how it went:
-#   - all well                    → ping            (a missing ping also alerts: the probe box died)
-#   - problems, first time        → /log            (recorded, no alert: one blip isn't an outage)
-#   - problems, twice in a row    → /fail + problems (alert)
-# Settings come from /etc/openhydra/monitor.env (see README.md): HC_URL, EXPECT_SEEDS.
+# Runs `openhydra-agent probe`, keeps its last report, and emails a person (through msmtp):
+#   - problems twice in a row → "PROBLEM" (one blip is only logged), then a reminder every 6 hours
+#     while they last, and "RECOVERED" when a run is clean again;
+#   - once a week, "still watching" with the last report, so a probe that silently stopped is
+#     noticed by the missing email.
+# Two probes on different hosts watch each other: each checks every bootstrap, so a dead probe
+# host shows up as an unreachable bootstrap in the other's email.
+# Settings come from /etc/openhydra/monitor.env (see README.md): ALERT_TO, EXPECT_SEEDS.
 set -uo pipefail
-: "${HC_URL:?set HC_URL in /etc/openhydra/monitor.env}"
+: "${ALERT_TO:?set ALERT_TO in /etc/openhydra/monitor.env}"
 EXPECT_SEEDS=${EXPECT_SEEDS:-0}
 AGENT=${AGENT:-/opt/openhydra-monitor/bin/openhydra-agent}
 STATE=${STATE_DIRECTORY:-/var/lib/openhydra-monitor}
+MAILER=${MAILER:-msmtp --file=/etc/openhydra/msmtprc -t}
+REMIND_SECS=${REMIND_SECS:-21600}
+WEEKLY_SECS=${WEEKLY_SECS:-604800}
+HOST=$(hostname -s 2>/dev/null || hostname)
+now=$(date +%s)
 
 report=$(HOME="$STATE" "$AGENT" --identity "$STATE/probe.key" --listen /ip4/127.0.0.1/tcp/0 \
   probe --expect-seeds "$EXPECT_SEEDS" 2>"$STATE/probe.log")
 code=$?
 [ -n "$report" ] && printf '%s\n' "$report" > "$STATE/last.json"
 problems=$(printf '%s' "$report" | python3 -I -c 'import json,sys; print("\n".join(json.load(sys.stdin)["problems"]))' 2>/dev/null)
-[ "$code" -ne 0 ] && [ -z "$problems" ] && problems="probe failed to run (exit $code): $(tail -3 "$STATE/probe.log")"
+[ "$code" -ne 0 ] && [ -z "$problems" ] && problems="the probe failed to run (exit $code): $(tail -3 "$STATE/probe.log")"
 
-ping() { curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "${2:-}" "$HC_URL$1" || echo "couldn't reach Healthchecks ($HC_URL$1)" >&2; }
+mail() { # subject, body
+  printf 'To: %s\nSubject: [OpenHydra probe %s] %s\nContent-Type: text/plain; charset=utf-8\n\n%s\n\n-- \nLast report: %s/last.json on %s\n' \
+    "$ALERT_TO" "$HOST" "$1" "$2" "$STATE" "$HOST" | $MAILER || echo "couldn't send the email: $1" >&2
+}
+age() { [ -e "$1" ] && echo $(( now - $(cat "$1") )) || echo 999999999; }
+
 if [ "$code" -eq 0 ]; then
-  rm -f "$STATE/failing"
-  ping ""
-elif [ -e "$STATE/failing" ]; then
-  ping /fail "$problems"
-else
-  touch "$STATE/failing"
-  ping /log "first failure, alerting if it repeats: $problems"
+  if [ -e "$STATE/alerted" ]; then
+    mail "RECOVERED" "The last run found no problems."
+  fi
+  rm -f "$STATE/failing" "$STATE/alerted"
+elif [ ! -e "$STATE/failing" ]; then
+  echo "$now" > "$STATE/failing"
+  echo "first failure, emailing if it repeats: $problems" >&2
+elif [ "$(age "$STATE/alerted")" -ge "$REMIND_SECS" ]; then
+  subject="PROBLEM"; [ -e "$STATE/alerted" ] && subject="still failing since $(date -u -d "@$(cat "$STATE/failing")" +%FT%TZ 2>/dev/null || cat "$STATE/failing")"
+  mail "$subject" "$problems"
+  echo "$now" > "$STATE/alerted"
+fi
+if [ "$(age "$STATE/weekly")" -ge "$WEEKLY_SECS" ]; then
+  mail "still watching" "Weekly check-in: this probe runs every 5 minutes. If this email stops arriving, the probe on $HOST has stopped.
+
+Last report:
+$report"
+  echo "$now" > "$STATE/weekly"
 fi
 exit 0
