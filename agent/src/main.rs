@@ -34,7 +34,7 @@ use openhydra_agent::{
     ByokConfig, EconomyStats, EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig,
     StatusServer, TransferStats, DEFAULT_ANTHROPIC_URL, DEFAULT_COMFYUI_URL, DEFAULT_EXO_URL,
     DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL,
-    DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_VLLM_URL,
+    DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_SGLANG_URL, DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -407,6 +407,8 @@ enum EngineKind {
     Ollama,
     /// vLLM (OpenAI-compatible `/v1/*`).
     Vllm,
+    /// SGLang (OpenAI-compatible `/v1/*`, default port 30000).
+    Sglang,
     /// LM Studio (OpenAI-compatible `/v1/*`).
     LmStudio,
     /// llama.cpp (`llama-server`) — OpenAI serve route + `/props` canonical-id detection.
@@ -429,6 +431,7 @@ impl EngineKind {
             // `provide_auto` before this is called); map it to Ollama's for exhaustiveness.
             EngineKind::Auto | EngineKind::Ollama => DEFAULT_OLLAMA_URL,
             EngineKind::Vllm | EngineKind::Openai => DEFAULT_VLLM_URL,
+            EngineKind::Sglang => DEFAULT_SGLANG_URL,
             EngineKind::LmStudio => DEFAULT_LM_STUDIO_URL,
             EngineKind::LlamaCpp => DEFAULT_LLAMACPP_URL,
             EngineKind::Exo => DEFAULT_EXO_URL,
@@ -668,7 +671,7 @@ struct ProvideArgs {
     /// authenticity tier). `auto` identifies each engine's scoring API itself (vLLM, SGLang, or the
     /// OpenHydra scoring endpoint of patched mistral.rs / llama-server `--prompt-scoring`) — the only
     /// choice with `--engine-kind auto`; `vllm` / `sglang` / `openhydra` name it explicitly (needs
-    /// `--engine-kind vllm`, `openai` or `llama-cpp`). Off by default; at most 2 challenges are scored
+    /// `--engine-kind vllm`, `sglang`, `openai` or `llama-cpp`). Off by default; at most 2 challenges are scored
     /// at once. Only publicly announced models are scorable. Ollama can't score a prompt itself: its
     /// models are scored by the side-scorer (see `--side-scorer`) on their weights file; without
     /// one, and for LM Studio and stock llama-server, challenges are refused.
@@ -1289,10 +1292,10 @@ fn provide(
     }
     let scorer = side_scorer(&args)?;
     if args.prompt_scoring.is_some()
-        && !matches!(args.engine_kind, EngineKind::Vllm | EngineKind::Openai | EngineKind::LlamaCpp)
+        && !matches!(args.engine_kind, EngineKind::Vllm | EngineKind::Sglang | EngineKind::Openai | EngineKind::LlamaCpp)
         && !(scorer.is_some() && matches!(args.engine_kind, EngineKind::Ollama | EngineKind::LmStudio))
     {
-        return Err("--prompt-scoring needs --engine-kind vllm, openai or llama-cpp, or ollama / lm-studio with a \
+        return Err("--prompt-scoring needs --engine-kind vllm, sglang, openai or llama-cpp, or ollama / lm-studio with a \
                     side-scorer (openhydra-scorer / openhydra-mlx-scorer next to this binary, or --side-scorer / --mlx-scorer)"
             .into());
     }
@@ -1312,8 +1315,9 @@ fn provide(
             let a = live_ollama(&url).map_err(|e| format!("engine {url}: {e}"))?;
             run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
-        EngineKind::Vllm => {
-            let mut a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
+        EngineKind::Vllm | EngineKind::Sglang => {
+            let name = if args.engine_kind == EngineKind::Sglang { "sglang" } else { "vllm" };
+            let mut a = live_openai(&url, name).map_err(|e| format!("engine {url}: {e}"))?;
             a = match args.prompt_scoring {
                 Some(ScoringChoice::Dialect(dialect)) => a.with_prompt_scoring(dialect),
                 Some(ScoringChoice::Auto) => a.with_auto_prompt_scoring(),

@@ -136,6 +136,7 @@ pub fn normalize_engine(engine: &str) -> &'static str {
         "llama.cpp" | "llama-cpp" | "llama_cpp" | "llamacpp" => "llama.cpp",
         "lm-studio" | "lmstudio" | "lm_studio" => "lm-studio",
         "vllm" => "vllm",
+        "sglang" => "sglang",
         "comfyui" | "comfy-ui" | "comfy_ui" => "comfyui",
         "exo" => "exo",
         _ => "",
@@ -149,6 +150,7 @@ fn health_url(engine: &str) -> &'static str {
         "llama.cpp" => "http://127.0.0.1:8080/health",
         "lm-studio" => "http://127.0.0.1:1234/v1/models",
         "vllm" => "http://127.0.0.1:8000/health",
+        "sglang" => "http://127.0.0.1:30000/health",
         "comfyui" => "http://127.0.0.1:8188/",
         "exo" => "http://127.0.0.1:52415/",
         _ => "",
@@ -158,6 +160,9 @@ fn health_url(engine: &str) -> &'static str {
 /// Official vLLM Docker image (CUDA + Python + vLLM baked in). A pinned digest is the v2
 /// hardening; `latest` is honest for the guided Tier-2 path.
 const VLLM_IMAGE: &str = "vllm/vllm-openai:latest";
+
+/// Official SGLang Docker image (CUDA + Python + SGLang baked in); `latest` as for vLLM.
+const SGLANG_IMAGE: &str = "lmsysorg/sglang:latest";
 
 /// The hardcoded v1 recipe for `(engine, os, accel)`, or an error when unsupported.
 ///
@@ -203,6 +208,7 @@ pub fn recipe_for_variant(engine: &str, os: Os, _accel: Accel, variant: Variant)
         "llama.cpp" => llama_cpp_recipe(os),
         "lm-studio" => Ok(lm_studio_recipe(os)),
         "vllm" => vllm_recipe(os),
+        "sglang" => sglang_recipe(os),
         "comfyui" => comfyui_recipe(os, variant),
         "exo" => exo_recipe(os, variant),
         _ => Err(format!("no installer for engine '{engine}'")),
@@ -285,7 +291,8 @@ fn vllm_plan(_os: Os, p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> {
              flips to running once it serves."
         )
     };
-    // (2) Docker-first — one image bakes CUDA+Python+vLLM; the most reliable path.
+    // (2) Docker-first — one image bakes CUDA+Python+vLLM; the most reliable path. There's no
+    // `vllm` command on the host afterwards, so the next step is a `docker run` of the image.
     if p.docker {
         return Ok(Recipe {
             engine: "vllm",
@@ -297,7 +304,16 @@ fn vllm_plan(_os: Os, p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> {
                 program: "docker".into(),
                 args: vec!["pull".into(), VLLM_IMAGE.into()],
             }],
-            health: Health::Manual { note: launch_note("8000") },
+            health: Health::Manual {
+                note: format!(
+                    "vLLM installed as a Docker image (NVIDIA driver {driver}). Launch it with a model \
+                     to serve an OpenAI API on :8000: `docker run -d --gpus all --ipc=host -p \
+                     127.0.0.1:8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface \
+                     {VLLM_IMAGE} --model <hf-model>`. On a Turing/T4 GPU add `-e \
+                     VLLM_ATTENTION_BACKEND=TRITON_ATTN` before the image name and `--enforce-eager` \
+                     after the model. This card flips to running once it serves."
+                ),
+            },
             default_model: None,
             verified: false,
         });
@@ -326,6 +342,88 @@ fn vllm_plan(_os: Os, p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> {
             },
         ],
         health: Health::Manual { note: launch_note("8000") },
+        default_model: None,
+        verified: false,
+    })
+}
+
+/// SGLang (Tier-2) — the same probe-then-install flow as vLLM. SGLang publishes Linux wheels
+/// only (manylinux x86_64/aarch64, Python 3.11+), so macOS and Windows get a pointer elsewhere.
+fn sglang_recipe(os: Os) -> Result<Recipe, String> {
+    match os {
+        Os::Linux => sglang_plan(&crate::hostinfo::probe_prereqs()),
+        Os::Macos => Err("SGLang has no macOS build — on a Mac, use vLLM (vllm-metal), Ollama or LM Studio.".into()),
+        Os::Windows => Err(
+            "SGLang has no native Windows build — run it under WSL2 (Linux), where OpenHydra's \
+             Docker/uv path then applies."
+                .into(),
+        ),
+    }
+}
+
+/// Pure planner for SGLang on Linux (probe → decision): NVIDIA driver required; Docker image
+/// first, else a uv venv + `uv pip install sglang`, else block.
+fn sglang_plan(p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> {
+    let Some(driver) = p.nvidia_driver.as_deref() else {
+        return Err("SGLang needs an NVIDIA GPU with drivers, but `nvidia-smi` isn't present. \
+                    Install the NVIDIA driver + CUDA toolkit (a system step we can't do for \
+                    you), then retry."
+            .into());
+    };
+    // The uv path's next step; the Docker path has its own (a `docker run` of the image).
+    let launch_note = format!(
+        "SGLang installed (NVIDIA driver {driver}). Launch it with a model to serve an OpenAI API \
+         on :30000: `{venv_python} -m sglang.launch_server --model-path <hf-model> --port 30000`. \
+         This card flips to running once it serves.",
+        venv_python = install_dir("sglang").join("venv").join("bin").join("python").display()
+    );
+    if p.docker {
+        return Ok(Recipe {
+            engine: "sglang",
+            summary: format!(
+                "Docker path (recommended): pull `{SGLANG_IMAGE}` — bundles CUDA + Python + SGLang. \
+                 NVIDIA driver {driver} + Docker detected."
+            ),
+            steps: vec![Step::Run {
+                program: "docker".into(),
+                args: vec!["pull".into(), SGLANG_IMAGE.into()],
+            }],
+            health: Health::Manual {
+                note: format!(
+                    "SGLang installed as a Docker image (NVIDIA driver {driver}). Launch it with a \
+                     model to serve an OpenAI API on :30000: `docker run -d --gpus all --ipc=host \
+                     --shm-size 16g -p 127.0.0.1:30000:30000 -v \
+                     ~/.cache/huggingface:/root/.cache/huggingface {SGLANG_IMAGE} python3 -m \
+                     sglang.launch_server --model-path <hf-model> --host 0.0.0.0 --port 30000`. This \
+                     card flips to running once it serves."
+                ),
+            },
+            default_model: None,
+            verified: false,
+        });
+    }
+    if !p.uv {
+        return Err("SGLang needs either Docker (recommended) or `uv` (a fast Python installer). \
+                    Install Docker, or `uv` from astral.sh/uv, then retry."
+            .into());
+    }
+    let venv = install_dir("sglang").join("venv");
+    let venv_s = venv.to_string_lossy().into_owned();
+    let py = venv.join("bin").join("python").to_string_lossy().into_owned();
+    Ok(Recipe {
+        engine: "sglang",
+        summary: format!(
+            "uv path: create an isolated Python 3.12 venv at {venv_s} and install SGLang. NVIDIA \
+             driver {driver} + uv detected. (The guided \"may take minutes / may fail\" path.)"
+        ),
+        steps: vec![
+            Step::Run { program: "uv".into(), args: vec!["venv".into(), "--python".into(), "3.12".into(), venv_s] },
+            Step::Run {
+                program: "uv".into(),
+                args: vec!["pip".into(), "install".into(), "--python".into(), py, "sglang".into()],
+            },
+        ],
+        health: Health::Manual { note: launch_note },
         default_model: None,
         verified: false,
     })
@@ -1209,16 +1307,36 @@ pub fn installed_on_disk(engine: &str) -> bool {
                 || has_program("exo")
                 || install_dir("exo").join("venv").join("bin").join("exo").exists()
         }
-        // A global `vllm` CLI, the vllm-metal venv (~/.venv-vllm-metal), or a source venv of ours.
+        // A global `vllm` CLI, the vllm-metal venv (~/.venv-vllm-metal), a source venv of ours, or
+        // the official Docker image (the Linux install path).
         "vllm" => {
-            has_program("vllm")
+            docker_image_present(VLLM_IMAGE)
+                || has_program("vllm")
                 || std::env::var("HOME")
                     .map(|h| Path::new(&h).join(".venv-vllm-metal").join("bin").join("vllm").exists())
                     .unwrap_or(false)
                 || install_dir("vllm").join("venv").join("bin").join("vllm").exists()
         }
+        // The official Docker image, or a venv of ours (SGLang has no standalone CLI on PATH).
+        "sglang" => {
+            docker_image_present(SGLANG_IMAGE)
+                || install_dir("sglang").join("venv").join("bin").join("python").exists()
+        }
         _ => false,
     }
+}
+
+/// Has Docker already pulled `image`? False when Docker is missing or the image isn't local.
+fn docker_image_present(image: &str) -> bool {
+    resolve_program("docker").is_some_and(|docker| {
+        Command::new(docker)
+            .args(["image", "inspect", "--format", "{{.Id}}", image])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
 /// Is a macOS app bundle `/Applications/<name>.app` installed? Always false off macOS.
@@ -1267,6 +1385,7 @@ pub fn run_engine(engine: &str) -> Result<(), String> {
         "comfyui" => Err("Start ComfyUI from its folder — `comfy launch` (serves :8188).".to_string()),
         "exo" => Err("Start Exo from its folder — run `exo` in the Exo venv.".to_string()),
         "vllm" => Err("vLLM needs a model — run `vllm serve <model>`.".to_string()),
+        "sglang" => Err("SGLang needs a model — run `python3 -m sglang.launch_server --model-path <model>`.".to_string()),
         other => Err(format!("Don't know how to start {other} automatically.")),
     }
 }
@@ -1413,7 +1532,8 @@ mod tests {
         assert!(r.summary.contains("Docker"));
         assert!(matches!(r.steps.first(), Some(Step::Run { program, args })
             if program == "docker" && args.iter().any(|a| a.contains("vllm/vllm-openai"))));
-        assert!(matches!(&r.health, Health::Manual { note } if note.contains("TRITON_ATTN")));
+        assert!(matches!(&r.health, Health::Manual { note }
+            if note.contains("TRITON_ATTN") && note.contains("docker run") && note.contains(VLLM_IMAGE)));
         assert!(!r.verified);
 
         // GPU + uv (no Docker) → uv venv + pip install path.
@@ -1427,6 +1547,37 @@ mod tests {
         let bare = Prereqs { nvidia_driver: drv(), docker: false, uv: false, ..Default::default() };
         let e = vllm_plan(Os::Linux, &bare).unwrap_err();
         assert!(e.contains("Docker") && e.contains("uv"));
+    }
+
+    #[test]
+    fn sglang_plan_prefers_docker_then_uv_and_blocks_on_missing_prereqs() {
+        use crate::hostinfo::Prereqs;
+        let drv = || Some("535.104.05".to_string());
+
+        let no_gpu = Prereqs { nvidia_driver: None, docker: true, uv: true, ..Default::default() };
+        let e = sglang_plan(&no_gpu).unwrap_err();
+        assert!(e.contains("NVIDIA") && e.contains("nvidia-smi"), "actionable GPU message: {e}");
+
+        let docker = Prereqs { nvidia_driver: drv(), docker: true, uv: true, ..Default::default() };
+        let r = sglang_plan(&docker).unwrap();
+        assert_eq!(r.engine, "sglang");
+        assert!(matches!(r.steps.first(), Some(Step::Run { program, args })
+            if program == "docker" && args.iter().any(|a| a == SGLANG_IMAGE)));
+        assert!(matches!(&r.health, Health::Manual { note }
+            if note.contains(":30000") && note.contains("docker run") && note.contains(SGLANG_IMAGE)));
+
+        let uv = Prereqs { nvidia_driver: drv(), docker: false, uv: true, ..Default::default() };
+        let r = sglang_plan(&uv).unwrap();
+        assert_eq!(r.steps.len(), 2, "uv venv + uv pip install");
+        assert!(matches!(&r.steps[1], Step::Run { args, .. } if args.iter().any(|a| a == "sglang")));
+
+        let bare = Prereqs { nvidia_driver: drv(), docker: false, uv: false, ..Default::default() };
+        let e = sglang_plan(&bare).unwrap_err();
+        assert!(e.contains("Docker") && e.contains("uv"));
+
+        // Linux-only wheels: a pointer elsewhere on macOS and Windows.
+        assert!(recipe_for("sglang", Os::Macos, Accel::Auto).unwrap_err().contains("macOS"));
+        assert!(recipe_for("sglang", Os::Windows, Accel::Auto).unwrap_err().contains("WSL2"));
     }
 
     #[test]
@@ -1452,6 +1603,7 @@ mod tests {
         }
         assert_eq!(normalize_engine("ollama"), "ollama");
         assert_eq!(normalize_engine("vllm"), "vllm");
+        assert_eq!(normalize_engine("sglang"), "sglang");
         assert_eq!(normalize_engine("koboldcpp"), "", "unknown engines normalise to empty");
     }
 
@@ -1504,7 +1656,7 @@ mod tests {
         assert!(is_runnable("ollama"));
         assert!(is_runnable("lm-studio") && is_runnable("lmstudio"));
         // These need a model/cluster arg, so no auto-"Run".
-        for e in ["llama.cpp", "vllm", "comfyui", "exo"] {
+        for e in ["llama.cpp", "vllm", "sglang", "comfyui", "exo"] {
             assert!(!is_runnable(e), "{e} should not be runnable");
         }
     }
@@ -1512,7 +1664,7 @@ mod tests {
     #[test]
     fn run_engine_refuses_model_dependent_engines_with_guidance() {
         // Non-self-serving engines can't be started blind — return an actionable error, never Ok.
-        for e in ["llama.cpp", "vllm", "comfyui", "exo"] {
+        for e in ["llama.cpp", "vllm", "sglang", "comfyui", "exo"] {
             let r = run_engine(e);
             assert!(r.is_err(), "{e} must not silently 'start'");
             assert!(!r.unwrap_err().is_empty());

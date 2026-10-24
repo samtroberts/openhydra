@@ -416,7 +416,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     }
     // The table is rebuilt on every refresh: a model's switch that had keyboard focus keeps it.
     const focused = document.activeElement?.closest?.("#servetable [data-share]")?.dataset.share;
-    setHTML($("#servetable tbody"), rows.length ? html`${rows}` : html`<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`);
+    setHTML($("#servetable tbody"), rows.length ? html`${rows}` : html`<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, SGLang, llama.cpp, or Exo, then rescan.</td></tr>`);
     if (focused !== undefined) [...$$("#servetable [data-share]")].find((sw) => sw.dataset.share === focused)?.focus();
     // "Previously served" — lifetime tokens on record but NOT currently detected.
     const pastModels = statModels().filter((id) => lifetimeServed(id) > 0 && !active.has(id))

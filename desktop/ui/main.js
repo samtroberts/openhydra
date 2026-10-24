@@ -184,7 +184,7 @@ function applyPreset(name) {
   $("[data-label='tokk']")?._set?.(p[1]);
 }
 // Settings › Engine labels → the agent's --engine-kind values.
-const ENGINE_KIND_OF = { "auto-detect": "auto", ollama: "ollama", vLLM: "vllm", "LM Studio": "lm-studio", "llama.cpp": "llama-cpp", Exo: "exo", ComfyUI: "comfyui" };
+const ENGINE_KIND_OF = { "auto-detect": "auto", ollama: "ollama", vLLM: "vllm", SGLang: "sglang", "LM Studio": "lm-studio", "llama.cpp": "llama-cpp", Exo: "exo", ComfyUI: "comfyui" };
 
 // ── recents (live sessions) ──
 function renderRecents() {

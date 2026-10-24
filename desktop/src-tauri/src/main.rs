@@ -1072,7 +1072,7 @@ fn confirm_global(app: &tauri::AppHandle, what: &GlobalExposure, starting: bool,
 /// agent; Exo and ComfyUI can't be scored (the agent refuses to start with the flag).
 fn scoring_supported(kind: &str, side_scorer_present: bool) -> bool {
     match kind.trim() {
-        "vllm" | "llama-cpp" => true,
+        "vllm" | "sglang" | "llama-cpp" => true,
         "ollama" | "lm-studio" => side_scorer_present,
         "exo" | "comfyui" => false,
         _ => true, // auto
@@ -1080,7 +1080,7 @@ fn scoring_supported(kind: &str, side_scorer_present: bool) -> bool {
 }
 
 /// The engine kinds the provider accepts for `--engine-kind` (besides `auto`).
-const ENGINE_KINDS: &[&str] = &["ollama", "vllm", "lm-studio", "llama-cpp", "exo", "comfyui"];
+const ENGINE_KINDS: &[&str] = &["ollama", "vllm", "sglang", "lm-studio", "llama-cpp", "exo", "comfyui"];
 
 /// Provider flags for the chosen engine: nothing for `auto` (the agent's default), else
 /// `--engine-kind <kind>` and, when set, `--engine <url>`. An unknown kind falls back to `auto`.
@@ -2520,7 +2520,7 @@ async fn install_engine(app: tauri::AppHandle, engine: String, accel: Option<Str
 #[tauri::command]
 async fn installed_engines() -> Vec<String> {
     tauri::async_runtime::spawn_blocking(|| {
-        ["ollama", "lm-studio", "llama.cpp", "comfyui", "vllm", "exo"]
+        ["ollama", "lm-studio", "llama.cpp", "comfyui", "vllm", "sglang", "exo"]
             .into_iter()
             .filter(|e| installer::installed_on_disk(e))
             .map(String::from)
@@ -3955,6 +3955,7 @@ mod tests {
     fn authenticity_checks_only_for_engines_that_can_be_scored() {
         assert!(scoring_supported("auto", false));
         assert!(scoring_supported("vllm", false));
+        assert!(scoring_supported("sglang", false));
         assert!(!scoring_supported("ollama", false) && scoring_supported("ollama", true));
         assert!(!scoring_supported("exo", true) && !scoring_supported("comfyui", true));
     }
@@ -4072,6 +4073,7 @@ mod tests {
     fn engine_args_pass_a_known_kind_and_its_endpoint() {
         assert_eq!(engine_args("auto", ""), vec!["--engine-kind", "auto"]);
         assert_eq!(engine_args("vllm", ""), vec!["--engine-kind", "vllm"]);
+        assert_eq!(engine_args("sglang", ""), vec!["--engine-kind", "sglang"]);
         assert_eq!(
             engine_args("llama-cpp", " http://127.0.0.1:8081 "),
             vec!["--engine-kind", "llama-cpp", "--engine", "http://127.0.0.1:8081"]

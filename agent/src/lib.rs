@@ -80,7 +80,7 @@ pub use adapters::exo::{ExoAdapter, DEFAULT_EXO_URL};
 pub use adapters::gemini::{GeminiAdapter, DEFAULT_GEMINI_URL};
 pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
-pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};
+pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_SGLANG_URL, DEFAULT_VLLM_URL};
 pub use consumer::{
     rank_providers, rank_providers_with_assurance,
     rank_providers_with_reputation, request_completion, select_provider, ConsumerNode,

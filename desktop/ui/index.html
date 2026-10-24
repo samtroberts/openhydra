@@ -188,6 +188,11 @@
               <div class="row"><button class="btn outline sm enginst" style="margin-left:auto">Guided install</button></div>
             </div>
             <div class="card pad">
+              <div class="row"><b style="font-size:13px">SGLang</b><span class="badge" style="margin-left:auto">not installed</span></div>
+              <div class="mut" style="font-size:12px;margin:6px 0 10px">High-throughput serving. Needs Linux + NVIDIA GPU.</div>
+              <div class="row"><button class="btn outline sm enginst" style="margin-left:auto">Guided install</button></div>
+            </div>
+            <div class="card pad">
               <div class="row"><b style="font-size:13px">Exo</b><span class="badge" style="margin-left:auto">not installed</span></div>
               <div class="mut" style="font-size:12px;margin:6px 0 10px">Shard big models across your devices.</div>
               <div class="row"><button class="btn outline sm enginst" style="margin-left:auto">Guided install</button></div>
@@ -361,7 +366,7 @@ openclaw config set model.name openhydra/auto</div><div class="connact"><button 
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Check for updates</label><div class="desc" id="updesc">Asks dl.openhydra.co whether a newer release is out. The app does this by itself every hour on the public network, never in a private deployment.</div></div><button class="btn outline sm" id="checkupd">Check now</button></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Restart the gateway</label><div class="desc">Applies the port, bootstrap peers and the checks above. Chats in progress are cut off.</div></div><button class="btn outline sm" id="restartgw">Restart</button></div></div>
               <div class="setpanel" data-p="engine"><div class="sectitle">Engine</div><div class="secsub" style="margin-bottom:16px">The local engine your shared models run on. Changes apply when you restart sharing (below).</div>
-                <div class="field"><label>Engine</label><div class="input select drop" id="enginedrop" data-opts="auto-detect|ollama|vLLM|LM Studio|llama.cpp|Exo|ComfyUI"><span>auto-detect</span><span class="icon" data-i="chev"></span></div></div>
+                <div class="field"><label>Engine</label><div class="input select drop" id="enginedrop" data-opts="auto-detect|ollama|vLLM|SGLang|LM Studio|llama.cpp|Exo|ComfyUI"><span>auto-detect</span><span class="icon" data-i="chev"></span></div></div>
                 <div class="field"><label>Endpoint</label><div class="input mono" id="engineendpoint" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div class="desc">The engine's address. Leave it as is unless your engine runs on another port or machine.</div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Start engine automatically if it's down</label><div class="desc">Autostarts your default engine when OpenHydra launches.</div></div><div class="switch on" id="engineautostartsw" data-sw></div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Allow authenticity checks</label><div class="desc">Lets other nodes verify that your engine really runs the model it claims, by scoring short test texts (at most 2 at once). Works with Ollama and LM Studio (GGUF models, and MLX models on Macs) — OpenHydra briefly loads a second copy of the model to score them, then frees that memory — and with vLLM, SGLang, or llama.cpp / mistral.rs builds with OpenHydra's scoring endpoint. Passing earns a higher trust tier. Applies the next time you start sharing.</div></div><div class="switch" id="authchecksw" data-sw></div></div>

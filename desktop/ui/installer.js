@@ -96,7 +96,7 @@ import { emit } from "./bus";
   }
 
 
-  const ENGINES = [["Ollama", "ollama", "General-purpose local LLMs."], ["LM Studio", "lm-studio", "MLX-optimised models on Apple silicon."], ["llama.cpp", "llama.cpp", "Lightweight GGUF runtime."], ["ComfyUI", "comfyui", "Image generation — Stable Diffusion, Flux."], ["vLLM", "vllm", "High-throughput serving. Needs Python + GPU."], ["Exo", "exo", "Shard big models across your devices."]];
+  const ENGINES = [["Ollama", "ollama", "General-purpose local LLMs."], ["LM Studio", "lm-studio", "MLX-optimised models on Apple silicon."], ["llama.cpp", "llama.cpp", "Lightweight GGUF runtime."], ["ComfyUI", "comfyui", "Image generation — Stable Diffusion, Flux."], ["vLLM", "vllm", "High-throughput serving. Needs Python + GPU."], ["SGLang", "sglang", "High-throughput serving. Needs Linux + NVIDIA GPU."], ["Exo", "exo", "Shard big models across your devices."]];
   // Engines OpenHydra can start on demand (self-serving; no model/cluster arg) → get a "Run" CTA.
   const RUNNABLE = new Set(["ollama", "lm-studio"]);
   export function renderEngines() {

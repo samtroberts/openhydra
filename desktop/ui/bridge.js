@@ -192,6 +192,10 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       if (args.engine === "vllm") return { engine: "vllm", supported: true, verified: false,
         already_installed: (mk.installedEngines || ["ollama"]).includes("vllm"), cli_available: false,
         summary: "Install vLLM for Apple Silicon via the community vllm-metal plugin (MLX backend, prebuilt wheels — no source compile). Runs install.sh into ~/.venv-vllm-metal.", blocker: null };
+      // SGLang ships Linux wheels only, so this macOS mock host can't install it.
+      if (args.engine === "sglang") return { engine: "sglang", supported: false, verified: false,
+        already_installed: false, cli_available: false, summary: "",
+        blocker: "SGLang has no macOS build — on a Mac, use vLLM (vllm-metal), Ollama or LM Studio." };
       const supported = ["ollama", "llama.cpp", "lm-studio", "comfyui", "exo"].includes(args.engine);
       const installed = (mk.installedEngines || ["ollama"]).includes(args.engine);
       const cliAvailable = ["comfyui", "exo"].includes(args.engine); // macOS: app default + CLI option
