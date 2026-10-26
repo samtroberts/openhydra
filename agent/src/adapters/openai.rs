@@ -42,6 +42,9 @@ pub const DEFAULT_VLLM_URL: &str = "http://127.0.0.1:8000";
 pub const DEFAULT_LM_STUDIO_URL: &str = "http://127.0.0.1:1234";
 /// SGLang's default serve address (`--port 30000`).
 pub const DEFAULT_SGLANG_URL: &str = "http://127.0.0.1:30000";
+/// moex's default serve address (`moex serve`, port 8765): a CUDA engine for Qwen3.5/3.6-35B-A3B
+/// on small-VRAM GPUs (github.com/neerajdad123-byte/moe).
+pub const DEFAULT_MOEX_URL: &str = "http://127.0.0.1:8765";
 
 // ── /v1/models (only the fields we use; unknown fields ignored) ──
 

@@ -29,7 +29,7 @@ use crate::adapters::comfyui::{ComfyUiAdapter, DEFAULT_COMFYUI_URL};
 use crate::adapters::exo::{ExoAdapter, DEFAULT_EXO_URL};
 use crate::adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 use crate::adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
-use crate::adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_SGLANG_URL, DEFAULT_VLLM_URL};
+use crate::adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_MOEX_URL, DEFAULT_SGLANG_URL, DEFAULT_VLLM_URL};
 use crate::http::ReqwestClient;
 
 /// Connect timeout for a detection probe. Localhost refuses instantly when a port is dead,
@@ -71,6 +71,7 @@ fn probe_specs() -> Vec<ProbeSpec> {
         ProbeSpec { label: "lm-studio", url: DEFAULT_LM_STUDIO_URL, build: build_lmstudio },
         ProbeSpec { label: "vllm", url: DEFAULT_VLLM_URL, build: build_vllm },
         ProbeSpec { label: "sglang", url: DEFAULT_SGLANG_URL, build: build_sglang },
+        ProbeSpec { label: "moex", url: DEFAULT_MOEX_URL, build: build_moex },
         ProbeSpec { label: "exo", url: DEFAULT_EXO_URL, build: build_exo },
         ProbeSpec { label: "comfyui", url: DEFAULT_COMFYUI_URL, build: build_comfyui },
     ]
@@ -102,6 +103,10 @@ fn build_vllm(u: &str, scoring: bool) -> Result<SharedAdapter, AdapterError> {
 }
 fn build_sglang(u: &str, scoring: bool) -> Result<SharedAdapter, AdapterError> {
     build_openai(u, "sglang", scoring)
+}
+/// moex returns no `logprobs`, so prompt scoring can't run on it: never enabled, even when asked.
+fn build_moex(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
+    build_openai(u, "moex", false)
 }
 fn build_comfyui(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
     Ok(Arc::new(ComfyUiAdapter::new(u, probe_client()?)))
@@ -343,6 +348,20 @@ mod tests {
         let multi = MultiAdapter::from_engines(vec![engine("ollama", "A", &["m1"])]);
         let err = multi.serve_stream(&infer("nope"), &mut |_| {}).unwrap_err();
         assert!(matches!(err, AdapterError::Http(_)));
+    }
+
+    #[test]
+    fn probe_specs_have_distinct_labels_and_ports() {
+        let specs = probe_specs();
+        let mut labels: Vec<_> = specs.iter().map(|s| s.label).collect();
+        let mut urls: Vec<_> = specs.iter().map(|s| s.url).collect();
+        labels.sort();
+        labels.dedup();
+        urls.sort();
+        urls.dedup();
+        assert_eq!(labels.len(), specs.len(), "duplicate engine label");
+        assert_eq!(urls.len(), specs.len(), "two engines probed on the same port");
+        assert!(specs.iter().any(|s| s.label == "moex" && s.url == DEFAULT_MOEX_URL));
     }
 
     #[test]
