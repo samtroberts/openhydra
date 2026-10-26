@@ -43,7 +43,7 @@ pub const DEFAULT_SEED_URL: &str = "https://dl.openhydra.co/seeds/index.json";
 /// (one still naming a seed since removed, served by a compromised bucket or CDN) can't be what a
 /// fresh install starts from. Signing a new list means raising this in the same commit; the
 /// seed-list workflow publishes the list on the push to main, before any release tag needs it.
-pub const MIN_SEQUENCE: u64 = 1;
+pub const MIN_SEQUENCE: u64 = 2;
 
 /// How often a gateway checks for a newer list after a good fetch (a conditional request).
 pub const REFRESH_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -430,14 +430,16 @@ mod tests {
         let cache = dir.path().join("seed-providers.json");
         let store = SeedStore::new(&pinned(), "https://example.invalid/seeds.json", Some(cache.clone()));
         assert!(store.current().seeds.is_empty(), "a build trusts no seed of its own");
-        assert!(store.offer(&sign(&list(2, vec![seed(1, "a")]), &key()).unwrap(), Some("\"e2\"".into())).unwrap());
-        assert!(!store.offer(&sign(&list(1, vec![seed(2, "old")]), &key()).unwrap(), None).unwrap(), "an older list is not taken");
-        assert!(!store.offer(&sign(&list(2, vec![seed(2, "same seq")]), &key()).unwrap(), None).unwrap());
-        assert!(store.offer(&sign(&list(3, vec![]), &SigningKey::from_bytes(&[9; 32])).unwrap(), None).is_err());
+        // Sequences from this build's floor up, so the test holds whatever MIN_SEQUENCE is.
+        let s = MIN_SEQUENCE;
+        assert!(store.offer(&sign(&list(s + 1, vec![seed(1, "a")]), &key()).unwrap(), Some("\"e2\"".into())).unwrap());
+        assert!(!store.offer(&sign(&list(s, vec![seed(2, "old")]), &key()).unwrap(), None).unwrap(), "an older list is not taken");
+        assert!(!store.offer(&sign(&list(s + 1, vec![seed(2, "same seq")]), &key()).unwrap(), None).unwrap());
+        assert!(store.offer(&sign(&list(s + 2, vec![]), &SigningKey::from_bytes(&[9; 32])).unwrap(), None).is_err());
         assert_eq!(store.current().public_keys(), [seed(1, "a").public_key].into_iter().collect());
         // A restart starts from the kept copy.
         let again = SeedStore::new(&pinned(), "https://example.invalid/seeds.json", Some(cache));
-        assert_eq!(again.current().sequence, 2);
+        assert_eq!(again.current().sequence, s + 1);
         let plain = SeedStore::new(&pinned(), "http://example.com/seeds.json", None);
         assert!(plain.refresh(&reqwest::blocking::Client::new()).unwrap_err().contains("plain http"));
     }
