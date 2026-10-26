@@ -1,0 +1,72 @@
+#!/bin/bash
+# OpenHydra seed provider (@SEED_NAME@): Qwen3.8-27B on HyperQwen, first-boot setup.
+# Rendered by ops/seeds/render.sh, which fills in the seed's identity; the rendered file is
+# private (it holds the key) and stays in ~/.openhydra-seeds, never in the repo.
+# Expects the AWS Deep Learning Base GPU AMI (Ubuntu 24.04: NVIDIA driver + Docker) on an A10G
+# (g5). Logs: /var/log/openhydra-seed.log. On a fresh instance (a spot relaunch) the model is
+# downloaded and prepared again: about 15-40 minutes before the seed answers.
+set -euo pipefail
+exec >>/var/log/openhydra-seed.log 2>&1
+echo "== seed setup start $(date -u +%FT%TZ)"
+export DEBIAN_FRONTEND=noninteractive
+export HOME=/root
+
+id openhydra >/dev/null 2>&1 || useradd --system --home-dir /var/lib/openhydra --shell /usr/sbin/nologin openhydra
+install -d -m 700 -o openhydra -g openhydra /etc/openhydra /var/lib/openhydra
+echo "@IDENTITY_B64@" | base64 -d > /etc/openhydra/identity.json
+chown openhydra:openhydra /etc/openhydra/identity.json && chmod 600 /etc/openhydra/identity.json
+
+# HyperQwen, pinned: the commit and image the 24-26 Oct tests measured.
+HQ_COMMIT=ce9615c
+HQ_IMAGE=ghcr.io/syv-ai/hyperqwen:sha-ce9615c
+if [ ! -d /opt/hyperqwen/.git ]; then git clone -q https://github.com/syv-ai/HyperQwen /opt/hyperqwen; fi
+cd /opt/hyperqwen && git fetch -q origin && git checkout -q "$HQ_COMMIT"
+# Single-user mode (DFlash2). KV_MEM is HyperQwen's 24 GiB-card constant: an A10G has about
+# 1.5 GB less, so size the pool from GPU_UTIL instead, and 64k context doesn't fit: 32k.
+cp .env.example .env
+printf 'KV_MEM=\nMAX_LEN=32768\n' >> .env
+docker pull -q "$HQ_IMAGE" && docker tag "$HQ_IMAGE" ghcr.io/syv-ai/hyperqwen:latest
+
+cat > /etc/systemd/system/hyperqwen.service <<'UNIT'
+[Unit]
+Description=HyperQwen (Qwen3.8-27B) for the OpenHydra seed
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+[Service]
+WorkingDirectory=/opt/hyperqwen
+ExecStart=/usr/bin/docker compose --profile single up
+ExecStop=/usr/bin/docker compose --profile single down
+Restart=always
+RestartSec=15
+TimeoutStartSec=0
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+curl -fsSL https://openhydra.co/install.sh | OPENHYDRA_BIN_DIR=/usr/local/bin sh
+
+# The agent starts once HyperQwen answers (the first boot downloads ~21 GB and prepares the model).
+# No --bootstrap: the agent joins through OpenHydra's public bootstraps by default.
+cat > /etc/systemd/system/openhydra-provider.service <<'UNIT'
+[Unit]
+Description=OpenHydra seed provider (@SEED_NAME@)
+After=network-online.target hyperqwen.service
+Wants=network-online.target hyperqwen.service
+[Service]
+User=openhydra
+Group=openhydra
+Environment=HOME=/var/lib/openhydra
+ExecStartPre=/bin/sh -c 'until curl -sf http://127.0.0.1:18020/v1/models >/dev/null; do sleep 15; done'
+ExecStart=/usr/local/bin/openhydra --identity /etc/openhydra/identity.json --listen /ip4/0.0.0.0/tcp/4001 --listen /ip4/0.0.0.0/udp/4001/quic-v1 --listen /ip6/::/tcp/4001 --listen /ip6/::/udp/4001/quic-v1 provide --engine-kind openai --engine http://127.0.0.1:18020 --share-models qwen3.8-27b --declare-quant int4 --db /var/lib/openhydra/provider.redb @PROMPT_SCORING@
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now hyperqwen
+systemctl enable --now openhydra-provider
+echo "== seed setup done $(date -u +%FT%TZ) (the provider starts once HyperQwen is ready)"
