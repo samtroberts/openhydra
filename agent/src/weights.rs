@@ -32,7 +32,7 @@ fn file_sha256_hex(path: &Path) -> io::Result<String> {
 /// its `model*.safetensors` (else every `*.safetensors`). Other files (a LoRA's
 /// `adapters.safetensors`, a leftover original checkpoint) don't change the digest, and a member that
 /// can't be read (a broken link of a half-downloaded snapshot) is an error, never left out.
-fn dir_members(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn dir_members(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
     let mut names: Vec<String> = match std::fs::read(dir.join("model.safetensors.index.json")) {
         Ok(index) => {

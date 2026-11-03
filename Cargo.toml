@@ -11,7 +11,7 @@ resolver = "2"
 members = ["network", "protocol", "agent"]
 # The patched libp2p-quic lives inside the `network` tree and is consumed via the
 # [patch] below, not as a workspace member.
-exclude = ["network/patched-deps/libp2p-quic"]
+exclude = ["network/patched-deps/libp2p-quic", "engine-mlx/rust"]
 
 # `[profile.*]` and `[patch.*]` are honored only in the workspace root manifest, so
 # they move here from network/Cargo.toml. The patch path is relative to this file.

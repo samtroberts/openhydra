@@ -374,6 +374,7 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
     let mut chunk_tokens = 0u64;
     let mut usage: Option<Usage> = None;
     let mut done = false;
+    let mut hit_token_limit = false;
     let mut tool_acc: Vec<ToolAcc> = Vec::new();
     // The OpenAI stream carries no timings; the engine is local, so measure them here —
     // start→first-token ≈ prefill, first-token→end ≈ decode.
@@ -449,10 +450,11 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
                     accumulate_tool_calls(&mut tool_acc, tcs);
                 }
             }
-            if choice.finish_reason.is_some() {
+            if let Some(reason) = &choice.finish_reason {
                 // A clean stop (content, `tool_calls`, `length`, …); keep reading — the
-                // usage chunk may still follow.
+                // usage chunk may still follow. `length` is the engine's token limit.
                 done = true;
+                hit_token_limit = reason == "length";
             }
         }
         if chunk.usage.is_some() {
@@ -505,7 +507,7 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
             function: ToolCallFunction { name: a.name, arguments: a.arguments },
         })
         .collect();
-    Ok(ServeOutcome { tokens, done, engine, tool_calls })
+    Ok(ServeOutcome { tokens, done, engine, tool_calls, hit_token_limit })
 }
 
 /// Merge one chunk's streamed tool-call fragments into the per-`index` accumulators: set
@@ -684,6 +686,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(out, "<think>thinking forever</think>");
+    }
+
+    #[test]
+    fn a_length_finish_is_reported_as_the_engine_s_token_limit() {
+        let (_, cut) = serve(&[r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":"length"}]}"#, "data: [DONE]"]).unwrap();
+        assert!(cut.done && cut.hit_token_limit);
+        let (_, whole) = serve(&[r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#, "data: [DONE]"]).unwrap();
+        assert!(whole.done && !whole.hit_token_limit);
     }
 
     #[test]

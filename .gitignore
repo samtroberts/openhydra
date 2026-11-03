@@ -168,3 +168,11 @@ desktop/src-tauri/WixTools/
 # openhydra-scorer build work dir (scorer/build.sh)
 scorer/.build/
 scorer/mistralrs/.build/
+
+# Built-in Mac engine (engine-mlx/): SwiftPM checkouts, xcodebuild output and the linking crate's target.
+engine-mlx/.build/
+engine-mlx/.xcbuild/
+engine-mlx/.xcbuild.log
+engine-mlx/.swiftpm/
+engine-mlx/rust/target/
+engine-mlx/rust/Cargo.lock

@@ -24,6 +24,8 @@
 //! * [`comfyui`] — ComfyUI (image generation). Detects installed Stable-Diffusion
 //!   checkpoints as models; serves txt2img via a queued workflow, returning the image
 //!   as a base64 data-URL in the completion stream. Bills sampler steps as tokens.
+//! * `mlx_swift` — the built-in Mac engine: Apple's MLX running in this process (Phase 1a of
+//!   ATTESTED_ENGINE_TIER_PLAN_v1), compiled in only with the `mlx-swift` feature.
 //! * [`exo`] — an Exo MLX cluster. Also serves over the OpenAI route, but detects via
 //!   `/state` (only placed-and-ready instances) so it advertises what it can actually serve,
 //!   not Exo's whole downloadable catalog (`/v1/models`).
@@ -41,6 +43,9 @@ pub mod embeddings;
 pub mod exo;
 pub mod gemini;
 pub mod llama_cpp;
+/// The built-in Mac engine (Apple MLX in-process); `--features mlx-swift` on Apple Silicon only.
+#[cfg(all(feature = "mlx-swift", target_os = "macos", target_arch = "aarch64"))]
+pub mod mlx_swift;
 pub mod ollama;
 pub mod openai;
 pub mod scoring;

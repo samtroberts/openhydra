@@ -420,6 +420,7 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
                 ..EngineMetrics::default()
             },
             tool_calls: Vec::new(), // image gen has no tool calls
+            hit_token_limit: false,
         })
     }
 }

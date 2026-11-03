@@ -106,6 +106,9 @@ struct ChatStreamChunk {
     message: ChatStreamMessage,
     #[serde(default)]
     done: bool,
+    /// Why the engine ended, on the final chunk: `"stop"`, or `"length"` at its token limit.
+    #[serde(default)]
+    done_reason: Option<String>,
     // Engine metrics — all present on the final (`done`) chunk.
     #[serde(default)]
     eval_count: Option<u64>,
@@ -370,6 +373,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         let mut eval_count = None;
         let mut engine = crate::adapter::EngineMetrics::default();
         let mut done = false;
+        let mut hit_token_limit = false;
         let mut first_token_at: Option<std::time::Instant> = None;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         // Reasoning models stream chain-of-thought in `message.thinking`, separate from
@@ -449,6 +453,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
             }
             if chunk.done {
                 done = true;
+                hit_token_limit = chunk.done_reason.as_deref() == Some("length");
                 break;
             }
         }
@@ -485,7 +490,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
                 engine.eval_count = tokens;
             }
         }
-        Ok(ServeOutcome { tokens, done, engine, tool_calls })
+        Ok(ServeOutcome { tokens, done, engine, tool_calls, hit_token_limit })
     }
 }
 
@@ -820,6 +825,17 @@ mod tests {
         assert_eq!(outcome.tool_calls[0].function.name, "a");
         assert_eq!(outcome.tool_calls[1].id, "call_2");
         assert_eq!(outcome.tool_calls[1].function.name, "b");
+    }
+
+    #[test]
+    fn a_length_done_reason_is_reported_as_the_engine_s_token_limit() {
+        let serve = |reason: &str| {
+            let last = format!(r#"{{"message":{{"role":"assistant","content":""}},"done":true,"done_reason":"{reason}","eval_count":2}}"#);
+            let lines = [r#"{"message":{"role":"assistant","content":"Hi"},"done":false}"#, last.as_str()];
+            serve_adapter(&lines).serve_stream(&user_req("hi"), &mut |_| {}).unwrap()
+        };
+        assert!(serve("length").hit_token_limit);
+        assert!(!serve("stop").hit_token_limit);
     }
 
     #[test]

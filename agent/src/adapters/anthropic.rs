@@ -65,6 +65,9 @@ struct StreamEvent {
 struct EventDelta {
     #[serde(default)]
     text: Option<String>,
+    /// On `message_delta` — why the message ended (`"max_tokens"` at the token limit).
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct Usage {
@@ -179,6 +182,7 @@ impl<H: HttpClient> EngineAdapter for AnthropicAdapter<H> {
 
         let mut chunk_tokens = 0u64;
         let (mut input, mut output, mut done) = (0u64, 0u64, false);
+        let mut hit_token_limit = false;
         for line in lines {
             // The caller asked to stop (out of budget, or the consumer left): drop the stream, which
             // makes the engine stop generating, and return what was sent.
@@ -212,6 +216,9 @@ impl<H: HttpClient> EngineAdapter for AnthropicAdapter<H> {
                     if let Some(u) = &ev.usage {
                         output = u.output_tokens;
                     }
+                    if let Some(reason) = ev.delta.as_ref().and_then(|d| d.stop_reason.as_deref()) {
+                        hit_token_limit = reason == "max_tokens";
+                    }
                 }
                 "message_stop" => done = true,
                 _ => {}
@@ -224,6 +231,7 @@ impl<H: HttpClient> EngineAdapter for AnthropicAdapter<H> {
             done,
             engine: EngineMetrics { prompt_eval_count: input, eval_count: output, ..EngineMetrics::default() },
             tool_calls: Vec::new(),
+            hit_token_limit,
         })
     }
 }
@@ -287,6 +295,21 @@ mod tests {
         let models = a.detect_models().unwrap();
         assert_eq!(models.iter().map(|m| m.engine_ref.as_str()).collect::<Vec<_>>(),
                    vec!["claude-3-5-sonnet", "claude-3-opus"]);
+    }
+
+    #[test]
+    fn a_max_tokens_stop_is_reported_as_the_engine_s_token_limit() {
+        let serve = |reason: &str| {
+            let lines = vec![
+                r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#.to_string(),
+                format!(r#"data: {{"type":"message_delta","delta":{{"stop_reason":"{reason}"}},"usage":{{"output_tokens":1}}}}"#),
+                r#"data: {"type":"message_stop"}"#.to_string(),
+            ];
+            let mock = MockHttp { stream_lines: lines, ..Default::default() };
+            AnthropicAdapter::new(DEFAULT_ANTHROPIC_URL, "sk-test", mock).serve_stream(&req(vec![msg("user", "hi")]), &mut |_| {}).unwrap()
+        };
+        assert!(serve("max_tokens").hit_token_limit);
+        assert!(!serve("end_turn").hit_token_limit);
     }
 
     #[test]

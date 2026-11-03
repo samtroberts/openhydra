@@ -421,6 +421,10 @@ enum EngineKind {
     Comfyui,
     /// Any other OpenAI-compatible server (LocalAI, …).
     Openai,
+    /// The built-in Mac engine: Apple's MLX running inside this process, serving one MLX model folder
+    /// (`--model-dir`), one request at a time (builds with the built-in engine only: `--features
+    /// mlx-swift` on Apple Silicon).
+    MlxSwift,
 }
 
 impl EngineKind {
@@ -436,6 +440,8 @@ impl EngineKind {
             EngineKind::LlamaCpp => DEFAULT_LLAMACPP_URL,
             EngineKind::Exo => DEFAULT_EXO_URL,
             EngineKind::Comfyui => DEFAULT_COMFYUI_URL,
+            // In-process: there is no URL to reach.
+            EngineKind::MlxSwift => "",
         }
     }
 }
@@ -598,6 +604,21 @@ struct ProvideArgs {
     /// built-in SD txt2img graph.
     #[arg(long = "comfyui-workflow-dir")]
     comfyui_workflow_dir: Option<PathBuf>,
+
+    /// The MLX model folder the built-in engine serves (`--engine-kind mlx-swift` only): a folder with
+    /// `config.json`, `*.safetensors` and the tokenizer files, e.g. a Hugging Face cache snapshot.
+    #[arg(long = "model-dir")]
+    model_dir: Option<PathBuf>,
+
+    /// The name consumers address the built-in engine's model by (`--engine-kind mlx-swift` only).
+    /// Default: the Hugging Face id the folder came from (`org/name`), else the folder's name.
+    #[arg(long = "model-name")]
+    model_name: Option<String>,
+
+    /// The most tokens (prompt plus reply) one request may use with the built-in engine (`--engine-kind
+    /// mlx-swift` only). Default: what fits this Mac's GPU memory beside the model, at most the model's own.
+    #[arg(long = "max-context")]
+    max_context: Option<u64>,
 
     /// If the engine's server isn't already up, start it before announcing. Off by default.
     /// Only applies to engines OpenHydra can launch unattended — `ollama` (`ollama serve`)
@@ -1281,6 +1302,11 @@ fn provide(
     economy: std::sync::Arc<EconomyStats>,
     args: ProvideArgs,
 ) -> Result<(), String> {
+    if args.engine_kind != EngineKind::MlxSwift
+        && (args.model_dir.is_some() || args.model_name.is_some() || args.max_context.is_some())
+    {
+        return Err("--model-dir, --model-name and --max-context are for --engine-kind mlx-swift".into());
+    }
     // Auto mode scans the standard ports and serves the union of whatever's running — the
     // zero-config default. It handles its own autostart, so it branches out before we resolve
     // a single engine URL.
@@ -1289,6 +1315,10 @@ fn provide(
             return Err("with --engine-kind auto, use --prompt-scoring auto (each engine is identified separately)".into());
         }
         return provide_auto(net, stats, economy, args);
+    }
+    // The built-in engine scores prompts itself and has no URL, side-scorer or autostart.
+    if args.engine_kind == EngineKind::MlxSwift {
+        return provide_built_in(net, stats, economy, args);
     }
     let scorer = side_scorer(&args)?;
     if args.prompt_scoring.is_some()
@@ -1310,7 +1340,7 @@ fn provide(
     // Bind the adapter first so its construction borrow of `url` ends before `url` is
     // moved into `run_single_engine`.
     match args.engine_kind {
-        EngineKind::Auto => unreachable!("handled above"),
+        EngineKind::Auto | EngineKind::MlxSwift => unreachable!("handled above"),
         EngineKind::Ollama => {
             let a = live_ollama(&url).map_err(|e| format!("engine {url}: {e}"))?;
             run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
@@ -1360,6 +1390,65 @@ fn provide(
             };
             run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
+    }
+}
+
+/// Provider over the built-in Mac engine (`--engine-kind mlx-swift`): load `--model-dir` in-process and
+/// serve it one request at a time.
+fn provide_built_in(
+    net: NetworkHandle,
+    stats: std::sync::Arc<TransferStats>,
+    economy: std::sync::Arc<EconomyStats>,
+    args: ProvideArgs,
+) -> Result<(), String> {
+    for (given, flag) in [
+        (args.engine.is_some(), "--engine"),
+        (args.engine_autostart, "--engine-autostart"),
+        (args.side_scorer.is_some(), "--side-scorer"),
+        (args.mlx_scorer.is_some(), "--mlx-scorer"),
+        (args.declare_quant.is_some(), "--declare-quant"),
+        (args.comfyui_workflow_dir.is_some(), "--comfyui-workflow-dir"),
+    ] {
+        if given {
+            return Err(format!("{flag} doesn't apply to --engine-kind mlx-swift (the built-in engine)"));
+        }
+    }
+    if matches!(args.prompt_scoring, Some(ScoringChoice::Dialect(_))) {
+        return Err("the built-in engine scores prompts itself: use --prompt-scoring auto".into());
+    }
+    #[cfg(all(feature = "mlx-swift", target_os = "macos", target_arch = "aarch64"))]
+    {
+        let dir = args.model_dir.clone().ok_or("--engine-kind mlx-swift needs --model-dir <MLX model folder>")?;
+        let started = std::time::Instant::now();
+        let adapter = openhydra_agent::adapters::mlx_swift::MlxSwiftAdapter::load(&dir, args.model_name.as_deref(), args.max_context)
+            .map_err(|e| format!("built-in engine: {e}"))?;
+        let m = adapter.model();
+        eprintln!(
+            "openhydra-agent: built-in engine (Apple MLX, in-process) loaded {} in {:.1}s — weights {}, config {}",
+            m.engine_ref,
+            started.elapsed().as_secs_f64(),
+            m.weight_digest,
+            adapter.config_sha256
+        );
+        eprintln!(
+            "openhydra-agent: built-in engine serves one request at a time (others are turned away so their \
+             consumers fail over), with a {}-token context",
+            adapter.context_length
+        );
+        if !adapter.ignored_weights.is_empty() {
+            eprintln!(
+                "openhydra-agent: built-in engine ignored weights files that aren't the model's own: {:?}",
+                adapter.ignored_weights
+            );
+        }
+        run_provider(adapter, "built-in".to_string(), args, net, stats, economy)
+    }
+    #[cfg(not(all(feature = "mlx-swift", target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (net, stats, economy, args);
+        Err("--engine-kind mlx-swift needs a build with the built-in Mac engine (`--features mlx-swift` on Apple \
+             Silicon, after engine-mlx/build.sh); this one has none"
+            .into())
     }
 }
 

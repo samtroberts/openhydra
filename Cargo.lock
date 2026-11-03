@@ -2990,6 +2990,7 @@ dependencies = [
  "k256",
  "libc",
  "notify",
+ "openhydra-mlx-engine",
  "openhydra-network",
  "openhydra-protocol",
  "opentelemetry",
@@ -3012,6 +3013,10 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "openhydra-mlx-engine"
+version = "0.1.0"
 
 [[package]]
 name = "openhydra-network"

@@ -327,6 +327,11 @@ pub struct ServeOutcome {
     /// Terminal structured data — carried on the return value, not via `on_delta` (which is
     /// text-only). The provider relays these back as a [`ServeChunk::ToolCalls`] frame.
     pub tool_calls: Vec<ToolCall>,
+    /// The engine ended the reply because it reached its token limit (`max_tokens`, or the room
+    /// left in its context), not because the model finished: the answer is cut short. Only as the
+    /// engine itself reports it (OpenAI `finish_reason: "length"`, Ollama `done_reason: "length"`,
+    /// …); `false` where the engine doesn't say.
+    pub hit_token_limit: bool,
 }
 
 /// A model an engine currently serves, ready to advertise to the swarm.
@@ -418,6 +423,14 @@ pub trait EngineAdapter {
     fn weights_path(&self, model_ref: &str) -> Option<std::path::PathBuf> {
         let _ = model_ref;
         None
+    }
+
+    /// Whether the engine runs one request at a time (an in-process engine with no batching). The
+    /// provider then refuses a serve at once while one is running, so its consumer fails over instead
+    /// of queueing, and answers challenges from their own workers. `false` by default: external
+    /// engines queue and batch on their own.
+    fn one_request_at_a_time(&self) -> bool {
+        false
     }
 }
 

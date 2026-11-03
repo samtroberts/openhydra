@@ -1116,6 +1116,16 @@ fn sample_tps(e: &crate::adapter::EngineMetrics) -> f64 {
     }
 }
 
+/// [`Provider::stream_wanted`] over the stream table alone, so a watcher thread can ask it without
+/// sharing the whole provider: its consumer still polls (within [`STREAM_ABANDON_MS`]) and it is open.
+fn stream_wanted_in(streams: &Mutex<HashMap<[u8; 16], StreamBuffer>>, nonce: &[u8; 16]) -> bool {
+    let now = now_unix_ms();
+    streams.lock().unwrap_or_else(|e| e.into_inner()).get(nonce).is_some_and(|b| {
+        let limit = if b.polled { STREAM_ABANDON_MS } else { NEVER_POLLED_ABANDON_MS };
+        !b.closed && now.saturating_sub(b.last_poll_ms) <= limit
+    })
+}
+
 /// F5: run a generation, catching a panic in the adapter/engine and turning it into a terminal
 /// `Error` chunk so a bug can't strand the consumer. Used by **both** serve transports:
 /// - streaming (`SERVE_STREAM`) — the appended terminal flips the stream buffer's `done`, so it
@@ -1135,9 +1145,10 @@ fn generate_guarded(
     adapter: &dyn EngineAdapter,
     on_chunk: &mut dyn FnMut(&[u8]),
     keep_going: &mut dyn FnMut(u64) -> bool,
+    still_wanted: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> ServeSummary {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::serve::handle_serve_request_within(req, adapter, on_chunk, keep_going)
+        crate::serve::handle_serve_request_watched(req, adapter, on_chunk, keep_going, still_wanted)
     })) {
         Ok(summary) => summary,
         Err(_) => {
@@ -2016,15 +2027,7 @@ impl<A: EngineAdapter> Provider<A> {
     /// Whether the stream under `nonce` should keep generating: its consumer still polls it (within
     /// [`STREAM_ABANDON_MS`]), and it is still open (not settled, evicted, or expired).
     fn stream_wanted(&self, nonce: &[u8; 16]) -> bool {
-        let now = now_unix_ms();
-        self.streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(nonce)
-            .is_some_and(|b| {
-                let limit = if b.polled { STREAM_ABANDON_MS } else { NEVER_POLLED_ABANDON_MS };
-                !b.closed && now.saturating_sub(b.last_poll_ms) <= limit
-            })
+        stream_wanted_in(&self.streams, nonce)
     }
 
     /// Handle a [`STREAM_CLOSE`]: `payload` = `nonce(16) ‖ offset(4, big-endian)`.
@@ -2494,9 +2497,16 @@ impl<A: EngineAdapter> Provider<A> {
         let mut budget = self.serve_budget(reservation.as_ref());
         // The engine is asked for its own id; the commitment and receipt keep the requested name.
         req.model_ref = engine_ref.clone();
-        let summary = generate_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c), &mut |sent| {
-            self.stream_wanted(&nonce) && budget(sent)
-        });
+        // Asked between deltas, and (for the consumer still polling) from a watcher while none flow.
+        let streams = &self.streams;
+        let still_wanted = move || stream_wanted_in(streams, &nonce);
+        let summary = generate_guarded(
+            req,
+            &self.adapter,
+            &mut |c| self.stream_append(nonce, c),
+            &mut |sent| self.stream_wanted(&nonce) && budget(sent),
+            Some(&still_wanted),
+        );
         // B-S1: the serve's commitment (what its settlement receipt is checked against) is what the
         // consumer's polls returned, recorded as they return it (`commit_fetched`): a stream it read
         // only part of is owed for that part, and one it read nothing of is owed nothing.
@@ -3079,7 +3089,17 @@ impl<A: EngineAdapter> Provider<A> {
     where
         A: Send + Sync + 'static,
     {
-        let pool = WorkerPool::new(max_concurrency);
+        // An engine that runs one request at a time gets one serve worker and no queue: a serve
+        // that arrives while it's busy is shed at once (its consumer fails over) rather than waiting
+        // behind it until the consumer times out. Its challenges (log-prob scoring, model info,
+        // attestation) get their own workers so they never wait behind a generation either.
+        let exclusive = self.adapter.one_request_at_a_time();
+        // The serve workers there really are. With one, the leecher throttle never sleeps (it would
+        // hold the only worker while every other serve is shed): such an engine serves leechers at
+        // full priority.
+        let max_concurrency = if exclusive { 1 } else { max_concurrency };
+        let pool = if exclusive { WorkerPool::with_queue(1, 0) } else { WorkerPool::new(max_concurrency) };
+        let challenge_pool = exclusive.then(|| WorkerPool::new(CONTROL_WORKERS));
         let control_pool = WorkerPool::new(CONTROL_WORKERS);
         let receipt_pool = WorkerPool::new(CONTROL_WORKERS);
         // R6/B2: event-driven share-policy reload. Spawn a filesystem watcher so a desktop toggle
@@ -3144,6 +3164,8 @@ impl<A: EngineAdapter> Provider<A> {
                     &receipt_pool
                 } else if is_control_message(data.first().copied()) {
                     &control_pool
+                } else if let (Some(challenges), true) = (challenge_pool.as_ref(), is_score || is_attest) {
+                    challenges
                 } else {
                     &pool
                 };
@@ -3587,6 +3609,7 @@ impl<A: EngineAdapter> Provider<A> {
                             &self.adapter,
                             &mut |c| chunks.push(c.to_vec()),
                             &mut self.serve_budget(reservation.as_ref()),
+                            None,
                         );
                         // B-S1: record what we served under the consumer's committed nonce so
                         // its settlement receipt can be validated (right tokens/model, once). Not
@@ -4063,7 +4086,7 @@ mod tests {
         ) -> Result<ServeOutcome, AdapterError> {
             on_delta("Hello");
             on_delta(" world");
-            Ok(ServeOutcome { tokens: 5, done: true, engine: Default::default(), tool_calls: Vec::new() })
+            Ok(ServeOutcome { tokens: 5, done: true, engine: Default::default(), tool_calls: Vec::new(), hit_token_limit: false })
         }
     }
 
@@ -4864,7 +4887,7 @@ mod tests {
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.
-        let summary = generate_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()), &mut |_| true);
+        let summary = generate_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()), &mut |_| true, None);
         assert!(!summary.ok);
         assert_eq!(summary.tokens, 0, "no tokens → no commitment recorded");
         let last = frames.last().expect("a terminal frame was appended");
@@ -4991,7 +5014,7 @@ mod tests {
             fn serve_stream(&self, req: &InferenceRequest, on_delta: &mut dyn FnMut(&str)) -> Result<ServeOutcome, AdapterError> {
                 self.0.lock().unwrap().push(req.model_ref.clone());
                 on_delta("hi");
-                Ok(ServeOutcome { tokens: 1, done: true, engine: Default::default(), tool_calls: Vec::new() })
+                Ok(ServeOutcome { tokens: 1, done: true, engine: Default::default(), tool_calls: Vec::new(), hit_token_limit: false })
             }
         }
         const PATH: &str = "/data/models/Qwen2.5-7B";
@@ -5188,7 +5211,7 @@ mod tests {
                     self.0.fetch_add(1, Ordering::Relaxed);
                     on_delta("x ");
                 }
-                Ok(ServeOutcome { tokens: 1_000, done: true, engine: Default::default(), tool_calls: Vec::new() })
+                Ok(ServeOutcome { tokens: 1_000, done: true, engine: Default::default(), tool_calls: Vec::new(), hit_token_limit: false })
             }
         }
         let (_dir, provider) = test_provider(Counting(Default::default()));
@@ -5206,7 +5229,7 @@ mod tests {
         let run = |nonce: [u8; 16]| {
             generate_guarded(req(nonce), &provider.adapter, &mut |c| provider.stream_append(nonce, c), &mut |_| {
                 provider.stream_wanted(&nonce)
-            })
+            }, None)
         };
         // Polled recently: it runs to the end.
         let live = [1u8; 16];

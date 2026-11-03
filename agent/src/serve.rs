@@ -48,6 +48,13 @@ pub struct ServeMetrics {
     /// (`finish_reason: "length"`) rather than shown it as complete (review round 4 H8).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// The engine itself ended the reply at its token limit ([`ServeOutcome::hit_token_limit`]): the
+    /// client is told `finish_reason: "length"`, as for [`ServeMetrics::stopped`]. Absent (false) from
+    /// providers that predate it.
+    ///
+    /// [`ServeOutcome::hit_token_limit`]: crate::adapter::ServeOutcome::hit_token_limit
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hit_token_limit: bool,
 }
 
 /// The billing rule this build follows: the reported count is [`billable_tokens`]. 3: whitespace
@@ -546,6 +553,22 @@ pub fn handle_serve_request_within(
     send_chunk: &mut dyn FnMut(&[u8]),
     keep_going: &mut dyn FnMut(u64) -> bool,
 ) -> ServeSummary {
+    handle_serve_request_watched(req, adapter, send_chunk, keep_going, None)
+}
+
+/// How often [`handle_serve_request_watched`] asks whether the serve is still wanted.
+const STILL_WANTED_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// [`handle_serve_request_within`], plus `still_wanted`, asked every [`STILL_WANTED_EVERY`] from a helper
+/// thread while the engine runs. `keep_going` is only asked when text is sent; this also stops the
+/// engine when its consumer is gone while no text flows (a long prefill, a tool call being buffered).
+pub fn handle_serve_request_watched(
+    req: ServeRequest,
+    adapter: &dyn EngineAdapter,
+    send_chunk: &mut dyn FnMut(&[u8]),
+    keep_going: &mut dyn FnMut(u64) -> bool,
+    still_wanted: Option<&(dyn Fn() -> bool + Sync)>,
+) -> ServeSummary {
     // A deterministic serve pins temperature to 0 and carries a fixed seed, overriding any
     // temperature the request also set (2b). Otherwise the request's own sampling is used.
     // Engines disagree on what a zero cap means (some read it as "no limit"), and nothing generated
@@ -589,7 +612,27 @@ pub fn handle_serve_request_within(
                 stop.set();
             }
         };
-        adapter.serve_stream(&infer, &mut on_delta)
+        match still_wanted {
+            None => adapter.serve_stream(&infer, &mut on_delta),
+            Some(still_wanted) => {
+                let finished = std::sync::atomic::AtomicBool::new(false);
+                let watched = stop.clone();
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        while !finished.load(std::sync::atomic::Ordering::Relaxed) && !watched.is_set() {
+                            if !still_wanted() {
+                                watched.set();
+                                break;
+                            }
+                            std::thread::sleep(STILL_WANTED_EVERY);
+                        }
+                    });
+                    let outcome = adapter.serve_stream(&infer, &mut on_delta);
+                    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                    outcome
+                })
+            }
+        }
     };
     // Stopped early, the engine never reported its count: what was sent stands in for it.
     let outcome = outcome.map(|mut o| {
@@ -603,8 +646,13 @@ pub fn handle_serve_request_within(
 
     match outcome {
         Ok(o) => {
-            let metrics =
-                ServeMetrics { engine: o.engine, provider_serve_ns, billing: BILLING_VERSION, stopped: stop.is_set() };
+            let metrics = ServeMetrics {
+                engine: o.engine,
+                provider_serve_ns,
+                billing: BILLING_VERSION,
+                stopped: stop.is_set(),
+                hit_token_limit: o.hit_token_limit && !stop.is_set(),
+            };
             // Tool calls (terminal, structured) go in their own frame just before `Done`, so
             // the consumer sees text deltas → tool_calls → done in order.
             if !o.tool_calls.is_empty() {
@@ -829,6 +877,37 @@ mod tests {
         }
     }
 
+    /// An engine that sends no text and runs until it is told to stop (a long prefill, a buffered call).
+    struct Silent;
+    impl EngineAdapter for Silent {
+        fn engine_name(&self) -> &'static str {
+            "silent"
+        }
+        fn detect_models(&self) -> Result<Vec<crate::adapter::DetectedModel>, AdapterError> {
+            Ok(vec![])
+        }
+        fn serve_stream(&self, r: &InferenceRequest, _: &mut dyn FnMut(&str)) -> Result<crate::adapter::ServeOutcome, AdapterError> {
+            let started = std::time::Instant::now();
+            while !r.stop.is_set() {
+                if started.elapsed() > std::time::Duration::from_secs(10) {
+                    return Err(AdapterError::Provider("never stopped".into()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(Default::default())
+        }
+    }
+
+    #[test]
+    fn a_serve_with_no_text_flowing_stops_once_it_is_no_longer_wanted() {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(300);
+        let still_wanted = move || std::time::Instant::now() < deadline;
+        let mut frames = Vec::new();
+        handle_serve_request_watched(req("p"), &Silent, &mut |c| frames.push(c.to_vec()), &mut |_| true, Some(&still_wanted));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
     fn req(reply_to: &str) -> ServeRequest {
         ServeRequest {
             reply_to: reply_to.into(),
@@ -872,7 +951,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default(), tool_calls: Vec::new() })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default(), tool_calls: Vec::new(), hit_token_limit: false })
         }
     }
 
@@ -1143,7 +1222,7 @@ mod tests {
             ) -> Result<ServeOutcome, AdapterError> {
                 self.temperature.set(request.temperature);
                 self.seed.set(request.seed);
-                Ok(ServeOutcome { tokens: 1, done: true, engine: Default::default(), tool_calls: Vec::new() })
+                Ok(ServeOutcome { tokens: 1, done: true, engine: Default::default(), tool_calls: Vec::new(), hit_token_limit: false })
             }
         }
 
@@ -1192,6 +1271,7 @@ mod tests {
                     provider_serve_ns: 9_000,
                     billing: BILLING_VERSION,
                     stopped: true,
+                    hit_token_limit: true,
                 },
             },
             ServeChunk::Error("boom".into()),
@@ -1240,6 +1320,7 @@ mod tests {
                     done: true,
                     engine: Default::default(),
                     tool_calls: vec![tool_call("get_weather")],
+                    hit_token_limit: false,
                 })
             }
         }
@@ -1249,6 +1330,35 @@ mod tests {
         assert!(matches!(frames[1], ServeChunk::Done { tokens: 2, .. }));
         assert_eq!(summary.tool_calls.len(), 1);
         assert_eq!(summary.tool_calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn an_engine_at_its_token_limit_says_so_in_done() {
+        struct LimitStub;
+        impl EngineAdapter for LimitStub {
+            fn engine_name(&self) -> &'static str {
+                "limitstub"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                Ok(vec![])
+            }
+            fn serve_stream(
+                &self,
+                _request: &InferenceRequest,
+                on_delta: &mut dyn FnMut(&str),
+            ) -> Result<ServeOutcome, AdapterError> {
+                on_delta("cut");
+                Ok(ServeOutcome { tokens: 1, done: true, hit_token_limit: true, ..Default::default() })
+            }
+        }
+        let (frames, summary) = collect_chunks(&req("c").encode(), &LimitStub);
+        assert!(matches!(frames.last(), Some(ServeChunk::Done { metrics, .. }) if metrics.hit_token_limit && !metrics.stopped));
+        assert!(summary.metrics.hit_token_limit);
+        // The flag survives the wire, and a provider that predates it reads as false.
+        let done = ServeChunk::Done { tokens: 1, metrics: summary.metrics }.encode();
+        assert!(matches!(ServeChunk::decode(&done), Ok(ServeChunk::Done { metrics, .. }) if metrics.hit_token_limit));
+        let old: ServeMetrics = serde_json::from_str(r#"{"engine":{"total_duration_ns":0,"load_duration_ns":0,"prompt_eval_count":0,"prompt_eval_duration_ns":0,"eval_count":1,"eval_duration_ns":0},"provider_serve_ns":0,"billing":4}"#).unwrap();
+        assert!(!old.hit_token_limit && !old.stopped);
     }
 
     #[test]
