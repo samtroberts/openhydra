@@ -415,6 +415,12 @@ fn strip_weight_extension(name: &str) -> (&str, bool) {
     (name, false)
 }
 
+/// Whether `name` is a weight file's name (it ends in one of [`WEIGHT_FILE_EXTENSIONS`]), which a
+/// provider announces under [`public_model_id`] (its stem) instead.
+pub fn is_weight_file_name(name: &str) -> bool {
+    strip_weight_extension(name).1
+}
+
 /// Whether `engine_ref` is announced under a name of its own: it isn't a name the network accepts, or
 /// it is a weight file's name.
 fn needs_public_name(engine_ref: &str) -> bool {

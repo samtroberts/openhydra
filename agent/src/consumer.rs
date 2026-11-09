@@ -775,6 +775,18 @@ fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
     }
 }
 
+/// The model a request for `requested` (a weight file's name) should go to, given the models this
+/// gateway knows: none when the name is known as it is (or isn't a weight file's name), else its stem
+/// ([`openhydra_protocol::model_id::public_model_id`]) when that is known. A stem a provider had to
+/// suffix (two checkpoints sharing it) can't be derived from the file name, so that stays unknown.
+fn weight_file_alias(requested: &str, known: &[String]) -> Option<String> {
+    if !openhydra_protocol::model_id::is_weight_file_name(requested) || known.iter().any(|m| m == requested) {
+        return None;
+    }
+    let stem = openhydra_protocol::model_id::public_model_id(requested);
+    (stem != requested && known.iter().any(|m| *m == stem)).then_some(stem)
+}
+
 /// How long our own provider's list of what it shares is used before asking again.
 const OWN_MODELS_TTL_MS: u64 = 15_000;
 
@@ -3402,6 +3414,17 @@ impl ConsumerNode {
         cancel: &dyn Fn() -> bool,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
+        // A weight file's name (`x.safetensors`, a ComfyUI checkpoint as it used to be announced) that
+        // the network doesn't know is served by the stem its provider announces now.
+        let alias = if openhydra_protocol::model_id::is_weight_file_name(model) {
+            weight_file_alias(model, &self.known_models().unwrap_or_default())
+        } else {
+            None
+        };
+        if let Some(stem) = &alias {
+            tracing::debug!(requested = %model, served_as = %stem, "a weight file's name maps to the model's announced name");
+        }
+        let model = alias.as_deref().unwrap_or(model);
         let now = now_unix_ms();
         // Providers this request already noted as unavailable: its retries are one miss (L5).
         let noted = std::cell::RefCell::new(std::collections::HashSet::new());
@@ -7317,6 +7340,21 @@ mod tests {
         crate::swarms::accept_credential(&member_dir, &member, &approved.magnet, "", now).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1_100)); // the store rescans on a newer mtime
         assert_eq!(node.usable_card_models(now_unix_ms()), vec!["private-model".to_string(), "public-model".to_string()]);
+    }
+
+    /// A ComfyUI checkpoint used to be announced by its file name; a request for that name is served
+    /// by the stem it is announced under now, and only then.
+    #[test]
+    fn an_old_checkpoint_name_reaches_the_model_by_its_stem() {
+        let known = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let k = known(&["v1-5-pruned-emaonly-fp16", "qwen2.5:7b"]);
+        assert_eq!(weight_file_alias("v1-5-pruned-emaonly-fp16.safetensors", &k).as_deref(), Some("v1-5-pruned-emaonly-fp16"));
+        assert_eq!(weight_file_alias("V1-5-PRUNED.CKPT", &k), None, "an unknown stem stays unknown");
+        assert_eq!(weight_file_alias("qwen2.5:7b", &k), None, "not a weight file's name");
+        // A provider that still announces the file name (an older one) keeps it.
+        let both = known(&["v1-5-pruned-emaonly-fp16.safetensors", "v1-5-pruned-emaonly-fp16"]);
+        assert_eq!(weight_file_alias("v1-5-pruned-emaonly-fp16.safetensors", &both), None);
+        assert_eq!(weight_file_alias("models/SDXL\\juggernaut.safetensors", &known(&["models/SDXL/juggernaut"])).as_deref(), Some("models/SDXL/juggernaut"));
     }
 
     fn test_node() -> (tempfile::TempDir, ConsumerNode) {
