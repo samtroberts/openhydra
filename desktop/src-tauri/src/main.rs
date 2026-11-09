@@ -1575,6 +1575,31 @@ fn export_card(
     serde_json::from_slice(&out.stdout).map_err(|e| format!("parse card export output: {e}"))
 }
 
+/// Save a card (from [`export_card`]) as a `.openhydra` file: a native Save dialog suggests
+/// `<model>.openhydra`, and the file holds the card's JSON (what a double-click on it imports). The
+/// card is verified again here, so the page can't have a file written for a card that doesn't check
+/// out. `None` when the user cancels. The dialog has already asked before replacing a file.
+#[tauri::command(async)]
+fn save_card_file(app: tauri::AppHandle, model: String, card: openhydra_agent::Card) -> Result<Option<String>, String> {
+    let mut d = app
+        .dialog()
+        .file()
+        .set_title("Save OpenHydra card")
+        .set_file_name(openhydra_agent::cards::card_file_name(&model))
+        .add_filter("OpenHydra card", &[openhydra_agent::cards::CARD_FILE_EXTENSION]);
+    if let Some(w) = app.get_webview_window("main") {
+        d = d.set_parent(&w);
+    }
+    let Some(picked) = d.blocking_save_file() else { return Ok(None) };
+    let path = picked.into_path().map_err(|e| format!("save card: {e}"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let written = openhydra_agent::cards::write_card_file(&path, &card, true, now_ms)?;
+    Ok(Some(written.display().to_string()))
+}
+
 /// The reason a one-shot agent command failed, from its stderr. The agent ends a failure with one
 /// `openhydra-agent: <reason>` line; a command that brings up a network node (`swarm remote-scope`)
 /// also logs before it (coloured tracing lines), which the user should not have to read through.
@@ -3368,6 +3393,7 @@ fn main() {
             save_share_policy,
             read_share_policy,
             export_card,
+            save_card_file,
             preview_card,
             import_card,
             list_cards,

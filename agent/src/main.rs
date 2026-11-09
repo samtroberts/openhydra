@@ -547,6 +547,14 @@ struct CardExportArgs {
     /// M4: swarms directory (`~/.openhydra/swarms/`), to confirm you own the `--swarm` you're binding.
     #[arg(long = "swarms-dir")]
     swarms_dir: Option<std::path::PathBuf>,
+    /// Save the card as a `.openhydra` file here (the extension is added if missing) — the file the
+    /// desktop app opens on a double-click, and `card import --file` reads. Prints the magnet link.
+    /// Without it, prints the card and magnet as JSON.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// With `--out`: replace the file if it exists.
+    #[arg(long, requires = "out")]
+    force: bool,
 }
 
 #[derive(Copy, Clone, clap::ValueEnum)]
@@ -1221,10 +1229,16 @@ fn run() -> Result<(), String> {
                         a.swarm,
                         a.swarms_dir,
                     )?;
-                    println!(
-                        "{}",
-                        serde_json::to_string(&out).map_err(|e| format!("serialize card: {e}"))?
-                    );
+                    if let Some(path) = &a.out {
+                        let written = openhydra_agent::cards::write_card_file(path, &out.card, a.force, now_ms)?;
+                        eprintln!("openhydra-agent: card saved to {}", written.display());
+                        println!("{}", out.magnet);
+                    } else {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&out).map_err(|e| format!("serialize card: {e}"))?
+                        );
+                    }
                 }
                 CardAction::Verify(a) => {
                     let input = match (a.magnet, a.file) {

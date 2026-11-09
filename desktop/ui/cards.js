@@ -55,11 +55,20 @@ export async function exportCardModal(model, isPrivate = false, boundSwarms = []
       <label class="mut" style="font-size:11px;margin-top:10px;display:block">Magnet string</label>
       <textarea class="input mono cardmagnet" rows="3" readonly style="width:100%;font-size:10.5px">${magnet}</textarea>
     </div>
-    <div class="cmodal-f"><button class="btn ghost sm ccopyjson">Copy JSON</button><button class="btn sm brand ccopymag">Copy magnet</button></div></div>`);
+    <div class="cmodal-f"><button class="btn ghost sm ccopyjson">Copy JSON</button><button class="btn ghost sm csavefile">Save .openhydra file</button><button class="btn sm brand ccopymag">Copy magnet</button></div></div>`);
   document.body.appendChild(back);
   const close = () => back.remove();
   $(".ccopymag", back).onclick = () => { navigator.clipboard?.writeText(magnet); toast("Card copied — send it to add your model"); close(); };
   $(".ccopyjson", back).onclick = () => { navigator.clipboard?.writeText(json); toast("Card JSON copied"); };
+  // A file to send (email, chat, a shared drive): a double-click on it opens OpenHydra and imports it.
+  $(".csavefile", back).onclick = async () => {
+    try {
+      const path = await call("save_card_file", { model, card });
+      if (path) toast(`Card saved to ${path}`);
+    } catch (e) {
+      toast(`Couldn't save the card: ${e}`);
+    }
+  };
   back.onclick = (e) => { if (e.target === back) close(); };
 }
 

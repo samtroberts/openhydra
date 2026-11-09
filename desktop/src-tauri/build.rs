@@ -16,6 +16,7 @@ const COMMANDS: &[&str] = &[
     "save_share_policy",
     "read_share_policy",
     "export_card",
+    "save_card_file",
     "preview_card",
     "import_card",
     "list_cards",

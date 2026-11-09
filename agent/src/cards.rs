@@ -181,6 +181,48 @@ pub fn run_export(
     Ok(CardExport { card: signed, magnet })
 }
 
+/// The file extension the desktop app opens cards from (a double-click on one imports it).
+pub const CARD_FILE_EXTENSION: &str = "openhydra";
+
+/// Save `card` as a `.openhydra` file at `path`, adding the extension when `path` has none, and
+/// return where it was written. The file holds the card's JSON, which is what the app opens and
+/// `card import --file` reads. The card is verified first (signature, expiry, privacy, schema), so a
+/// file is never written for a card nobody could import. An existing file is replaced only with
+/// `overwrite` (a save dialog asks first; the command line asks for `--force`).
+pub fn write_card_file(path: &Path, card: &Card, overwrite: bool, now_ms: u64) -> Result<PathBuf, String> {
+    verify_card(card, now_ms).map_err(|e| format!("not saving an invalid card: {e}"))?;
+    let path = if path.extension().is_some() { path.to_path_buf() } else { path.with_extension(CARD_FILE_EXTENSION) };
+    let json = card.to_json().map_err(|e| e.to_string())?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    if overwrite {
+        opts.create(true).truncate(true);
+    } else {
+        opts.create_new(true);
+    }
+    let mut file = opts.open(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} already exists (pass --force to replace it)", path.display())
+        } else {
+            format!("{}: {e}", path.display())
+        }
+    })?;
+    use std::io::Write;
+    file.write_all(json.as_bytes()).and_then(|_| file.write_all(b"\n")).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// A file name for `model`'s card: the model name with anything a file system dislikes replaced,
+/// and the `.openhydra` extension (e.g. `Qwen/Qwen2.5-7B-Instruct` → `Qwen-Qwen2.5-7B-Instruct.openhydra`).
+pub fn card_file_name(model: &str) -> String {
+    let stem: String = model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .collect();
+    let stem = stem.trim_matches(|c| c == '-' || c == '.');
+    format!("{}.{CARD_FILE_EXTENSION}", if stem.is_empty() { "model" } else { stem })
+}
+
 /// Parse a card from either a magnet string (`openhydra:card:...`) or JSON, then fully verify it
 /// (signature, key↔peer-id binding, privacy, schema, expiry). The shared parse+verify entry point for
 /// `card verify` and, later, import. `now_ms` is injected.
@@ -511,5 +553,37 @@ mod tests {
         assert!(card_swarm_allowed(&policy, "m", "m", &a.to_ascii_uppercase()).is_ok());
         let err = card_swarm_allowed(&policy, "m", "m", &b).unwrap_err();
         assert!(err.contains("not shared with swarm"), "{err}");
+    }
+
+    #[test]
+    fn a_saved_card_file_opens_as_the_same_card_and_is_never_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = an_identity();
+        let card = signed_card(&id, "qwen3:1.7b", 9_999_999_999_999);
+        // No extension: `.openhydra` is added.
+        let written = write_card_file(&dir.path().join("mine"), &card, false, 1_000).unwrap();
+        assert_eq!(written, dir.path().join("mine.openhydra"));
+        // It imports as the same card, through the same entry point the app and `card import` use.
+        let text = std::fs::read_to_string(&written).unwrap();
+        let back = parse_and_verify(&text, 1_000).unwrap();
+        assert_eq!(back.card, card);
+        // An existing file is kept unless asked.
+        let err = write_card_file(&written, &card, false, 1_000).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(write_card_file(&written, &card, true, 1_000).is_ok(), "replaced when asked");
+        // A tampered or expired card is not saved.
+        let mut tampered = card.clone();
+        tampered.model_id = "qwen3:8b".into();
+        assert!(write_card_file(&dir.path().join("bad.openhydra"), &tampered, false, 1_000).is_err());
+        assert!(!dir.path().join("bad.openhydra").exists());
+        let old = signed_card(&id, "qwen3:1.7b", 2_000);
+        assert!(write_card_file(&dir.path().join("old.openhydra"), &old, false, 3_000).is_err());
+    }
+
+    #[test]
+    fn a_card_file_name_comes_from_the_model_name() {
+        assert_eq!(card_file_name("Qwen/Qwen2.5-7B-Instruct"), "Qwen-Qwen2.5-7B-Instruct.openhydra");
+        assert_eq!(card_file_name("qwen3:1.7b"), "qwen3-1.7b.openhydra");
+        assert_eq!(card_file_name("///"), "model.openhydra");
     }
 }
