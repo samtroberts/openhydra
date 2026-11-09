@@ -933,6 +933,10 @@ pub fn rank_providers_with_reputation(
 /// Privacy and Settlement are resolved at their disclosed baseline (`P0`/`S0`) here — their
 /// verifiers are not built yet — so a policy that requires a privacy/settlement floor above the
 /// baseline admits nobody under `HardGate` (fail-closed, honest) until those axes are verifiable.
+/// The round trip a provider with no measurement yet is ranked as: a slow but ordinary one, so it
+/// gains nothing over providers that were measured.
+const UNMEASURED_RTT_MS: f64 = 150.0;
+
 pub fn rank_providers_with_assurance(
     peers: &[DiscoveredPeer],
     request_canonical: &str,
@@ -940,6 +944,21 @@ pub fn rank_providers_with_assurance(
     earned_reputation: &dyn Fn(&str, &str) -> Option<f64>,
     achieved_authenticity: &dyn Fn(&str, &str) -> AuthenticityTier,
     policy: &AssurancePolicy,
+) -> Vec<SelectedProvider> {
+    rank_providers_measured(peers, request_canonical, tier, earned_reputation, achieved_authenticity, policy, &|_| None)
+}
+
+/// [`rank_providers_with_assurance`] with each provider's measured round trip (`rtt`, by its libp2p
+/// peer id; `None` when there is no measurement, which scores as [`UNMEASURED_RTT_MS`]).
+#[allow(clippy::too_many_arguments)]
+pub fn rank_providers_measured(
+    peers: &[DiscoveredPeer],
+    request_canonical: &str,
+    tier: u8,
+    earned_reputation: &dyn Fn(&str, &str) -> Option<f64>,
+    achieved_authenticity: &dyn Fn(&str, &str) -> AuthenticityTier,
+    policy: &AssurancePolicy,
+    rtt: &dyn Fn(&str) -> Option<std::time::Duration>,
 ) -> Vec<SelectedProvider> {
     let compatible: Vec<&DiscoveredPeer> = peers
         .iter()
@@ -977,7 +996,10 @@ pub fn rank_providers_with_assurance(
         .map(|p| PeerScoreInput {
             // Ranked (and matched back) by the 128-bit id: two providers sharing a 64-bit id stay apart.
             peer_id: provider_state_id(&p.peer_id, &p.public_key),
-            latency_ms: 1.0, // RTT survey deferred (matches the M1.3 router default)
+            // The round trip this node measured (libp2p ping), or [`UNMEASURED_RTT_MS`] when there
+            // is none yet (an unconnected provider, a card not yet dialled): no measurement must
+            // not look like the nearest provider there is.
+            latency_ms: rtt(&p.libp2p_peer_id).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(UNMEASURED_RTT_MS),
             load_pct: p.load_pct,
             // Earned reputation (local tracker, per (peer, model)) wins; else neutral. Never the
             // record's own `reputation_score`: it isn't signed, so any provider could claim the top
@@ -3620,13 +3642,14 @@ impl ConsumerNode {
             .filter(|p| seed_keys.contains(&p.public_key.to_ascii_lowercase()))
             .map(|p| provider_state_id(&p.peer_id, &p.public_key))
             .collect();
-        let mut candidates = rank_providers_with_assurance(
+        let mut candidates = rank_providers_measured(
             &peers,
             "",
             self.tier,
             &|pid, mkey| self.earned_reputation(pid, mkey, now).or_else(|| seeds.contains(pid).then_some(SEED_START_REPUTATION)),
             &|pid, mkey| if own.contains(pid) { AuthenticityTier::HardwareAttested } else { self.authenticity_of(pid, mkey, now) },
             policy,
+            &|libp2p| self.net.peer_rtt(libp2p),
         );
         if policy.mode == PolicyMode::HardGate {
             self.maybe_qualify(model, &peers, &candidates, now);
@@ -7100,6 +7123,25 @@ mod tests {
         let peers = vec![discovered("x", "gemma-4/e4b/fp16/cccccccccccccccc", 10.0)];
         assert!(select_provider(&peers, TPL_A, 2).is_none());
         assert!(select_provider(&[], TPL_A, 2).is_none());
+    }
+
+    #[test]
+    fn a_nearer_provider_ranks_first_when_round_trips_are_measured() {
+        let mut far = DiscoveredPeer { peer_id: "far".into(), libp2p_peer_id: "12D3far".into(), model_id: "m".into(), connected: true, ..Default::default() };
+        far.public_key = "aa".into();
+        let mut near = DiscoveredPeer { peer_id: "near".into(), libp2p_peer_id: "12D3near".into(), model_id: "m".into(), connected: true, ..Default::default() };
+        near.public_key = "bb".into();
+        let peers = vec![far, near];
+        let rtt = |p: &str| Some(std::time::Duration::from_millis(if p == "12D3near" { 8 } else { 140 }));
+        let ranked = rank_providers_measured(&peers, "", 2, &|_, _| None, &|_, _| AuthenticityTier::SelfReported, &AssurancePolicy::OPEN, &rtt);
+        assert_eq!(ranked[0].libp2p_peer_id, "12D3near");
+        // One not measured yet doesn't jump ahead of a measured one.
+        let only_far = |p: &str| (p == "12D3far").then(|| std::time::Duration::from_millis(40));
+        let ranked = rank_providers_measured(&peers, "", 2, &|_, _| None, &|_, _| AuthenticityTier::SelfReported, &AssurancePolicy::OPEN, &only_far);
+        assert_eq!(ranked[0].libp2p_peer_id, "12D3far");
+        // Unmeasured, they tie on latency and keep the order they came in.
+        let ranked = rank_providers_with_assurance(&peers, "", 2, &|_, _| None, &|_, _| AuthenticityTier::SelfReported, &AssurancePolicy::OPEN);
+        assert_eq!(ranked[0].libp2p_peer_id, "12D3far");
     }
 
     #[test]
