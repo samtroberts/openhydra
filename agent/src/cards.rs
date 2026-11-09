@@ -126,10 +126,15 @@ pub fn run_export(
     // Detect the model on a local engine (fast localhost probes; no swarm).
     let engines = crate::detect::detect_engines();
     let all: Vec<&DetectedModel> = engines.iter().flat_map(|e| &e.models).chain(built_in.iter()).collect();
+    // The name the provider announces each model under: assigned over every detected model, as its
+    // announce pass does. `--model` may be either name (a ComfyUI checkpoint's file name, or the stem
+    // it is announced and carded under).
+    let names = crate::provider::PublicNames::from_engine_refs(all.iter().map(|m| m.engine_ref.as_str()));
+    let engine_ref = names.engine_ref(model).to_string();
     let detected = all
         .iter()
         .copied()
-        .find(|m| m.engine_ref == model)
+        .find(|m| m.engine_ref == model || m.engine_ref == engine_ref)
         .ok_or_else(|| {
             format!("model {model:?} is not detected on any local engine — start the engine that serves it, then retry")
         })?;
@@ -176,8 +181,6 @@ pub fn run_export(
         }
     };
 
-    // The name the provider announces: assigned over every detected model, as its announce pass does.
-    let names = crate::provider::PublicNames::from_engine_refs(all.iter().map(|m| m.engine_ref.as_str()));
     let public_id = names.public(&detected.engine_ref).to_string();
     let card = build_card(detected, &public_id, &id.openhydra_peer_id, now_ms, ttl_secs, pricing, region, swarm_binding);
     let signed = sign_card(card, &id.keypair).map_err(|e| e.to_string())?;
@@ -589,5 +592,24 @@ mod tests {
         assert_eq!(card_file_name("Qwen/Qwen2.5-7B-Instruct"), "Qwen-Qwen2.5-7B-Instruct.openhydra");
         assert_eq!(card_file_name("qwen3:1.7b"), "qwen3-1.7b.openhydra");
         assert_eq!(card_file_name("///"), "model.openhydra");
+    }
+
+    /// A ComfyUI checkpoint is carded under its stem; the verifier stays as strict as ever (a card
+    /// naming the file is still refused), and the stem maps back to the file for serving.
+    #[test]
+    fn a_checkpoint_is_carded_under_its_stem_without_relaxing_the_verifier() {
+        let id = an_identity();
+        let file = "v1-5-pruned-emaonly-fp16.safetensors";
+        let names = crate::provider::PublicNames::from_engine_refs([file]);
+        let public = names.public(file).to_string();
+        assert_eq!(public, "v1-5-pruned-emaonly-fp16");
+        assert_eq!(names.engine_ref(&public), file, "requests for the stem are served by the file");
+        let mut m = detected(file, "", "");
+        m.family = "stable-diffusion".into();
+        let card = build_card(&m, &public, &id.openhydra_peer_id, 1_000, 3_600, PricingMode::Reciprocal, None, None);
+        let signed = sign_card(card, &id.keypair).expect("a stem-named card signs");
+        assert!(verify_card(&signed, 2_000).is_ok());
+        let by_file = build_card(&m, file, &id.openhydra_peer_id, 1_000, 3_600, PricingMode::Reciprocal, None, None);
+        assert!(sign_card(by_file, &id.keypair).is_err(), "a card naming the weight file is still refused");
     }
 }

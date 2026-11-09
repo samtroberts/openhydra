@@ -4119,12 +4119,14 @@ mod tests {
             let rec = build_peer_record(&detected(""), public, "oh", "lib", "pk", "", 0);
             assert_eq!(rec.model_id, public);
         }
-        // Names the network already accepts are announced unchanged; the others are cleaned up.
+        // Names the network already accepts are announced unchanged; the others are cleaned up, and a
+        // weight file (a ComfyUI checkpoint) is announced under its stem.
         assert_eq!(names.public("qwen2.5:7b"), "qwen2.5:7b");
         assert_eq!(names.public("/data/models/Qwen2.5-7B"), "Qwen2.5-7B");
-        assert_eq!(names.public("SDXL\\juggernaut.safetensors"), "SDXL/juggernaut.safetensors");
+        assert_eq!(names.public("SDXL\\juggernaut.safetensors"), "SDXL/juggernaut");
+        assert_eq!(names.public("sd_xl_base_1.0.safetensors"), "sd_xl_base_1.0");
         assert_eq!(names.public("Flux (dev)"), "Flux-dev");
-        assert_eq!(names.renamed().len(), 4);
+        assert_eq!(names.renamed().len(), 5);
         // An unknown name maps to itself (the engine refuses it, or the share gate does).
         assert_eq!(names.engine_ref("nope"), "nope");
     }

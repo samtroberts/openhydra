@@ -398,34 +398,56 @@ pub fn is_valid_canonical_field(id: &str) -> bool {
     id.is_empty() || is_valid_model_id(id)
 }
 
+/// File extensions of model weights. An engine id ending in one (ComfyUI names its models by checkpoint
+/// file: `v1-5-pruned-emaonly-fp16.safetensors`) is announced and carded under its stem: a weight
+/// file's name isn't a model's name, and a card refuses to carry one (`card_is_privacy_safe`).
+pub const WEIGHT_FILE_EXTENSIONS: [&str; 6] = [".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin"];
+
+/// `name` without a trailing [`WEIGHT_FILE_EXTENSIONS`] entry (any case), and whether it had one.
+fn strip_weight_extension(name: &str) -> (&str, bool) {
+    for ext in WEIGHT_FILE_EXTENSIONS {
+        if let Some(cut) = name.len().checked_sub(ext.len()) {
+            if cut > 0 && name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(ext) {
+                return (&name[..cut], true);
+            }
+        }
+    }
+    (name, false)
+}
+
+/// Whether `engine_ref` is announced under a name of its own: it isn't a name the network accepts, or
+/// it is a weight file's name.
+fn needs_public_name(engine_ref: &str) -> bool {
+    !is_valid_model_id(engine_ref) || strip_weight_extension(engine_ref).1
+}
+
 /// The name a provider announces for an engine model. A name the network accepts
-/// ([`is_valid_model_id`]) is used as is. Anything else is cleaned up rather than left unshared:
+/// ([`is_valid_model_id`]) is used as is, unless it is a weight file's name. Anything else is cleaned
+/// up rather than left unshared:
 ///
 /// * an absolute or home-relative path (`/data/models/Qwen2.5-7B`, `~/m/x.gguf`, `C:\\m\\x`) keeps
-///   only its last component (a `.gguf` file without its extension), so no directory or user name
-///   is announced;
-/// * Windows separators become `/` (`SDXL\\juggernaut.safetensors` → `SDXL/juggernaut.safetensors`);
+///   only its last component, so no directory or user name is announced;
+/// * a weight file ([`WEIGHT_FILE_EXTENSIONS`]) loses its extension
+///   (`v1-5-pruned-emaonly-fp16.safetensors` → `v1-5-pruned-emaonly-fp16`);
+/// * Windows separators become `/` (`SDXL\\juggernaut.safetensors` → `SDXL/juggernaut`);
 /// * any other character outside the allowed set becomes `-`; runs of `-` and spaces collapse;
 /// * it starts with a letter or digit, is at most [`MAX_MODEL_ID_LEN`] bytes, and is never empty.
 ///
 /// The provider keeps the mapping back to the engine's own id for serving. Two engine ids that clean
 /// up to the same name are told apart by [`assign_public_ids`].
 pub fn public_model_id(engine_ref: &str) -> String {
-    if is_valid_model_id(engine_ref) {
+    if !needs_public_name(engine_ref) {
         return engine_ref.to_string();
     }
     let t = engine_ref.trim();
     let b = t.as_bytes();
     let windows_drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
     let s = if t.starts_with('/') || t.starts_with('~') || windows_drive {
-        // The file or directory name; a GGUF file loses its extension, as llama.cpp's handles do.
+        // The file or directory name; a weight file loses its extension, as llama.cpp's handles do.
         let last = t.rsplit(['/', '\\']).find(|p| !p.trim().is_empty()).unwrap_or("");
-        match last.len().checked_sub(5) {
-            Some(cut) if last.is_char_boundary(cut) && last[cut..].eq_ignore_ascii_case(".gguf") => last[..cut].to_string(),
-            _ => last.to_string(),
-        }
+        strip_weight_extension(last).0.to_string()
     } else {
-        t.replace('\\', "/")
+        strip_weight_extension(t).0.replace('\\', "/")
     };
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -468,8 +490,8 @@ pub fn assign_public_ids<'a, I: IntoIterator<Item = &'a str>>(engine_refs: I) ->
     let mut refs: Vec<&str> = engine_refs.into_iter().collect();
     refs.sort_unstable();
     refs.dedup();
-    let mut taken: std::collections::BTreeSet<String> = refs.iter().filter(|r| is_valid_model_id(r)).map(|r| r.to_string()).collect();
-    let cleaned: Vec<(&str, String)> = refs.iter().filter(|r| !is_valid_model_id(r)).map(|r| (*r, public_model_id(r))).collect();
+    let mut taken: std::collections::BTreeSet<String> = refs.iter().filter(|r| !needs_public_name(r)).map(|r| r.to_string()).collect();
+    let cleaned: Vec<(&str, String)> = refs.iter().filter(|r| needs_public_name(r)).map(|r| (*r, public_model_id(r))).collect();
     let mut claims: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for (_, base) in &cleaned {
         *claims.entry(base.as_str()).or_default() += 1;
@@ -782,7 +804,16 @@ mod tests {
             ("~/models/phi-3-mini.GGUF", "phi-3-mini"),
             ("C:\\models\\Llama-3.1-8B", "Llama-3.1-8B"),
             ("./models/x", "models/x"),
-            ("SDXL\\juggernaut.safetensors", "SDXL/juggernaut.safetensors"),
+            ("SDXL\\juggernaut.safetensors", "SDXL/juggernaut"),
+            ("v1-5-pruned-emaonly-fp16.safetensors", "v1-5-pruned-emaonly-fp16"),
+            ("sd_xl_base_1.0.safetensors", "sd_xl_base_1.0"),
+            ("dreamshaper_8.ckpt", "dreamshaper_8"),
+            ("Model.SafeTensors", "Model"),
+            ("gemma-3-4b-it-Q4_K_M.gguf", "gemma-3-4b-it-Q4_K_M"),
+            ("pytorch_model.bin", "pytorch_model"),
+            ("chat.gpt", "chat.gpt"),
+            ("qwen2.5-coder:1.5b", "qwen2.5-coder:1.5b"),
+            (".safetensors", "safetensors"),
             ("Flux (dev)", "Flux-dev"),
             ("my model [v2], final", "my model-v2-final"),
             ("qwén 7b", "qw-n 7b"),
@@ -816,6 +847,25 @@ mod tests {
         // A name that clashes with nothing keeps the clean form.
         let solo: std::collections::BTreeMap<_, _> = assign_public_ids(["/data/models/Qwen2.5-7B", "qwen2.5:7b"]).into_iter().collect();
         assert_eq!(solo["/data/models/Qwen2.5-7B"], "Qwen2.5-7B");
+    }
+
+    /// ComfyUI names models by checkpoint file. They are announced (and carded) under the stem, two
+    /// checkpoints that share one are told apart, and a stem never takes a name another model has.
+    #[test]
+    fn weight_files_are_announced_under_their_stems() {
+        let map: std::collections::BTreeMap<_, _> =
+            assign_public_ids(["v1-5-pruned-emaonly-fp16.safetensors", "qwen2.5:7b"]).into_iter().collect();
+        assert_eq!(map["v1-5-pruned-emaonly-fp16.safetensors"], "v1-5-pruned-emaonly-fp16");
+        assert_eq!(map["qwen2.5:7b"], "qwen2.5:7b");
+        // The same stem from two formats: both get distinct names, neither the bare stem.
+        let both: std::collections::BTreeMap<_, _> = assign_public_ids(["juggernaut.safetensors", "juggernaut.ckpt"]).into_iter().collect();
+        assert_ne!(both["juggernaut.safetensors"], both["juggernaut.ckpt"]);
+        assert!(both.values().all(|p| p.starts_with("juggernaut-") && is_valid_model_id(p)), "{both:?}");
+        // A stem that another model already uses as its name doesn't take it.
+        let clash: std::collections::BTreeMap<_, _> = assign_public_ids(["flux.safetensors", "flux"]).into_iter().collect();
+        assert_eq!(clash["flux"], "flux");
+        assert_ne!(clash["flux.safetensors"], "flux");
+        assert!(WEIGHT_FILE_EXTENSIONS.iter().all(|e| !clash["flux.safetensors"].ends_with(e)));
     }
 
     #[test]
