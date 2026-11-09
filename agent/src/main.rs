@@ -554,6 +554,27 @@ enum CardAction {
     /// Verify a card (from `--magnet`, `--file`, or stdin) and add it to the cards file that
     /// `serve --cards-file` reads. A card for the same provider and model replaces the old one.
     Import(CardImportArgs),
+    /// Choose what the gateway does for MODEL (a public card's model) when the card's provider is
+    /// offline, busy or refuses: `ask` (fail, saying how many other providers serve the same
+    /// version), `same-version` (use one of them, and say so in the reply; the default) or `never`.
+    /// A request's `x-openhydra-fallback` header wins. A private card's model never falls back.
+    Fallback(CardFallbackArgs),
+}
+
+#[derive(Args)]
+struct CardFallbackArgs {
+    /// The model (as its card names it).
+    #[arg(long)]
+    model: String,
+    /// `ask`, `same-version` or `never`.
+    #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+    set: Option<String>,
+    /// Remove the saved choice (back to the default).
+    #[arg(long)]
+    clear: bool,
+    /// The cards file whose choices to change (default `~/.openhydra/cards.json`).
+    #[arg(long = "cards-file")]
+    cards_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -1337,6 +1358,24 @@ fn run() -> Result<(), String> {
                         "OK: model {:?} served by {} (openhydra id {}), expires {}",
                         v.card.model_id, v.card.libp2p_peer_id, v.card.openhydra_peer_id, v.card.expires_at
                     );
+                }
+                CardAction::Fallback(a) => {
+                    let choice = match &a.set {
+                        Some(v) => Some(openhydra_agent::cards::CardFallback::parse(v).ok_or_else(|| {
+                            format!("--set {v:?}: expected ask, same-version or never")
+                        })?),
+                        None => None,
+                    };
+                    let path = a.cards_file.unwrap_or_else(|| {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                        std::path::PathBuf::from(home).join(".openhydra").join("cards.json")
+                    });
+                    let prefs = openhydra_agent::cards::set_card_fallback(&path, a.model.trim(), choice)?;
+                    match choice {
+                        Some(c) => println!("{}: fallback {}", a.model.trim(), c.as_str()),
+                        None => println!("{}: fallback back to the default (same-version)", a.model.trim()),
+                    }
+                    eprintln!("openhydra-agent: {} saved choice(s) in {}", prefs.fallback.len(), openhydra_agent::cards::prefs_path(&path).display());
                 }
                 CardAction::Import(a) => {
                     let input = match (a.magnet, a.file) {

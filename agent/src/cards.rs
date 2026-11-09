@@ -322,6 +322,92 @@ pub fn card_to_discovered(card: &Card) -> DiscoveredPeer {
     }
 }
 
+/// How imported cards pin a requested model. A request names a model, never a card; when an
+/// imported card names that model, the card's providers serve it rather than anyone announcing the
+/// same name.
+#[derive(Debug, Clone)]
+pub enum CardPin {
+    /// No imported card names it: routed as any model is.
+    None,
+    /// A private card names it: only these providers (and this machine's own), never anyone found
+    /// on the network, and the network isn't asked about it.
+    Private { peers: Vec<DiscoveredPeer> },
+    /// Public cards name it: these providers first; another provider only as a fallback, and only
+    /// one announcing one of these exact versions (canonical ids; empty when the cards state none).
+    Public { peers: Vec<DiscoveredPeer>, canonicals: Vec<String> },
+}
+
+/// What a gateway does when a public card's providers can't serve (offline, overloaded, refused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CardFallback {
+    /// Fail with the reason and how many others could serve, so a person can choose.
+    Ask,
+    /// Use another provider announcing the same exact version, and say so in the reply.
+    SameVersion,
+    /// Fail; never use another provider.
+    Never,
+}
+
+impl CardFallback {
+    /// From `ask` / `same-version` / `never` (case and surrounding space ignored).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "same-version" | "same_version" => Some(Self::SameVersion),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::SameVersion => "same-version",
+            Self::Never => "never",
+        }
+    }
+}
+
+/// The saved fallback choices, by model (`<cards file stem>.prefs.json` beside the cards file).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CardPrefs {
+    #[serde(default)]
+    pub fallback: std::collections::BTreeMap<String, CardFallback>,
+}
+
+/// Where the saved choices for the cards file `cards` live: `cards.json` → `cards.prefs.json`.
+pub fn prefs_path(cards: &Path) -> PathBuf {
+    let stem = cards.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "cards".into());
+    cards.with_file_name(format!("{stem}.prefs.json"))
+}
+
+/// Read the saved choices; missing or unreadable → none saved.
+pub fn read_card_prefs(path: &Path) -> CardPrefs {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Save (or, with `None`, clear) the fallback choice for `model` beside the cards file `cards`.
+pub fn set_card_fallback(cards: &Path, model: &str, choice: Option<CardFallback>) -> Result<CardPrefs, String> {
+    let path = prefs_path(cards);
+    let mut prefs = read_card_prefs(&path);
+    match choice {
+        Some(c) => {
+            prefs.fallback.insert(model.to_string(), c);
+        }
+        None => {
+            prefs.fallback.remove(model);
+        }
+    }
+    let json = serde_json::to_string_pretty(&prefs).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })?;
+    Ok(prefs)
+}
+
 /// Read a cards file (a JSON array of [`Card`]). Missing/empty → `[]`; a parse error is surfaced.
 pub fn read_cards_file(path: &Path) -> Result<Vec<Card>, String> {
     match std::fs::read_to_string(path) {
@@ -424,6 +510,30 @@ impl CardStore {
         c.cards.iter().filter(|card| now_ms < card.expires_at).cloned().collect()
     }
 
+    /// How the imported cards pin `model_id` (see [`CardPin`]). A private card wins over a public one
+    /// for the same name: once a private card names a model, the request never leaves its swarm.
+    pub fn pin_for(&self, model_id: &str, now_ms: u64) -> CardPin {
+        self.refresh(now_ms);
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cards: Vec<&Card> = c.cards.iter().filter(|card| card.model_id == model_id && now_ms < card.expires_at).collect();
+        if cards.is_empty() {
+            return CardPin::None;
+        }
+        let private: Vec<DiscoveredPeer> = cards.iter().filter(|c| !c.swarm_public_key.is_empty()).map(|c| card_to_discovered(c)).collect();
+        if !private.is_empty() {
+            return CardPin::Private { peers: private };
+        }
+        let mut canonicals: Vec<String> = cards.iter().map(|c| c.canonical_id.clone()).filter(|c| !c.is_empty()).collect();
+        canonicals.sort();
+        canonicals.dedup();
+        CardPin::Public { peers: cards.iter().map(|c| card_to_discovered(c)).collect(), canonicals }
+    }
+
+    /// The fallback choice saved for `model_id` (`card fallback`, the app's selector), if any.
+    pub fn fallback_pref(&self, model_id: &str) -> Option<CardFallback> {
+        read_card_prefs(&prefs_path(&self.path)).fallback.get(model_id).copied()
+    }
+
     /// The peer ids of the providers of every unexpired imported card: the peers a gateway's cards
     /// let in (`--allow-swarm-peers`). Importing a card is a deliberate choice of that provider.
     pub fn provider_peer_ids(&self, now_ms: u64) -> std::collections::HashSet<String> {
@@ -514,6 +624,63 @@ mod tests {
     fn signed_card(id: &openhydra_network::identity::Identity, model_id: &str, expires_at: u64) -> Card {
         let c = Card::new_unsigned(id.openhydra_peer_id.clone(), model_id, 1_000, expires_at);
         sign_card(c, &id.keypair).unwrap()
+    }
+
+    fn card_with(id: &openhydra_network::identity::Identity, model_id: &str, canonical: &str, swarm: &str, expires_at: u64) -> Card {
+        let mut c = Card::new_unsigned(id.openhydra_peer_id.clone(), model_id, 1_000, expires_at);
+        c.canonical_id = canonical.into();
+        c.swarm_public_key = swarm.into();
+        sign_card(c, &id.keypair).unwrap()
+    }
+
+    #[test]
+    fn cards_pin_their_model_and_a_private_card_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cards.json");
+        let (a, b, p) = (an_identity(), an_identity(), an_identity());
+        let v = "qwen2.5/7b/q4_k_m/abcd0123abcd0123";
+        add_card(&path, &card_with(&a, "qwen", v, "", 9_999_999_999_999)).unwrap();
+        add_card(&path, &card_with(&b, "qwen", "", "", 9_999_999_999_999)).unwrap();
+        add_card(&path, &card_with(&a, "old", v, "", 5_000)).unwrap();
+        let store = CardStore::new(path.clone());
+        match store.pin_for("qwen", 2_000) {
+            CardPin::Public { peers, canonicals } => {
+                assert_eq!(peers.len(), 2, "both cards' providers");
+                assert_eq!(canonicals, vec![v.to_string()], "only stated versions");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(store.pin_for("unknown", 2_000), CardPin::None));
+        assert!(matches!(store.pin_for("old", 6_000), CardPin::None), "an expired card pins nothing");
+        // A private card for the same name: only its provider, never the public cards' too.
+        add_card(&path, &card_with(&p, "qwen", v, &"ab".repeat(32), 9_999_999_999_999)).unwrap();
+        match store.pin_for("qwen", 2_000) {
+            CardPin::Private { peers } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].libp2p_peer_id, p.libp2p_peer_id.to_string());
+            }
+            other => panic!("a private card must win: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_choices_are_saved_beside_the_cards_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cards-gw.json");
+        assert_eq!(prefs_path(&path), dir.path().join("cards-gw.prefs.json"));
+        let store = CardStore::new(path.clone());
+        assert_eq!(store.fallback_pref("qwen"), None);
+        set_card_fallback(&path, "qwen", Some(CardFallback::Never)).unwrap();
+        set_card_fallback(&path, "other", Some(CardFallback::Ask)).unwrap();
+        assert_eq!(store.fallback_pref("qwen"), Some(CardFallback::Never));
+        set_card_fallback(&path, "qwen", None).unwrap();
+        assert_eq!(store.fallback_pref("qwen"), None);
+        assert_eq!(store.fallback_pref("other"), Some(CardFallback::Ask));
+        for (s, c) in [("ask", CardFallback::Ask), (" Same-Version ", CardFallback::SameVersion), ("never", CardFallback::Never)] {
+            assert_eq!(CardFallback::parse(s), Some(c));
+            assert_eq!(CardFallback::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(CardFallback::parse("always"), None);
     }
 
     #[test]

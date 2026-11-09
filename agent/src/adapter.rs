@@ -40,6 +40,30 @@ pub enum AdapterError {
     Cancelled(String),
     /// The provider was too busy to take the request (its serve pool full); try another.
     Overloaded(String),
+    /// A model an imported card pins couldn't be served by the card's providers, and no fallback
+    /// was allowed (a private card never falls back; a public one only when the caller lets it).
+    CardUnavailable(Box<CardUnavailable>),
+}
+
+/// Why a card's model wasn't served ([`AdapterError::CardUnavailable`]): the message for people,
+/// and the details a client (the app) acts on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardUnavailable {
+    /// What happened, in a sentence or two.
+    #[serde(skip)]
+    pub message: String,
+    pub model: String,
+    /// The card is private: the request never leaves its swarm, so nothing else is offered.
+    pub private: bool,
+    /// `offline` (couldn't be reached), `overloaded` (it shed the request) or `refused` (it answered
+    /// with an error).
+    pub reason: String,
+    /// The card providers' short ids (the last characters of their peer ids).
+    pub providers: Vec<String>,
+    /// Other providers announcing the same exact version (public cards only).
+    pub alternatives: usize,
+    /// The fallback choice that applied: `ask`, `same-version` or `never`.
+    pub fallback: String,
 }
 
 impl fmt::Display for AdapterError {
@@ -54,6 +78,7 @@ impl fmt::Display for AdapterError {
             AdapterError::Network(m) => write!(f, "network: {m}"),
             AdapterError::Cancelled(m) => write!(f, "cancelled: {m}"),
             AdapterError::Overloaded(m) => write!(f, "provider overloaded: {m}"),
+            AdapterError::CardUnavailable(c) => f.write_str(&c.message),
         }
     }
 }
@@ -71,6 +96,7 @@ impl AdapterError {
             | AdapterError::Network(m)
             | AdapterError::Cancelled(m)
             | AdapterError::Overloaded(m) => m,
+            AdapterError::CardUnavailable(c) => &c.message,
         }
     }
 }

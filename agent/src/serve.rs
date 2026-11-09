@@ -536,6 +536,9 @@ pub struct ServeSummary {
     /// name the client asked for resolves to its stem). Metrics label by this, never by whatever
     /// string the client sent. Empty provider-side.
     pub served_model: String,
+    /// Consumer-side: the model's card provider couldn't serve (`offline`, `overloaded`, `refused`)
+    /// and another provider of the same version did instead. `None` otherwise.
+    pub card_fallback: Option<String>,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -567,6 +570,7 @@ pub fn handle_serve_request(
                 recount_pending: false,
                 provider: String::new(),
                 served_model: String::new(),
+                card_fallback: None,
             };
         }
     };
@@ -717,6 +721,7 @@ pub fn handle_serve_request_watched(
                 recount_pending: false,
                 provider: String::new(),
                 served_model: String::new(),
+                card_fallback: None,
             }
         }
         Err(e) => {
@@ -736,6 +741,8 @@ pub fn handle_serve_request_watched(
                 provider: String::new(),
 
                 served_model: String::new(),
+
+                card_fallback: None,
             }
         }
     }

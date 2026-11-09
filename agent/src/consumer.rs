@@ -791,6 +791,102 @@ fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
 /// gateway knows: none when the name is known as it is (or isn't a weight file's name), else its stem
 /// ([`openhydra_protocol::model_id::public_model_id`]) when that is known. A stem a provider had to
 /// suffix (two checkpoints sharing it) can't be derived from the file name, so that stays unknown.
+/// The providers a card pins a model to: its cards' providers and this machine's own (which joins
+/// only when it shares the model: `serve_once` adds it from its own list).
+fn card_peer_ids(card_peers: &[DiscoveredPeer], own: Option<&str>) -> std::collections::HashSet<String> {
+    card_peers.iter().map(|p| p.libp2p_peer_id.clone()).chain(own.map(str::to_string)).collect()
+}
+
+/// `ids`, within `only` when a step before (`openhydra/auto`) already chose the providers.
+fn restrict_to(only: Option<&std::collections::HashSet<String>>, ids: std::collections::HashSet<String>) -> std::collections::HashSet<String> {
+    match only {
+        Some(o) => ids.into_iter().filter(|p| o.contains(p)).collect(),
+        None => ids,
+    }
+}
+
+/// The providers a public card's model may fall back to: found on the network, not one the card
+/// pins, and announcing one of the cards' exact versions (`canonicals`). None when the cards state
+/// no version: the same name alone isn't the same model.
+fn card_alternatives(found: &[DiscoveredPeer], pinned: &std::collections::HashSet<String>, canonicals: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = found
+        .iter()
+        .filter(|p| !pinned.contains(&p.libp2p_peer_id))
+        .filter(|p| !p.canonical_model_id.is_empty() && canonicals.iter().any(|c| *c == p.canonical_model_id))
+        .map(|p| p.libp2p_peer_id.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Why a card's providers didn't serve, from the last error: `overloaded` (it shed the request or
+/// is busy), `refused` (it answered with an error), else `offline` (it couldn't be reached).
+fn card_failure_reason(e: &AdapterError) -> &'static str {
+    match e {
+        AdapterError::Overloaded(_) | AdapterError::Busy(_) => "overloaded",
+        AdapterError::Provider(m) if m.to_ascii_lowercase().contains("overloaded") => "overloaded",
+        AdapterError::Provider(_) => "refused",
+        _ => "offline",
+    }
+}
+
+/// The last characters of a peer id, as the app shows providers.
+fn short_peer(peer: &str) -> String {
+    let n = peer.chars().count();
+    format!("…{}", peer.chars().skip(n.saturating_sub(6)).collect::<String>())
+}
+
+/// The error for a card's model its providers couldn't serve, with no fallback taken
+/// ([`AdapterError::CardUnavailable`]): what happened, and what the caller can do.
+#[allow(clippy::too_many_arguments)]
+fn card_unavailable(
+    model: &str,
+    private: bool,
+    reason: &str,
+    err: &AdapterError,
+    providers: Vec<String>,
+    alternatives: usize,
+    choice: crate::cards::CardFallback,
+    alternatives_failed: bool,
+) -> AdapterError {
+    use crate::cards::CardFallback;
+    let who = if private { "the swarm's provider" } else { "the card's provider" };
+    let what = match reason {
+        "overloaded" => format!("{who} is busy (it turned the request away)"),
+        "refused" => {
+            let detail: String = err.message().chars().take(160).collect();
+            format!("{who} refused the request ({detail})")
+        }
+        _ => format!("{who} is offline (it couldn't be reached)"),
+    };
+    let others = if alternatives == 1 { "1 other provider serves".to_string() } else { format!("{alternatives} other providers serve") };
+    let message = if private {
+        format!("{model}: {what}. This private model is never sent outside its swarm, so nothing else was tried.")
+    } else if alternatives_failed {
+        format!("{model}: {what}, and the {others} the same version couldn't serve it either.")
+    } else if alternatives == 0 {
+        format!("{model}: {what}, and no other provider serves the same version.")
+    } else {
+        match choice {
+            CardFallback::Never => format!("{model}: {what}. {others} the same version, but falling back is off for this model."),
+            _ => format!(
+                "{model}: {what}. {others} the same version: send `x-openhydra-fallback: same-version` (or say yes in the app) \
+                 to use one. Another provider is another machine, which can read your prompt."
+            ),
+        }
+    };
+    AdapterError::CardUnavailable(Box::new(crate::adapter::CardUnavailable {
+        message,
+        model: model.to_string(),
+        private,
+        reason: reason.to_string(),
+        providers,
+        alternatives: if private { 0 } else { alternatives },
+        fallback: if private { CardFallback::Never.as_str().to_string() } else { choice.as_str().to_string() },
+    }))
+}
+
 fn weight_file_alias(requested: &str, known: &[String]) -> Option<String> {
     if known.iter().any(|m| m == requested) {
         return None;
@@ -1085,6 +1181,7 @@ pub fn request_completion(
                     recount_pending: false,
                     provider: String::new(),
                     served_model: String::new(),
+                    card_fallback: None,
                 })
             }
         }
@@ -1609,6 +1706,7 @@ fn dispatch_stream_slice(
                     recount_pending: false,
                     provider: String::new(),
                     served_model: String::new(),
+                    card_fallback: None,
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
@@ -3487,6 +3585,7 @@ impl ConsumerNode {
         think: Option<bool>,
         min_authenticity: Option<AuthenticityTier>,
         only: Option<&std::collections::HashSet<String>>,
+        fallback: Option<crate::cards::CardFallback>,
         cancel: &dyn Fn() -> bool,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
@@ -3501,21 +3600,136 @@ impl ConsumerNode {
             tracing::debug!(requested = %model, served_as = %stem, "a weight file's name maps to the model's announced name");
         }
         let model = alias.as_deref().unwrap_or(model);
+        // The buyer's floor for this request: this node's, raised (never lowered) by the request's.
+        let policy = request_policy(self.assurance, min_authenticity);
+        // An imported card that names the model pins it to the card's providers (see `CardPin`).
+        let pin = self.cards.as_ref().map(|c| c.pin_for(model, now_unix_ms())).unwrap_or(crate::cards::CardPin::None);
+        let (card_peers, private) = match &pin {
+            crate::cards::CardPin::None => {
+                return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
+            }
+            crate::cards::CardPin::Private { peers } => (peers.clone(), true),
+            crate::cards::CardPin::Public { peers, .. } => (peers.clone(), false),
+        };
+        let pinned = restrict_to(only, card_peer_ids(&card_peers, self.self_provider.as_deref()));
+        // Whether any of the answer reached the client: then nothing else may be tried.
+        let delivered = std::cell::Cell::new(false);
+        // The providers the lookups for this request found (a public card's possible fallbacks).
+        let seen = std::cell::RefCell::new(Vec::new());
+        let first = {
+            let mut track = |d: &str| {
+                delivered.set(true);
+                on_delta(d)
+            };
+            // A private card's model is never looked up on the network: its name isn't asked about
+            // publicly, and nobody found there could serve it anyway.
+            self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
+        };
+        let err = match first {
+            Ok(summary) => return Ok(summary),
+            Err(e) if delivered.get() || cancel() || matches!(e, AdapterError::Cancelled(_)) => return Err(e),
+            Err(e) => e,
+        };
+        let reason = card_failure_reason(&err);
+        let shown: Vec<String> = card_peers.iter().map(|p| short_peer(&p.libp2p_peer_id)).collect();
+        if private {
+            tracing::warn!(model, reason, "a private card's provider couldn't serve; not looking elsewhere");
+            return Err(card_unavailable(model, true, reason, &err, shown, 0, crate::cards::CardFallback::Never, false));
+        }
+        let crate::cards::CardPin::Public { canonicals, .. } = &pin else { unreachable!("matched above") };
+        // Another provider only for the same exact version, never just the same name.
+        let alternatives = self.same_version_alternatives(model, &pinned, canonicals, only, seen.into_inner());
+        let choice = fallback
+            .or_else(|| self.cards.as_ref().and_then(|c| c.fallback_pref(model)))
+            .unwrap_or(crate::cards::CardFallback::SameVersion);
+        if choice != crate::cards::CardFallback::SameVersion || alternatives.is_empty() {
+            tracing::info!(model, reason, alternatives = alternatives.len(), choice = choice.as_str(), "a card's provider couldn't serve; not falling back");
+            return Err(card_unavailable(model, false, reason, &err, shown, alternatives.len(), choice, false));
+        }
+        tracing::info!(model, reason, alternatives = alternatives.len(), "a card's provider couldn't serve; using another provider of the same version");
+        let second = {
+            let mut track = |d: &str| {
+                delivered.set(true);
+                on_delta(d)
+            };
+            self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&alternatives), false, None, cancel, &mut track)
+        };
+        match second {
+            Ok(mut summary) => {
+                summary.card_fallback = Some(reason.to_string());
+                Ok(summary)
+            }
+            Err(e) if delivered.get() || cancel() || matches!(e, AdapterError::Cancelled(_)) => Err(e),
+            Err(_) => Err(card_unavailable(model, false, reason, &err, shown, alternatives.len(), choice, true)),
+        }
+    }
+
+    /// The providers a public card's model may fall back to ([`card_alternatives`]), within `only`:
+    /// those this request's own lookups found (`seen`), else a lookup now, the bootstraps' registry,
+    /// then a fresh lookup, stopping at the first that finds one. The request's own lookups come
+    /// first because the retries before (every card provider failed) make the next lookup skip the
+    /// providers already known and wait on the DHT, which can come back empty (live, 10 Nov).
+    fn same_version_alternatives(
+        &self,
+        model: &str,
+        pinned: &std::collections::HashSet<String>,
+        canonicals: &[String],
+        only: Option<&std::collections::HashSet<String>>,
+        seen: Vec<DiscoveredPeer>,
+    ) -> std::collections::HashSet<String> {
+        if canonicals.is_empty() {
+            return Default::default();
+        }
+        let pick = |found: Vec<DiscoveredPeer>| -> std::collections::HashSet<String> {
+            card_alternatives(&found, pinned, canonicals).into_iter().filter(|p| only.is_none_or(|o| o.contains(p))).collect()
+        };
+        let found = pick(seen);
+        if !found.is_empty() {
+            return found;
+        }
+        let found = pick(self.net.discover(model).unwrap_or_default());
+        if !found.is_empty() {
+            return found;
+        }
+        let found = pick(self.net.query_registry(model).unwrap_or_default());
+        if !found.is_empty() {
+            return found;
+        }
+        let _ = self.net.invalidate_discover(model);
+        pick(self.net.discover(model).unwrap_or_default())
+    }
+
+    /// Serve `model` with retries ([`run_passes`] over [`serve_once`](Self::serve_once)), among the
+    /// providers `only` allows (all when `None`), without asking the network when `no_discovery`.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_passes(
+        self: &Arc<Self>,
+        model: &str,
+        messages: &[ChatMessage],
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        tools: &[Value],
+        think: Option<bool>,
+        policy: &AssurancePolicy,
+        only: Option<&std::collections::HashSet<String>>,
+        no_discovery: bool,
+        seen: Option<&std::cell::RefCell<Vec<DiscoveredPeer>>>,
+        cancel: &dyn Fn() -> bool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ServeSummary, AdapterError> {
         let now = now_unix_ms();
         // Providers this request already noted as unavailable: its retries are one miss (L5).
         let noted = std::cell::RefCell::new(std::collections::HashSet::new());
-        // The buyer's floor for this request: this node's, raised (never lowered) by the request's.
-        let policy = request_policy(self.assurance, min_authenticity);
         // The `complete` span (from #[instrument]); we fill in `provider`/`tokens` on success.
         let req_span = tracing::Span::current();
         let started = std::time::Instant::now();
         run_passes(
             model,
             &mut |fresh| {
-                if fresh {
+                if fresh && !no_discovery {
                     let _ = self.net.invalidate_discover(model);
                 }
-                self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, only, cancel, now, &noted, &req_span, on_delta)
+                self.serve_once(model, messages, max_tokens, temperature, tools, think, policy, only, no_discovery, seen, cancel, now, &noted, &req_span, on_delta)
             },
             cancel,
             &|| started.elapsed(),
@@ -3539,6 +3753,8 @@ impl ConsumerNode {
         think: Option<bool>,
         policy: &AssurancePolicy,
         only: Option<&std::collections::HashSet<String>>,
+        no_discovery: bool,
+        seen: Option<&std::cell::RefCell<Vec<DiscoveredPeer>>>,
         cancel: &dyn Fn() -> bool,
         now: u64,
         noted: &std::cell::RefCell<std::collections::HashSet<(String, String)>>,
@@ -3550,7 +3766,10 @@ impl ConsumerNode {
         // those providers, not for the model name.
         let allowed = |p: &DiscoveredPeer| only.is_none_or(|o| o.contains(&p.libp2p_peer_id));
         let t_discover = std::time::Instant::now();
-        let mut peers = {
+        let mut peers = if no_discovery {
+            // A private card's model: only the card's providers (added below), never the network.
+            Vec::new()
+        } else {
             let _span = tracing::info_span!("discover", model = %model).entered();
             match self.net.discover(model) {
                 Ok(p) => p,
@@ -3558,6 +3777,10 @@ impl ConsumerNode {
                 Err(e) => return AttemptOutcome::Fatal(AdapterError::Network(format!("discover: {e}"))),
             }
         };
+        // Everyone the lookup found, before `only` narrows it: a card's model falls back to them.
+        if let Some(seen) = seen {
+            seen.borrow_mut().extend(peers.iter().cloned());
+        }
         peers.retain(allowed);
         // C7: passive discovery (DHT get_providers + gossip PEX) can come up empty across NATs —
         // the D-sized gossip mesh doesn't forward a provider's advert to this specific consumer
@@ -3565,7 +3788,7 @@ impl ConsumerNode {
         // bootstrap's provider registry, which has retained the verified adverts it saw. This is
         // a best-effort supplement: only when passive discovery found nothing, and a failed query
         // (no bootstrap, transport error) just leaves `peers` empty for the normal Retryable path.
-        if peers.is_empty() {
+        if peers.is_empty() && !no_discovery {
             let _span = tracing::info_span!("registry_query", model = %model).entered();
             match self.net.query_registry(model) {
                 Ok(reg) if reg.iter().any(allowed) => {
@@ -7457,6 +7680,71 @@ mod tests {
         assert_eq!(weight_file_alias("/aaa/qwen2.5:7b.gguf", &k), None, "a path");
         assert_eq!(weight_file_alias("qwen2.5:7b.gguf.gguf", &k).as_deref(), Some("qwen2.5:7b"));
         assert_eq!(weight_file_alias(&format!("{}.gguf", "x".repeat(10_000)), &known(&[&"x".repeat(10_000)])), None, "too long to be a model id");
+    }
+
+    fn peer(id: &str, canonical: &str) -> DiscoveredPeer {
+        DiscoveredPeer { libp2p_peer_id: id.into(), model_id: "qwen".into(), canonical_model_id: canonical.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_private_cards_model_is_never_served_by_a_provider_found_on_the_network() {
+        // The swarm's provider (card), our own provider, and a public provider announcing the same
+        // name, found on the network.
+        let card = vec![peer("12D3swarm", "q/7b/q4/t")];
+        let pinned = restrict_to(None, card_peer_ids(&card, Some("12D3own")));
+        assert_eq!(pinned, ["12D3swarm", "12D3own"].iter().map(|s| s.to_string()).collect());
+        // serve_once keeps only the pinned providers of whatever discovery found, and with a private
+        // card it doesn't ask the network at all: online or offline, the public one never qualifies.
+        let found = vec![peer("12D3public", "q/7b/q4/t"), peer("12D3swarm", "q/7b/q4/t")];
+        let candidates: Vec<&str> = found.iter().filter(|p| pinned.contains(&p.libp2p_peer_id)).map(|p| p.libp2p_peer_id.as_str()).collect();
+        assert_eq!(candidates, ["12D3swarm"]);
+        // A step that already chose providers (`openhydra/auto`) narrows it further, never widens it.
+        let only: std::collections::HashSet<String> = ["12D3public".to_string()].into();
+        assert!(restrict_to(Some(&only), card_peer_ids(&card, None)).is_empty());
+        // It fails, saying why, and offers nothing.
+        let e = card_unavailable("qwen", true, "offline", &AdapterError::Network("dial failed".into()), vec!["…swarm".into()], 3, crate::cards::CardFallback::SameVersion, false);
+        let AdapterError::CardUnavailable(c) = &e else { panic!("{e:?}") };
+        assert!(c.private && c.alternatives == 0 && c.fallback == "never", "{c:?}");
+        assert!(c.message.contains("never sent outside its swarm"), "{}", c.message);
+        assert_eq!(crate::gateway::error_class(&e), (axum::http::StatusCode::SERVICE_UNAVAILABLE, "card_provider_unavailable"));
+    }
+
+    #[test]
+    fn a_public_card_falls_back_only_to_the_same_exact_version() {
+        let pinned: std::collections::HashSet<String> = ["12D3card".to_string()].into();
+        let found = vec![
+            peer("12D3card", "qwen2.5/7b/q4_k_m/aa"),
+            peer("12D3same", "qwen2.5/7b/q4_k_m/aa"),
+            peer("12D3other_quant", "qwen2.5/7b/q8_0/aa"),
+            peer("12D3unstated", ""),
+            peer("12D3same", "qwen2.5/7b/q4_k_m/aa"),
+        ];
+        let canonicals = vec!["qwen2.5/7b/q4_k_m/aa".to_string()];
+        assert_eq!(card_alternatives(&found, &pinned, &canonicals), vec!["12D3same".to_string()]);
+        assert!(card_alternatives(&found, &pinned, &[]).is_empty(), "a card stating no version has no fallback");
+    }
+
+    #[test]
+    fn a_card_failure_says_offline_overloaded_or_refused_and_what_can_be_done() {
+        assert_eq!(card_failure_reason(&AdapterError::Overloaded("pool full".into())), "overloaded");
+        assert_eq!(card_failure_reason(&AdapterError::Provider("provider overloaded, retry".into())), "overloaded");
+        assert_eq!(card_failure_reason(&AdapterError::Provider("no credential for swarm".into())), "refused");
+        assert_eq!(card_failure_reason(&AdapterError::Network("dial failed".into())), "offline");
+        assert_eq!(card_failure_reason(&AdapterError::Route("no provider for model 'q'".into())), "offline");
+        use crate::cards::CardFallback;
+        let net = AdapterError::Network("dial failed".into());
+        let msg = |alts, choice, failed| match card_unavailable("qwen", false, "offline", &net, vec![], alts, choice, failed) {
+            AdapterError::CardUnavailable(c) => (c.message.clone(), c.alternatives, c.fallback.clone()),
+            other => panic!("{other:?}"),
+        };
+        let (m, n, f) = msg(2, CardFallback::Ask, false);
+        assert!(m.contains("is offline") && m.contains("2 other providers serve the same version") && m.contains("x-openhydra-fallback"), "{m}");
+        assert_eq!((n, f.as_str()), (2, "ask"));
+        assert!(msg(1, CardFallback::Never, false).0.contains("falling back is off"));
+        assert!(msg(0, CardFallback::SameVersion, false).0.contains("no other provider serves the same version"));
+        assert!(msg(2, CardFallback::SameVersion, true).0.contains("couldn't serve it either"));
+        let busy = card_unavailable("qwen", false, "overloaded", &AdapterError::Overloaded("x".into()), vec![], 0, CardFallback::Ask, false);
+        assert!(busy.to_string().contains("is busy"), "{busy}");
     }
 
     #[test]

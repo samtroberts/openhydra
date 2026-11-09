@@ -224,7 +224,7 @@ fn test_request(net: NetworkHandle, model: &str, only: &HashSet<String>) -> Test
     let node = Arc::new(ConsumerNode::new(net));
     let messages = vec![ChatMessage::new("user", "Reply with one word: ok")];
     let start = Instant::now();
-    let result = node.complete(model, messages, Some(8), Some(0.0), Vec::new(), Some(false), None, Some(only), &|| false, &mut |_| {});
+    let result = node.complete(model, messages, Some(8), Some(0.0), Vec::new(), Some(false), None, Some(only), None, &|| false, &mut |_| {});
     let ms = start.elapsed().as_millis() as u64;
     match result {
         Ok(s) => TestResult { model: model.to_string(), ok: s.ok, ms, tokens: s.tokens, error: None },

@@ -135,6 +135,18 @@ struct ChatRequest {
     /// Consulted only when top-level `think` is absent.
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// OpenHydra's own options (OpenAI SDKs send them with `extra_body`).
+    #[serde(default)]
+    openhydra: Option<OpenHydraOptions>,
+}
+
+/// OpenHydra's own request options (`"openhydra": { … }` in a chat completion request).
+#[derive(Debug, Default, Deserialize)]
+struct OpenHydraOptions {
+    /// What to do when a public card's provider can't serve: `ask`, `same-version` or `never`
+    /// (the [`FALLBACK_HEADER`] header says the same and wins).
+    #[serde(default)]
+    fallback: Option<String>,
 }
 
 /// The subset of OpenAI-compat `chat_template_kwargs` we read — the thinking toggle that
@@ -179,8 +191,9 @@ type EventRx = tokio::sync::mpsc::Receiver<GatewayEvent>;
 enum GatewayEvent {
     Delta(String),
     Done(Box<ServeSummary>),
-    /// The error's text, and its HTTP status and OpenAI error `type` ([`error_class`]).
-    Error(String, ErrorClass),
+    /// The error's text, its HTTP status and OpenAI error `type` ([`error_class`]), and details a
+    /// client can act on ([`error_details`]; a card's provider that couldn't serve).
+    Error(String, ErrorClass, Option<Value>),
 }
 
 /// An error's HTTP status and OpenAI error `type`.
@@ -191,9 +204,23 @@ type ErrorClass = (StatusCode, &'static str);
 /// result's data URL (round 9 B9-1).
 const MAX_BUFFERED_COMPLETION_BYTES: usize = 128 * 1024 * 1024;
 
-fn too_large_to_buffer() -> (String, ErrorClass) {
-    ("the completion is too large to return in one response; use streaming".into(), (StatusCode::BAD_GATEWAY, "upstream_error"))
+fn too_large_to_buffer() -> (String, ErrorClass, Option<Value>) {
+    ("the completion is too large to return in one response; use streaming".into(), (StatusCode::BAD_GATEWAY, "upstream_error"), None)
 }
+
+/// The details of an error a client can act on: for a card's model its providers couldn't serve,
+/// the reason, the providers, how many others serve the same version, and the fallback choice that
+/// applied (the app asks the user from these).
+fn error_details(e: &crate::adapter::AdapterError) -> Option<Value> {
+    match e {
+        crate::adapter::AdapterError::CardUnavailable(c) => serde_json::to_value(c.as_ref()).ok(),
+        _ => None,
+    }
+}
+
+/// The request header that says what to do when a public card's provider can't serve:
+/// `ask`, `same-version` or `never` (see [`crate::cards::CardFallback`]).
+pub const FALLBACK_HEADER: &str = "x-openhydra-fallback";
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -248,9 +275,21 @@ pub(crate) fn error_class(e: &crate::adapter::AdapterError) -> ErrorClass {
             (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
         }
         AdapterError::Overloaded(_) => (StatusCode::SERVICE_UNAVAILABLE, "upstream_overloaded"),
+        AdapterError::CardUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "card_provider_unavailable"),
         AdapterError::Network(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
         other => classify_error(&other.to_string()),
     }
+}
+
+/// The `error` object of an OpenAI-shaped error, with the details a client can act on when there
+/// are some (`code` is then their `reason`, e.g. `offline`).
+fn error_body(message: &str, etype: &str, details: Option<Value>) -> Value {
+    let code = details.as_ref().and_then(|d| d.get("reason").cloned()).unwrap_or(Value::Null);
+    let mut v = json!({ "message": message, "type": etype, "code": code });
+    if let Some(d) = details {
+        v["openhydra"] = d;
+    }
+    v
 }
 
 /// An OpenAI-shaped error response: `{ "error": { message, type, code } }` with a status.
@@ -949,6 +988,9 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
         "recount_pending": summary.recount_pending,
         // The authenticity tier this gateway had established for the provider that served (D2).
         "provider_authenticity": summary.authenticity.map(|t| t.label()),
+        // The model's card provider couldn't serve and another provider of the same version did:
+        // never silent (the app shows it under the reply).
+        "card": summary.card_fallback.as_ref().map(|reason| json!({ "fell_back": true, "reason": reason })),
         "engine": {
             "native_tps": rate(e.eval_count, e.eval_duration_ns),
             "prefill_tps": rate(e.prompt_eval_count, e.prompt_eval_duration_ns),
@@ -1094,6 +1136,7 @@ fn spawn_worker(
     think: Option<bool>,
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
     only: Option<std::collections::HashSet<String>>,
+    fallback: Option<crate::cards::CardFallback>,
     gen_permit: OwnedSemaphorePermit,
 ) -> (
     EventRx,
@@ -1116,7 +1159,7 @@ fn spawn_worker(
         // Or gone before any delta (during discovery or prefill): its receiver is already dropped.
         let cancel = || gone.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed();
         let offered = offered_tool_names(&tools);
-        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, only.as_ref(), &cancel, &mut on_delta) {
+        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, only.as_ref(), fallback, &cancel, &mut on_delta) {
             Ok(mut summary) => {
                 let (kept, dropped) = filter_tool_calls(std::mem::take(&mut summary.tool_calls), &offered);
                 if dropped > 0 {
@@ -1126,7 +1169,7 @@ fn spawn_worker(
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
-                let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e)));
+                let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e), error_details(&e)));
             }
         }
     });
@@ -1179,6 +1222,7 @@ async fn chat_completions(
         req.temperature,
         req.tools,
         think,
+        req.openhydra.and_then(|o| o.fallback),
     )
     .await
     {
@@ -1207,6 +1251,9 @@ enum DispatchErr {
     NoModels(String),
     /// The [`MIN_AUTHENTICITY_HEADER`] isn't one of `A0`–`A3`.
     BadAuthenticity,
+    /// The fallback choice ([`FALLBACK_HEADER`] or `openhydra.fallback`) isn't `ask`,
+    /// `same-version` or `never`.
+    BadFallback,
 }
 
 /// The request header a client sets to require a minimum authenticity tier (`A0`–`A3`) for its
@@ -1244,6 +1291,7 @@ async fn spawn_dispatch(
     temperature: Option<f64>,
     tools: Vec<Value>,
     think: Option<bool>,
+    body_fallback: Option<String>,
 ) -> Result<(String, Route, EventRx, std::time::Instant), DispatchErr>
 {
     // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
@@ -1257,6 +1305,15 @@ async fn spawn_dispatch(
         Some(v) => match v.to_str().ok().and_then(parse_authenticity_tier) {
             Some(t) => Some(t),
             None => return Err(DispatchErr::BadAuthenticity),
+        },
+    };
+    // What to do when a public card's provider can't serve: the header, else the request body's
+    // `openhydra.fallback`, else the saved choice or the default (decided where the card is known).
+    let fallback = match headers.get(FALLBACK_HEADER).map(|v| v.to_str().unwrap_or("")).map(str::to_string).or(body_fallback) {
+        None => None,
+        Some(v) => match crate::cards::CardFallback::parse(&v) {
+            Some(c) => Some(c),
+            None => return Err(DispatchErr::BadFallback),
         },
     };
     // G3b: acquire the global generation slot BEFORE any (blocking) discovery work, so the backstop
@@ -1293,7 +1350,7 @@ async fn spawn_dispatch(
             gen_permit,
         )
     } else {
-        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, gen_permit)
+        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, gen_permit)
     };
     Ok((model, route, rx, started))
 }
@@ -1318,6 +1375,11 @@ fn dispatch_err_openai(e: DispatchErr) -> Response {
         DispatchErr::BadAuthenticity => openai_error(
             StatusCode::BAD_REQUEST,
             &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2"),
+            "invalid_request_error",
+        ),
+        DispatchErr::BadFallback => openai_error(
+            StatusCode::BAD_REQUEST,
+            &format!("{FALLBACK_HEADER} (or openhydra.fallback) must be one of ask, same-version, never"),
             "invalid_request_error",
         ),
     }
@@ -1399,11 +1461,12 @@ fn spawn_byok_worker(
                     recount_pending: false,
                     provider: String::new(),
                     served_model: String::new(),
+                    card_fallback: None,
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
-                let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e)));
+                let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e), error_details(&e)));
             }
         }
     });
@@ -1474,12 +1537,12 @@ fn stream_response(
                 }
                 chunk.to_string()
             }
-            GatewayEvent::Error(m, (_, etype)) => {
+            GatewayEvent::Error(m, (_, etype), details) => {
                 metrics.record_error();
                 json!({
                     "id": id_s, "object": "chat.completion.chunk", "created": created, "model": model_s,
                     "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }],
-                    "error": { "message": m, "type": etype },
+                    "error": error_body(&m, etype, details),
                 })
                 .to_string()
             }
@@ -1506,7 +1569,7 @@ async fn buffered_response(
     metrics: Arc<Metrics>,
 ) -> Response {
     let mut content = String::new();
-    let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass)>> = None;
+    let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass, Option<Value>)>> = None;
     // Time the first delta even though the HTTP body is buffered: with P1 streaming the tokens
     // arrive incrementally over the channel, so this is the real generation time-to-first-token.
     let mut ttft: Option<std::time::Duration> = None;
@@ -1521,7 +1584,7 @@ async fn buffered_response(
                 content.push_str(&t);
             }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
-            GatewayEvent::Error(m, class) => outcome = Some(Err((m, class))),
+            GatewayEvent::Error(m, class, details) => outcome = Some(Err((m, class, details))),
         }
     }
     match outcome {
@@ -1540,9 +1603,9 @@ async fn buffered_response(
             Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall)))
                 .into_response()
         }
-        Some(Err((m, (status, etype)))) => {
+        Some(Err((m, (status, etype), details))) => {
             metrics.record_error();
-            openai_error(status, &m, etype)
+            (status, Json(json!({ "error": error_body(&m, etype, details) }))).into_response()
         }
         None => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1782,6 +1845,19 @@ fn anthropic_error(status: StatusCode, message: &str, etype: &str) -> Response {
         .into_response()
 }
 
+/// An Anthropic-shaped error with the details a client can act on ([`error_details`]).
+fn anthropic_error_with(status: StatusCode, message: &str, etype: &str, details: Option<Value>) -> Response {
+    (status, Json(anthropic_error_value(message, etype, details))).into_response()
+}
+
+fn anthropic_error_value(message: &str, etype: &str, details: Option<Value>) -> Value {
+    let mut v = json!({ "type": "error", "error": { "type": etype, "message": message } });
+    if let Some(d) = details {
+        v["error"]["openhydra"] = d;
+    }
+    v
+}
+
 fn dispatch_err_anthropic(e: DispatchErr) -> Response {
     match e {
         DispatchErr::Aup(reason) => anthropic_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error"),
@@ -1799,6 +1875,11 @@ fn dispatch_err_anthropic(e: DispatchErr) -> Response {
         DispatchErr::BadAuthenticity => anthropic_error(
             StatusCode::BAD_REQUEST,
             &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2"),
+            "invalid_request_error",
+        ),
+        DispatchErr::BadFallback => anthropic_error(
+            StatusCode::BAD_REQUEST,
+            &format!("{FALLBACK_HEADER} must be one of ask, same-version, never"),
             "invalid_request_error",
         ),
     }
@@ -1896,6 +1977,8 @@ async fn messages(
         // Anthropic-surface thinking control (`thinking:{type}`) mapping is a separate
         // follow-up; the OpenAI surface carries the Ollama-native `think` switch today.
         None,
+        // The Anthropic surface takes the fallback choice from the header only.
+        None,
     )
     .await
     {
@@ -1921,7 +2004,7 @@ async fn anthropic_buffered_response(
 ) -> Response {
     let mut content = String::new();
     let mut ttft: Option<std::time::Duration> = None;
-    let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass)>> = None;
+    let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass, Option<Value>)>> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
             GatewayEvent::Delta(t) => {
@@ -1933,7 +2016,7 @@ async fn anthropic_buffered_response(
                 content.push_str(&t);
             }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
-            GatewayEvent::Error(m, class) => outcome = Some(Err((m, class))),
+            GatewayEvent::Error(m, class, details) => outcome = Some(Err((m, class, details))),
         }
     }
     match outcome {
@@ -1945,9 +2028,9 @@ async fn anthropic_buffered_response(
             metrics.record_model(served_label(&summary, &model), &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
             Json(anthropic_message_object(&id, &model, &content, &summary)).into_response()
         }
-        Some(Err((m, (status, _)))) => {
+        Some(Err((m, (status, etype), details))) => {
             metrics.record_error();
-            anthropic_error(status, &m, "api_error")
+            anthropic_error_with(status, &m, if details.is_some() { etype } else { "api_error" }, details)
         }
         None => anthropic_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2009,9 +2092,9 @@ async fn anthropic_stream_worker(
         _ = out.closed() => return,
     };
     let first = match first {
-        Some(GatewayEvent::Error(m, _)) => {
+        Some(GatewayEvent::Error(m, (_, etype), details)) => {
             metrics.record_error();
-            let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } }))).await;
+            let _ = out.send(("error", anthropic_error_value(&m, if details.is_some() { etype } else { "api_error" }, details))).await;
             return;
         }
         Some(ev) => ev, // a Delta or Done — the message really started
@@ -2093,9 +2176,9 @@ async fn anthropic_stream_worker(
                 }
                 break 'drain;
             }
-            GatewayEvent::Error(m, _) => {
+            GatewayEvent::Error(m, (_, etype), details) => {
                 metrics.record_error();
-                if out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } }))).await.is_err() {
+                if out.send(("error", anthropic_error_value(&m, if details.is_some() { etype } else { "api_error" }, details))).await.is_err() {
                     return;
                 }
                 break 'drain;
@@ -2705,6 +2788,7 @@ mod tests {
             recount_pending: false,
             provider: String::new(),
             served_model: String::new(),
+            card_fallback: None,
         }
     }
 
@@ -2830,6 +2914,43 @@ mod tests {
         assert!(get_status(port, "/metrics", &[&format!("Authorization: Bearer {key}")]).await.contains(" 200 "));
         // Liveness stays open.
         assert!(get_status(port, "/health", &[]).await.contains(" 200 "));
+    }
+
+    #[test]
+    fn a_card_providers_failure_reaches_the_client_with_what_it_can_do() {
+        let e = crate::adapter::AdapterError::CardUnavailable(Box::new(crate::adapter::CardUnavailable {
+            message: "qwen: the card's provider is offline.".into(),
+            model: "qwen".into(),
+            private: false,
+            reason: "offline".into(),
+            providers: vec!["…a1b2c3".into()],
+            alternatives: 2,
+            fallback: "ask".into(),
+        }));
+        let body = error_body(&e.to_string(), error_class(&e).1, error_details(&e));
+        assert_eq!(body["type"], "card_provider_unavailable");
+        assert_eq!(body["code"], "offline");
+        assert_eq!(body["openhydra"]["alternatives"], 2);
+        assert_eq!(body["openhydra"]["private"], false);
+        assert_eq!(body["openhydra"]["fallback"], "ask");
+        assert!(body["openhydra"].get("message").is_none(), "the message is said once");
+        let a = anthropic_error_value(&e.to_string(), "card_provider_unavailable", error_details(&e));
+        assert_eq!(a["error"]["openhydra"]["reason"], "offline");
+        // Any other error carries no details.
+        assert_eq!(error_body("x", "upstream_error", None)["code"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_choice_that_isnt_one_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (port, _dir) = serve_test_gateway(None).await;
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-openhydra-fallback: always\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.lines().next().unwrap_or_default().contains(" 400 "), "{out}");
+        assert!(out.contains("ask, same-version, never"), "{out}");
     }
 
     #[tokio::test]
@@ -3220,7 +3341,7 @@ mod tests {
     #[tokio::test]
     async fn stream_immediate_error_has_no_message_envelope() {
         // An error as the FIRST frame → a single `error` frame, never a `message_start`.
-        let names = stream_names(vec![GatewayEvent::Error("no provider".into(), (StatusCode::SERVICE_UNAVAILABLE, "no_provider"))]).await;
+        let names = stream_names(vec![GatewayEvent::Error("no provider".into(), (StatusCode::SERVICE_UNAVAILABLE, "no_provider"), None)]).await;
         assert_eq!(names, vec!["error"]);
     }
 
@@ -3351,11 +3472,11 @@ mod tests {
 
     #[test]
     fn validation_rejects_empty_model_and_messages() {
-        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
+        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None, openhydra: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None, openhydra: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None, openhydra: None };
         assert!(validate(&r).is_none());
     }
 
