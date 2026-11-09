@@ -237,7 +237,7 @@ fn classify_error(msg: &str) -> (StatusCode, &'static str) {
 /// a provider's own error is always an upstream error, whatever its text says (it can't pass for a
 /// routing refusal or a timeout). Only our own routing and network messages are read, and errors of
 /// the older kinds fall back to [`classify_error`].
-fn error_class(e: &crate::adapter::AdapterError) -> ErrorClass {
+pub(crate) fn error_class(e: &crate::adapter::AdapterError) -> ErrorClass {
     use crate::adapter::AdapterError;
     match e {
         AdapterError::Route(m) if m.contains("no provider") => (StatusCode::SERVICE_UNAVAILABLE, "no_provider"),
@@ -985,12 +985,12 @@ fn stream_chunk(id: &str, model: &str, created: u64, delta: Value, finish: Optio
 }
 
 /// The OpenAI `finish_reason` of a completion: `"tool_calls"` when the model requested tools,
-/// `"length"` when the provider stopped it short (out of credit, or a stall it took for the
-/// client leaving), else `"stop"`.
+/// `"length"` when it was cut short (the engine reached its token limit, or the provider stopped it:
+/// out of credit, or a stall it took for the client leaving), else `"stop"`.
 fn finish_reason(summary: &ServeSummary) -> &'static str {
     if !summary.tool_calls.is_empty() {
         "tool_calls"
-    } else if summary.metrics.stopped {
+    } else if summary.metrics.stopped || summary.metrics.hit_token_limit {
         "length"
     } else {
         "stop"
@@ -1384,6 +1384,7 @@ fn spawn_byok_worker(
                         provider_serve_ns: started.elapsed().as_nanos() as u64,
                         billing: 0,
                         stopped: false,
+                        hit_token_limit: outcome.hit_token_limit,
                     },
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
@@ -2653,6 +2654,7 @@ mod tests {
                 provider_serve_ns: 500_000_000,
                 billing: 0,
                 stopped: false,
+                hit_token_limit: false,
             },
             proxy_roundtrip_ns: 600_000_000,
             discover_ns: 1_000_000,
@@ -3324,6 +3326,16 @@ mod tests {
         // Round 8 G8-4: libp2p's "Timeout", whatever its case.
         assert_eq!(error_class(&AdapterError::Network("proxy_forward: proxy outbound: Timeout".into())).0, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(error_class(&AdapterError::Overloaded("stream shed at open".into())).0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn a_reply_the_engine_cut_at_its_token_limit_finishes_with_length() {
+        let mut s = summary(8, 4);
+        assert_eq!((finish_reason(&s), anthropic_stop_reason(&s)), ("stop", "end_turn"));
+        s.metrics.hit_token_limit = true;
+        assert_eq!((finish_reason(&s), anthropic_stop_reason(&s)), ("length", "max_tokens"));
+        let v = completion_object("chatcmpl-1", "m", 1, "cut", &s, std::time::Duration::from_millis(5), std::time::Duration::from_millis(1));
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
     }
 
     #[test]

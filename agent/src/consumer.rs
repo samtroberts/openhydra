@@ -1854,13 +1854,153 @@ fn attempt_not_reachable_yet(opened: bool, e: &AdapterError) -> bool {
     !opened && is_unreachable_dial(e)
 }
 
-/// How a pass whose candidates all failed (nothing streamed) ends: `NotReachableYet` when every
-/// attempt was [`attempt_not_reachable_yet`], else `Retryable`.
-fn failed_pass_outcome(err: AdapterError, all_not_reachable_yet: bool) -> AttemptOutcome {
-    if all_not_reachable_yet {
+/// How a pass whose candidates all failed (nothing streamed) ends: `AllShed` when every attempt was
+/// shed by a busy provider, `NotReachableYet` when every attempt was [`attempt_not_reachable_yet`],
+/// else `Retryable`.
+fn failed_pass_outcome(err: AdapterError, all_not_reachable_yet: bool, all_shed: bool) -> AttemptOutcome {
+    if all_shed {
+        AttemptOutcome::AllShed(err)
+    } else if all_not_reachable_yet {
         AttemptOutcome::NotReachableYet(err)
     } else {
         AttemptOutcome::Retryable(err)
+    }
+}
+
+/// Whether a failed attempt costs its provider reputation: never our own provider, a payment refusal,
+/// a client that left, or a shed (busy is the load others cause, not a fault, however often it
+/// happens, including across one request's retries); a provider we couldn't reach only on a second
+/// miss (`missed_again`).
+fn failure_costs_reputation(self_serve: bool, refused: bool, cancelled: bool, shed: bool, unreachable: bool, missed_again: bool) -> bool {
+    let excused = shed || (unreachable && !missed_again);
+    !self_serve && !refused && !cancelled && !excused
+}
+
+/// The first wait after a pass in which every provider shed the request (its serve workers were all
+/// busy); each later wait doubles, up to [`SHED_RETRY_MAX`], with ±25% jitter so requests waiting on
+/// the same provider don't come back in step.
+const SHED_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
+const SHED_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(4);
+/// The most a request waits for a busy provider, counted from the first pass that found them all
+/// busy: a single provider (an own rig, a private swarm, a rare model) then serves requests that
+/// arrive together one after another instead of turning all but one away. Failover to a provider
+/// that isn't busy stays immediate: these waits happen only when every provider tried was busy.
+const SHED_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wait before looking again after an all-shed pass, `waited` into the budget, or `None` once
+/// the budget is spent. `jitter` is in `[0, 1)`. Advances `backoff`.
+fn next_shed_wait(backoff: &mut std::time::Duration, waited: std::time::Duration, jitter: f64) -> Option<std::time::Duration> {
+    let remaining = SHED_RETRY_BUDGET.saturating_sub(waited);
+    if remaining < SHED_RETRY_FIRST / 5 {
+        return None;
+    }
+    let wait = backoff.mul_f64(0.75 + 0.5 * jitter.clamp(0.0, 1.0)).min(remaining);
+    *backoff = (*backoff * 2).min(SHED_RETRY_MAX);
+    Some(wait)
+}
+
+/// How [`ConsumerNode::complete`] goes from one serve pass to the next. `pass(fresh)` runs one
+/// ([`ConsumerNode::serve_once`]; `fresh` bypasses the discovery cache first); `elapsed` is the time
+/// since the request began; `wait` sleeps unless the client leaves, and says whether it is still
+/// wanted; `jitter` gives a number in `[0, 1)`.
+///
+/// - A pass that every provider shed (nothing served) waits with backoff and tries the same
+///   providers again, for up to [`SHED_RETRY_BUDGET`]; then the client gets the shed (a 503).
+/// - Any other failed pass is retried once with a fresh lookup, and a pass that reached no provider
+///   at all keeps looking for up to [`UNREACHABLE_RETRY_BUDGET`].
+/// - Nothing is retried once output reached the client (`Fatal`), or after the client left.
+fn run_passes(
+    model: &str,
+    pass: &mut dyn FnMut(bool) -> AttemptOutcome,
+    cancel: &dyn Fn() -> bool,
+    elapsed: &dyn Fn() -> std::time::Duration,
+    wait: &mut dyn FnMut(std::time::Duration) -> bool,
+    jitter: &mut dyn FnMut() -> f64,
+) -> Result<ServeSummary, AdapterError> {
+    let mut outcome = pass(false);
+    // When the first cache-bypassing pass began (None until one has).
+    let mut bypassed: Option<std::time::Duration> = None;
+    let mut unreachable_waits = UNREACHABLE_RETRY_WAITS.iter();
+    let mut shed_since: Option<std::time::Duration> = None;
+    let mut shed_backoff = SHED_RETRY_FIRST;
+    loop {
+        outcome = match outcome {
+            AttemptOutcome::Served(summary) => return Ok(summary),
+            AttemptOutcome::Fatal(e) => return Err(e),
+            AttemptOutcome::AllShed(e) | AttemptOutcome::Retryable(e) | AttemptOutcome::NotReachableYet(e) if cancel() => {
+                return Err(e)
+            }
+            AttemptOutcome::AllShed(e) => {
+                let since = *shed_since.get_or_insert_with(elapsed);
+                let waited = elapsed().saturating_sub(since);
+                match next_shed_wait(&mut shed_backoff, waited, jitter()) {
+                    Some(w) => {
+                        tracing::info!(model, wait_ms = w.as_millis() as u64, waited_ms = waited.as_millis() as u64,
+                            "every provider is busy; trying again shortly");
+                        if !wait(w) {
+                            return Err(e);
+                        }
+                        pass(false)
+                    }
+                    None => {
+                        let msg = match e {
+                            AdapterError::Overloaded(m) => m,
+                            other => other.to_string(),
+                        };
+                        return Err(AdapterError::Overloaded(format!(
+                            "{msg} (every provider of '{model}' stayed busy for {}s)",
+                            waited.as_secs()
+                        )));
+                    }
+                }
+            }
+            // A provider answered (with an error) after the one cache-bypass retry: that was enough.
+            AttemptOutcome::Retryable(e) if bypassed.is_some() => return Err(e),
+            AttemptOutcome::NotReachableYet(e) if bypassed.is_some() => {
+                // A provider that only just joined isn't reachable until its address is confirmed
+                // (a few seconds): its dial fails at once, so wait a little and look again rather
+                // than fail the request. Only when no provider could be reached at all, and
+                // nothing has been streamed.
+                let since = bypassed.unwrap_or_default();
+                match next_unreachable_wait(&mut unreachable_waits, elapsed().saturating_sub(since), false) {
+                    Some(w) => {
+                        tracing::info!(model, wait_ms = w.as_millis() as u64, "provider not reachable yet; looking again shortly");
+                        // Its client may have left while we waited (L6).
+                        if !wait(w) {
+                            return Err(e);
+                        }
+                        pass(true)
+                    }
+                    None => return Err(e),
+                }
+            }
+            // First pass may discover from the C11 cache. On a "no usable provider" outcome — empty
+            // discovery, or every candidate failed with nothing streamed — the cached set may be
+            // stale (a provider moved/died and its replacement isn't cached yet), so look again with
+            // a cold get_providers lookup. Only reached when nothing was streamed, so it can never
+            // duplicate delivered output.
+            AttemptOutcome::Retryable(_) | AttemptOutcome::NotReachableYet(_) => {
+                tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
+                bypassed = Some(elapsed());
+                pass(true)
+            }
+        };
+    }
+}
+
+/// Sleep `total` in short steps, returning early (false) once the client has left.
+fn wait_unless_cancelled(total: std::time::Duration, cancel: &dyn Fn() -> bool) -> bool {
+    let step = std::time::Duration::from_millis(50);
+    let end = std::time::Instant::now() + total;
+    loop {
+        if cancel() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= end {
+            return true;
+        }
+        std::thread::sleep(step.min(end - now));
     }
 }
 
@@ -1890,6 +2030,9 @@ enum AttemptOutcome {
     /// A provider that answered with an error is no reason to wait: sending it the request again
     /// only costs it reputation each time (review 2026-10-14, M3).
     NotReachableYet(AdapterError),
+    /// Every provider tried shed the request before serving anything (each was busy): the caller
+    /// waits and tries them again (see [`SHED_RETRY_BUDGET`]). Sheds cost no reputation.
+    AllShed(AdapterError),
     /// Must propagate as-is — e.g. output was already streamed to the client (a retry would
     /// duplicate it), or a discovery-transport error a cache bypass can't fix.
     Fatal(AdapterError),
@@ -3002,46 +3145,20 @@ impl ConsumerNode {
         let policy = request_policy(self.assurance, min_authenticity);
         // The `complete` span (from #[instrument]); we fill in `provider`/`tokens` on success.
         let req_span = tracing::Span::current();
-        // First pass may discover from the C11 cache. On a "no usable provider" outcome — empty
-        // discovery, or every candidate failed with nothing streamed — the cached set may be
-        // stale (a provider moved/died and its replacement isn't cached yet), so invalidate this
-        // model's discovery cache and retry once with a cold get_providers lookup. The retry is
-        // only reached when nothing was streamed, so it can never duplicate delivered output.
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, only, cancel, now, &noted, &req_span, on_delta) {
-            AttemptOutcome::Served(summary) => return Ok(summary),
-            AttemptOutcome::Fatal(e) => return Err(e),
-            AttemptOutcome::Retryable(e) | AttemptOutcome::NotReachableYet(e) if cancel() => return Err(e),
-            AttemptOutcome::Retryable(_) | AttemptOutcome::NotReachableYet(_) => {}
-        }
-        tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
         let started = std::time::Instant::now();
-        let mut waits = UNREACHABLE_RETRY_WAITS.iter();
-        loop {
-            let _ = self.net.invalidate_discover(model);
-            match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, only, cancel, now, &noted, &req_span, on_delta) {
-                AttemptOutcome::Served(summary) => return Ok(summary),
-                AttemptOutcome::Fatal(e) => return Err(e),
-                // A provider answered (with an error): the one cache-bypass retry was enough.
-                AttemptOutcome::Retryable(e) => return Err(e),
-                AttemptOutcome::NotReachableYet(e) => {
-                    // A provider that only just joined isn't reachable until its address is confirmed
-                    // (a few seconds): its dial fails at once, so wait a little and look again rather
-                    // than fail the request. Only when no provider could be reached at all, and
-                    // nothing has been streamed.
-                    match next_unreachable_wait(&mut waits, started.elapsed(), cancel()) {
-                        Some(w) => {
-                            tracing::info!(model, wait_ms = w.as_millis() as u64, "provider not reachable yet; looking again shortly");
-                            std::thread::sleep(w);
-                            // Its client may have left while we waited (L6).
-                            if cancel() {
-                                return Err(e);
-                            }
-                        }
-                        None => return Err(e),
-                    }
+        run_passes(
+            model,
+            &mut |fresh| {
+                if fresh {
+                    let _ = self.net.invalidate_discover(model);
                 }
-            }
-        }
+                self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, only, cancel, now, &noted, &req_span, on_delta)
+            },
+            cancel,
+            &|| started.elapsed(),
+            &mut |w| wait_unless_cancelled(w, cancel),
+            &mut rand::random::<f64>,
+        )
     }
 
     /// One serve pass: discover (which may early-reply from the C11 cache) → rank → try
@@ -3184,6 +3301,8 @@ impl ConsumerNode {
         // The last error a provider we reached gave: what the client is told, rather than that
         // another provider couldn't be reached.
         let mut answered_err: Option<AdapterError> = None;
+        // Whether every attempt so far was shed by a busy provider before it served anything.
+        let mut all_shed = true;
         for (i, provider) in candidates.into_iter().enumerate() {
             // Its client left: don't open anything more at providers (L6).
             if cancel() {
@@ -3400,7 +3519,10 @@ impl ConsumerNode {
                 Err(e) => {
                     // Its client left (review round 4 H1): the provider did nothing wrong.
                     let cancelled = (matches!(e, AdapterError::Cancelled(_)) || cancel()) && !oversized.get();
-                    if !cancelled {
+                    // A shed is routine while a busy provider is waited for (see `run_passes`).
+                    if !delivered && matches!(e, AdapterError::Overloaded(_)) {
+                        tracing::debug!(provider = %provider.libp2p_peer_id, attempt = i + 1, total, error = %e, "provider busy");
+                    } else if !cancelled {
                         tracing::warn!(
                             provider = %provider.libp2p_peer_id, attempt = i + 1, total,
                             error = %e, "provider attempt failed"
@@ -3423,8 +3545,9 @@ impl ConsumerNode {
                     let shed = !delivered && matches!(e, AdapterError::Overloaded(_));
                     let unreachable = !delivered && matches!(e, AdapterError::Network(_));
                     let missed_again = (shed || unreachable) && self.note_unavailable_once(noted, &provider.libp2p_peer_id, &provider.model_id, now);
-                    let excused = shed || (unreachable && !missed_again);
-                    let rejected = !self.is_self_serve(&provider.libp2p_peer_id) && !refused && !cancelled && !excused;
+                    all_shed &= shed;
+                    let self_serve = self.is_self_serve(&provider.libp2p_peer_id);
+                    let rejected = failure_costs_reputation(self_serve, refused, cancelled, shed, unreachable, missed_again);
                     if rejected {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                         self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Rejected, now);
@@ -3489,9 +3612,11 @@ impl ConsumerNode {
         // Every candidate failed, but nothing was streamed → safe for the caller to bypass the
         // discovery cache and retry once.
         let all_not_reachable_yet = all_not_reachable_yet && last_err.is_some();
+        let all_shed = all_shed && (answered_err.is_some() || last_err.is_some());
         failed_pass_outcome(
             answered_err.or(last_err).unwrap_or_else(|| AdapterError::Route(format!("all providers failed for '{model}'"))),
             all_not_reachable_yet,
+            all_shed,
         )
     }
 
@@ -6025,7 +6150,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default(), tool_calls: Vec::new() })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default(), tool_calls: Vec::new(), hit_token_limit: false })
         }
     }
 
@@ -6109,6 +6234,7 @@ mod tests {
                         kind: "function".into(),
                         function: ToolCallFunction { name: "search".into(), arguments: r#"{"q":"rust"}"#.into() },
                     }],
+                    hit_token_limit: false,
                 })
             }
         }
@@ -6855,10 +6981,10 @@ mod tests {
         // A stream that opened reached its provider, even though its last poll carries the dial error.
         let dropped = AdapterError::Network(format!("stream poll dropped past retry budget: proxy_forward: {DIAL_FAILED_UNREACHABLE}"));
         assert!(!attempt_not_reachable_yet(true, &dropped));
-        assert!(matches!(failed_pass_outcome(unreachable(), true), AttemptOutcome::NotReachableYet(_)));
+        assert!(matches!(failed_pass_outcome(unreachable(), true, false), AttemptOutcome::NotReachableYet(_)));
         // One provider unreachable, one answering with an error: no waiting, no resending.
-        assert!(matches!(failed_pass_outcome(answered(), false), AttemptOutcome::Retryable(_)));
-        assert!(matches!(failed_pass_outcome(unreachable(), false), AttemptOutcome::Retryable(_)));
+        assert!(matches!(failed_pass_outcome(answered(), false, false), AttemptOutcome::Retryable(_)));
+        assert!(matches!(failed_pass_outcome(unreachable(), false, false), AttemptOutcome::Retryable(_)));
         // The client left: no more waits.
         let mut waits = UNREACHABLE_RETRY_WAITS.iter();
         assert_eq!(next_unreachable_wait(&mut waits, std::time::Duration::ZERO, true), None);
@@ -6874,6 +7000,139 @@ mod tests {
         // Late in the budget, a wait that wouldn't fit isn't taken.
         let mut waits = UNREACHABLE_RETRY_WAITS.iter();
         assert_eq!(next_unreachable_wait(&mut waits, UNREACHABLE_RETRY_BUDGET, false), None);
+    }
+
+    /// A scripted run of [`run_passes`]: each pass returns the next outcome; waits advance a fake
+    /// clock. Returns the result, the passes run (with whether each was fresh) and the waits.
+    fn scripted_passes(
+        outcomes: Vec<AttemptOutcome>,
+        pass_ms: u64,
+        gone_after: Option<usize>,
+    ) -> (Result<ServeSummary, AdapterError>, Vec<bool>, Vec<std::time::Duration>) {
+        use std::cell::{Cell, RefCell};
+        let clock = Cell::new(std::time::Duration::ZERO);
+        let script = RefCell::new(std::collections::VecDeque::from(outcomes));
+        let passes = RefCell::new(Vec::new());
+        let waits = RefCell::new(Vec::new());
+        let cancel = || gone_after.is_some_and(|n| passes.borrow().len() >= n);
+        let result = run_passes(
+            "m",
+            &mut |fresh| {
+                passes.borrow_mut().push(fresh);
+                clock.set(clock.get() + std::time::Duration::from_millis(pass_ms));
+                script.borrow_mut().pop_front().unwrap_or_else(|| AttemptOutcome::Fatal(AdapterError::Route("script ran out".into())))
+            },
+            &cancel,
+            &|| clock.get(),
+            &mut |w| {
+                waits.borrow_mut().push(w);
+                clock.set(clock.get() + w);
+                !cancel()
+            },
+            &mut || 0.5,
+        );
+        (result, passes.into_inner(), waits.into_inner())
+    }
+
+    fn shed() -> AttemptOutcome {
+        AttemptOutcome::AllShed(AdapterError::Overloaded("stream shed at open".into()))
+    }
+
+    fn served() -> AttemptOutcome {
+        AttemptOutcome::Served(ServeSummary { ok: true, tokens: 7, ..Default::default() })
+    }
+
+    /// A busy single provider: the request waits (0.5 s, 1 s, 2 s…) and is served when it frees up,
+    /// trying the same providers again (no cache bypass).
+    #[test]
+    fn a_request_every_provider_shed_waits_and_is_served_when_one_frees_up() {
+        let (result, passes, waits) = scripted_passes(vec![shed(), shed(), shed(), served()], 10, None);
+        assert_eq!(result.expect("served").tokens, 7);
+        assert_eq!(passes, [false, false, false, false]);
+        let ms: Vec<u128> = waits.iter().map(|w| w.as_millis()).collect();
+        assert_eq!(ms, [500, 1000, 2000]);
+    }
+
+    /// Busy for the whole budget: the client gets the shed (a 503 `upstream_overloaded`), after at
+    /// most [`SHED_RETRY_BUDGET`] of waiting, with backoff capped at [`SHED_RETRY_MAX`].
+    #[test]
+    fn a_provider_busy_for_the_whole_budget_ends_in_overloaded() {
+        let (result, passes, waits) = scripted_passes(std::iter::repeat_with(shed).take(200).collect(), 10, None);
+        let err = result.expect_err("overloaded");
+        assert!(matches!(err, AdapterError::Overloaded(_)), "{err:?}");
+        assert_eq!(crate::gateway::error_class(&err).1, "upstream_overloaded");
+        assert!(err.to_string().contains("stayed busy"), "{err}");
+        let total: std::time::Duration = waits.iter().sum();
+        assert!(total <= SHED_RETRY_BUDGET, "{total:?}");
+        assert!(total + std::time::Duration::from_secs(5) >= SHED_RETRY_BUDGET, "used the budget: {total:?}");
+        assert!(waits.iter().all(|w| *w <= SHED_RETRY_MAX.mul_f64(1.25)));
+        assert!(passes.len() > 10 && passes.len() < 30, "{}", passes.len());
+        // Jitter stays within ±25% of the step.
+        let mut backoff = SHED_RETRY_FIRST;
+        let low = next_shed_wait(&mut backoff, std::time::Duration::ZERO, 0.0).unwrap();
+        let mut backoff = SHED_RETRY_FIRST;
+        let high = next_shed_wait(&mut backoff, std::time::Duration::ZERO, 0.999).unwrap();
+        assert!(low.as_millis() == 375 && high.as_millis() < 625, "{low:?} {high:?}");
+        // No wait is started past the budget.
+        let mut backoff = SHED_RETRY_MAX;
+        assert_eq!(next_shed_wait(&mut backoff, SHED_RETRY_BUDGET, 0.5), None);
+    }
+
+    /// A pass with a real error in it isn't a busy one: it gets the one cache-bypass retry, no waits.
+    #[test]
+    fn a_pass_with_a_real_error_is_not_waited_on() {
+        let real = || AttemptOutcome::Retryable(AdapterError::Provider("the engine failed".into()));
+        let (result, passes, waits) = scripted_passes(vec![real(), real()], 10, None);
+        assert!(matches!(result, Err(AdapterError::Provider(_))));
+        assert_eq!(passes, [false, true]);
+        assert!(waits.is_empty());
+        // A pass mixing a shed with a real error ends that way too: it is not all shed.
+        assert!(matches!(
+            failed_pass_outcome(AdapterError::Provider("x".into()), false, false),
+            AttemptOutcome::Retryable(_)
+        ));
+        assert!(matches!(failed_pass_outcome(AdapterError::Overloaded("x".into()), false, true), AttemptOutcome::AllShed(_)));
+        // Output already delivered: never retried.
+        let (result, passes, _) = scripted_passes(vec![AttemptOutcome::Fatal(AdapterError::Network("dropped".into())), served()], 10, None);
+        assert!(result.is_err());
+        assert_eq!(passes.len(), 1);
+    }
+
+    /// The client left while waiting for a busy provider: no more passes.
+    #[test]
+    fn a_client_that_leaves_stops_the_waiting() {
+        let (result, passes, waits) = scripted_passes(std::iter::repeat_with(shed).take(50).collect(), 10, Some(3));
+        assert!(matches!(result, Err(AdapterError::Overloaded(_))));
+        assert_eq!(passes.len(), 3);
+        assert_eq!(waits.len(), 2, "the wait that noticed it was the last");
+        // The real wait returns as soon as the client is gone.
+        let started = std::time::Instant::now();
+        assert!(!wait_unless_cancelled(std::time::Duration::from_secs(5), &|| started.elapsed() > std::time::Duration::from_millis(100)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(wait_unless_cancelled(std::time::Duration::from_millis(20), &|| false));
+    }
+
+    /// A shed never costs its provider reputation: not across one request's retries (one miss), and
+    /// not when a later request finds it busy again (a "second" miss, which would count for a
+    /// provider we couldn't reach).
+    #[test]
+    fn sheds_cost_no_reputation_across_retries() {
+        let (_dir, node) = test_node();
+        let t = 1_000_000;
+        let noted = std::cell::RefCell::new(std::collections::HashSet::new());
+        for round in 0..5u64 {
+            let missed_again = node.note_unavailable_once(&noted, "p", "m", t + round * 2_000);
+            assert!(!failure_costs_reputation(false, false, false, true, false, missed_again), "round {round}");
+            // Still eligible, just tried last.
+            assert!(node.briefly_unavailable("p", "m", t + round * 2_000));
+        }
+        let next = std::cell::RefCell::new(std::collections::HashSet::new());
+        let missed_again = node.note_unavailable_once(&next, "p", "m", t + 30_000);
+        assert!(missed_again);
+        assert!(!failure_costs_reputation(false, false, false, true, false, missed_again));
+        // For contrast: an unreachable provider's second miss does count, and a real error always.
+        assert!(failure_costs_reputation(false, false, false, false, true, true));
+        assert!(failure_costs_reputation(false, false, false, false, false, false));
     }
 
     /// Round 8 T8-3/T8-5: a shed or a missed provider goes last for a minute and only a second miss

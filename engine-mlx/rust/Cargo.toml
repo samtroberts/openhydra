@@ -1,0 +1,18 @@
+[package]
+name = "openhydra-mlx-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Links OpenHydra's built-in Mac engine (Apple MLX via mlx-swift-lm, engine-mlx/) into the agent"
+publish = false
+build = "build.rs"
+links = "ohmlx"
+
+[lib]
+path = "src/lib.rs"
+
+# Its own workspace: it builds only on Apple Silicon macOS, after engine-mlx/build.sh, so it stays out of
+# the root workspace that CI builds and tests on every platform. The agent uses it through a path
+# dependency behind its `mlx-swift` feature.
+[workspace]

@@ -178,3 +178,11 @@ scorer/mistralrs/.build/
 !/network/patched-deps/libp2p-mdns/Cargo.toml.orig
 !/network/patched-deps/libp2p-dcutr/Cargo.toml.orig
 !/network/patched-deps/libp2p-gossipsub/Cargo.toml.orig
+
+# Built-in Mac engine (engine-mlx/): SwiftPM checkouts, xcodebuild output and the linking crate's target.
+engine-mlx/.build/
+engine-mlx/.xcbuild/
+engine-mlx/.xcbuild.log
+engine-mlx/.swiftpm/
+engine-mlx/rust/target/
+engine-mlx/rust/Cargo.lock

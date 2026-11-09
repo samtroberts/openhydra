@@ -10,13 +10,14 @@
 resolver = "2"
 members = ["network", "protocol", "agent"]
 # The patched libp2p-quic, libp2p-mdns, libp2p-kad, libp2p-dcutr and libp2p-gossipsub live inside the `network` tree and are consumed via
-# the [patch] below, not as workspace members.
+# the [patch] below, not as workspace members. `engine-mlx/rust` (the built-in Mac engine's linking crate) is its own workspace.
 exclude = [
     "network/patched-deps/libp2p-quic",
     "network/patched-deps/libp2p-mdns",
     "network/patched-deps/libp2p-kad",
     "network/patched-deps/libp2p-dcutr",
     "network/patched-deps/libp2p-gossipsub",
+    "engine-mlx/rust",
 ]
 
 # `[profile.*]` and `[patch.*]` are honored only in the workspace root manifest, so

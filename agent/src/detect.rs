@@ -272,7 +272,7 @@ mod tests {
             on_delta: &mut dyn FnMut(&str),
         ) -> Result<ServeOutcome, AdapterError> {
             on_delta(self.tag);
-            Ok(ServeOutcome { tokens: 1, done: true, engine: EngineMetrics::default(), tool_calls: Vec::new() })
+            Ok(ServeOutcome { tokens: 1, done: true, engine: EngineMetrics::default(), tool_calls: Vec::new(), hit_token_limit: false })
         }
     }
 

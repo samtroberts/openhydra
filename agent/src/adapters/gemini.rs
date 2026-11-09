@@ -175,6 +175,7 @@ impl<H: HttpClient> EngineAdapter for GeminiAdapter<H> {
 
         let mut chunk_tokens = 0u64;
         let (mut prompt, mut output, mut done) = (0u64, 0u64, false);
+        let mut hit_token_limit = false;
         for line in lines {
             // The caller asked to stop (out of budget, or the consumer left): drop the stream, which
             // makes the engine stop generating, and return what was sent.
@@ -201,8 +202,10 @@ impl<H: HttpClient> EngineAdapter for GeminiAdapter<H> {
                         }
                     }
                 }
-                if cand.finish_reason.is_some() {
+                if let Some(reason) = &cand.finish_reason {
                     done = true;
+                    // `MAX_TOKENS`: the engine's token limit.
+                    hit_token_limit = reason == "MAX_TOKENS";
                 }
             }
             if let Some(u) = &chunk.usage {
@@ -217,6 +220,7 @@ impl<H: HttpClient> EngineAdapter for GeminiAdapter<H> {
             done,
             engine: EngineMetrics { prompt_eval_count: prompt, eval_count: output, ..EngineMetrics::default() },
             tool_calls: Vec::new(),
+            hit_token_limit,
         })
     }
 }
@@ -276,6 +280,17 @@ mod tests {
         let models = g.detect_models().unwrap();
         assert_eq!(models.iter().map(|m| m.engine_ref.as_str()).collect::<Vec<_>>(),
                    vec!["gemini-1.5-pro", "gemini-1.5-flash"]);
+    }
+
+    #[test]
+    fn a_max_tokens_finish_is_reported_as_the_engine_s_token_limit() {
+        let serve = |reason: &str| {
+            let line = format!(r#"data: {{"candidates":[{{"content":{{"parts":[{{"text":"Hi"}}],"role":"model"}},"finishReason":"{reason}"}}]}}"#);
+            let mock = MockHttp { stream_lines: vec![line], ..Default::default() };
+            GeminiAdapter::new(DEFAULT_GEMINI_URL, "k", mock).serve_stream(&req(vec![msg("user", "hi")]), &mut |_| {}).unwrap()
+        };
+        assert!(serve("MAX_TOKENS").hit_token_limit);
+        assert!(!serve("STOP").hit_token_limit);
     }
 
     #[test]

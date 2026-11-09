@@ -51,7 +51,14 @@ impl WorkerPool {
     /// running it, so jobs execute concurrently — the lock only serialises the brief handoff.
     pub fn new(n: usize) -> Self {
         let n = n.max(1);
-        let bound = n.saturating_mul(QUEUE_DEPTH_PER_WORKER).max(MIN_QUEUE);
+        Self::with_queue(n, n.saturating_mul(QUEUE_DEPTH_PER_WORKER).max(MIN_QUEUE))
+    }
+
+    /// A pool of `n` workers (clamped to ≥1) whose queue holds at most `bound` jobs. With `bound` 0 a
+    /// job is accepted only when a worker is idle and waiting for one, so [`submit`](Self::submit)
+    /// sheds whenever every worker is busy.
+    pub fn with_queue(n: usize, bound: usize) -> Self {
+        let n = n.max(1);
         let (tx, rx) = mpsc::sync_channel::<Job>(bound);
         let rx = Arc::new(Mutex::new(rx));
         let handles = (0..n)
@@ -111,6 +118,23 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn a_pool_without_a_queue_sheds_while_its_worker_is_busy() {
+        let pool = WorkerPool::with_queue(1, 0);
+        // Let the worker reach its receive before the first submit.
+        let mut accepted = false;
+        for _ in 0..100 {
+            if pool.submit(|| std::thread::sleep(Duration::from_millis(300))) {
+                accepted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(accepted, "an idle worker takes a job");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!pool.submit(|| {}), "a busy worker with no queue sheds");
+    }
 
     #[test]
     fn runs_every_accepted_job() {
