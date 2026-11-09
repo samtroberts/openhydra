@@ -33,5 +33,9 @@ export function infraPeerIds() {
   const s = new Set();
   (snap?.network?.relay_reservations || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)\/p2p-circuit/); if (m) s.add(m[1]); });
   (state?.settings?.bootstraps || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)/); if (m) s.add(m[1]); });
+  // A bootstrap or relay that also serves models (a private deployment's providers often are its
+  // bootstraps) is a peer, not just infrastructure.
+  for (const p of snap?.network?.known_providers || []) s.delete(p.libp2p_peer_id);
+  for (const p of snap?.card_providers || []) s.delete(p.libp2p_peer_id);
   return s;
 }

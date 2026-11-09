@@ -3,7 +3,7 @@
 import { $, $$, peerShort } from "./dom";
 import { html, setHTML, insertHTML } from "./html";
 import { snap, state, infraPeerIds } from "./state";
-import { netModels, modelIdle, seenCount, displayModelName, localSharedModels } from "./models";
+import { netModels, modelIdle, seenCount, displayModelName, localSharedModels, remoteProviders } from "./models";
 import { repByPeerModel, repKey, modelReputation, modelAvgTps, trustByPeerModel } from "./econ";
 import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
 
@@ -35,8 +35,8 @@ import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
     };
     // Group the announced providers by model so a model served by several peers can expand (#11b).
     const provsByModel = {};
-    const own = state?.provider?.status?.peer_id;   // our own advert is shown as "your machine", not a provider row
-    for (const p of (snap?.network?.known_providers || [])) if (!own || p.libp2p_peer_id !== own) (provsByModel[p.model_id] ||= []).push(p);
+    // Announced providers and the providers of usable imported cards (a private card's never announces).
+    for (const p of remoteProviders()) (provsByModel[p.model_id] ||= []).push(p);
     // Sort: by reputation (best first), by provider count (most first), or by name.
     const repOf = (m) => modelReputation(m, byPM) ?? -1;
     const cntOf = (m) => (seenCount[m] || 0) + (local.has(m) ? 1 : 0);
@@ -57,7 +57,7 @@ import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
       return html`${row}${remote.map((p) => {
           const prep = byPM[repKey(p.openhydra_peer_id, p.model_id)];
           const t = trustOf(p);
-          return html`<tr class="provsub" data-cat="${modelCat(m)}" data-for="${m}"><td style="padding-left:34px"><span class="mono mut">${peerShort(p.libp2p_peer_id)}</span></td><td class="num mut">1</td><td class="num mut">—</td><td>${repBadge(prep)}</td><td>${trustCell(t.tier, t.check)}</td></tr>`;
+          return html`<tr class="provsub" data-cat="${modelCat(m)}" data-for="${m}"><td style="padding-left:34px"><span class="mono mut">${peerShort(p.libp2p_peer_id)}</span>${p.via_card ? html` <span class="mut" style="font-size:10.5px" title="Known from an imported card">· card</span>` : ""}</td><td class="num mut">1</td><td class="num mut">—</td><td>${repBadge(prep)}</td><td>${trustCell(t.tier, t.check)}</td></tr>`;
         })}`;
     });
     setHTML($("#provtable tbody"), rows.length ? html`${rows}` : html`<tr><td colspan="5" class="mut">${snap ? (q ? "No models match your search." : "No models discovered yet — they appear as peers announce.") : "Connecting…"}</td></tr>`);

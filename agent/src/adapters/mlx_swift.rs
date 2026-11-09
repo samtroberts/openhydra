@@ -209,6 +209,40 @@ impl MlxSwiftAdapter {
         })
     }
 
+    /// What [`load`](Self::load) would serve from `dir` as `name`, without loading it (no Metal, no
+    /// engine): the name, canonical id and weight digest a card for it carries. `card export` uses it,
+    /// since the engine runs inside the provider's own process where nothing can detect it. The digest
+    /// is [`crate::weights::digest_now`], the same `<name>\0<sha256>\n` over the same members the
+    /// engine's manifest gives, so a card's `weight_hash` is what the provider serves.
+    pub fn describe(dir: &Path, name: Option<&str>) -> Result<DetectedModel, String> {
+        let dir = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+        let members = member_names(&dir)?;
+        let weight_digest = crate::weights::digest_now(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let template = effective_chat_template(&dir);
+        let size_bytes = members.iter().filter_map(|m| std::fs::metadata(dir.join(m)).ok()).map(|m| m.len()).sum();
+        let config: Value = std::fs::read(dir.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let model_type = config
+            .get("model_type")
+            .or_else(|| config.get("text_config").and_then(|t| t.get("model_type")))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let engine_ref = name.map(str::to_string).unwrap_or_else(|| model_name(&dir));
+        let (family, params, quant, canonical_id) = canonicalise(&dir, &engine_ref, &template);
+        Ok(DetectedModel {
+            engine_ref,
+            canonical_id,
+            family: if family.is_empty() { model_type } else { family },
+            params,
+            quant,
+            size_bytes,
+            weight_digest,
+        })
+    }
+
     /// The model this adapter serves.
     pub fn model(&self) -> &DetectedModel {
         &self.model

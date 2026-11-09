@@ -99,6 +99,9 @@ pub fn run_export(
     now_ms: u64,
     swarm_public_key: Option<String>,
     swarms_dir: Option<PathBuf>,
+    // Models of an engine detection can't see (the built-in engine runs inside the provider's own
+    // process), described by the caller; detected as if an engine had reported them.
+    built_in: Vec<DetectedModel>,
 ) -> Result<CardExport, String> {
     // Export gate, part 1 — fail-closed without a policy file (checked FIRST so it fails fast and is
     // testable without a live engine). Review fix (MODERATE): previously `None` fell back to
@@ -122,9 +125,10 @@ pub fn run_export(
 
     // Detect the model on a local engine (fast localhost probes; no swarm).
     let engines = crate::detect::detect_engines();
-    let detected = engines
+    let all: Vec<&DetectedModel> = engines.iter().flat_map(|e| &e.models).chain(built_in.iter()).collect();
+    let detected = all
         .iter()
-        .flat_map(|e| &e.models)
+        .copied()
         .find(|m| m.engine_ref == model)
         .ok_or_else(|| {
             format!("model {model:?} is not detected on any local engine — start the engine that serves it, then retry")
@@ -173,7 +177,7 @@ pub fn run_export(
     };
 
     // The name the provider announces: assigned over every detected model, as its announce pass does.
-    let names = crate::provider::PublicNames::from_engine_refs(engines.iter().flat_map(|e| &e.models).map(|m| m.engine_ref.as_str()));
+    let names = crate::provider::PublicNames::from_engine_refs(all.iter().map(|m| m.engine_ref.as_str()));
     let public_id = names.public(&detected.engine_ref).to_string();
     let card = build_card(detected, &public_id, &id.openhydra_peer_id, now_ms, ttl_secs, pricing, region, swarm_binding);
     let signed = sign_card(card, &id.keypair).map_err(|e| e.to_string())?;
@@ -520,7 +524,7 @@ mod tests {
         // Review fix (MODERATE): fail-closed — no --share-policy-file must NOT fall back to share-all
         // (which would export a private model). Checked before detection, so no live engine needed.
         let dir = tempfile::tempdir().unwrap();
-        let err = run_export("qwen3:1.7b", None, 60, PricingMode::Reciprocal, None, &dir.path().join("id.key"), 1_000, None, None)
+        let err = run_export("qwen3:1.7b", None, 60, PricingMode::Reciprocal, None, &dir.path().join("id.key"), 1_000, None, None, Vec::new())
             .unwrap_err();
         assert!(err.contains("--share-policy-file"), "got: {err}");
     }

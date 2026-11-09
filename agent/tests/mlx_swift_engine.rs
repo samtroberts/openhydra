@@ -232,3 +232,16 @@ fn earlier_tool_call_arguments_reach_the_template() {
     let err = adapter.serve_stream(&bad, &mut |_| {}).expect_err("malformed tools");
     assert!(err.to_string().contains("tools"), "{err}");
 }
+
+/// `card export` describes a built-in model without loading it; the card must name and hash exactly
+/// what the loaded engine serves.
+#[test]
+#[ignore = "needs OHMLX_TEST_MODEL and a --features mlx-swift build"]
+fn describing_a_model_matches_what_loading_it_serves() {
+    kernels();
+    let adapter = MlxSwiftAdapter::load(&model(), None, None).expect("load");
+    let described = MlxSwiftAdapter::describe(&model(), None).expect("describe");
+    assert_eq!(&described, adapter.model());
+    let named = MlxSwiftAdapter::describe(&model(), Some("my-model")).expect("describe");
+    assert_eq!(named.engine_ref, "my-model");
+}

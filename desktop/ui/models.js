@@ -20,10 +20,24 @@ export function noteSeen() {
   for (const m of noteSnapshot(seenModels, snap?.network?.known_models, snap?.network?.recently_withdrawn, now)) delete seenCount[m];
   // Other machines only: our own provider's advert can come back in the list, and the views add
   // "your machine" themselves (it was counted twice).
+  const c = {}; for (const p of remoteProviders()) c[p.model_id] = (c[p.model_id] || 0) + 1;
+  for (const m of Object.keys(c)) seenCount[m] = c[m];
+  for (const p of snap?.network?.known_providers || []) seenCount[p.model_id] = c[p.model_id] || 0;
+}
+// Other machines' providers, one entry per (peer, model): the network's announced ones, plus the
+// providers of imported cards the gateway can use (a private card's provider never announces), each
+// counted once. Our own provider's advert is left out (the views show "your machine" themselves).
+export function remoteProviders() {
   const own = state?.provider?.status?.peer_id;
-  const all = snap?.network?.known_providers || [];
-  const c = {}; for (const p of all) if (!own || p.libp2p_peer_id !== own) c[p.model_id] = (c[p.model_id] || 0) + 1;
-  for (const p of all) seenCount[p.model_id] = c[p.model_id] || 0;
+  const out = [], seen = new Set();
+  const add = (p, viaCard) => {
+    const k = p.libp2p_peer_id + "\u0000" + p.model_id;
+    if ((own && p.libp2p_peer_id === own) || seen.has(k)) return;
+    seen.add(k); out.push(viaCard ? { ...p, via_card: true } : p);
+  };
+  for (const p of snap?.network?.known_providers || []) add(p, false);
+  for (const p of snap?.card_providers || []) add(p, true);
+  return out;
 }
 // The local engine's models that are actually SHARED on the network — NOT every model the engine
 // has. A model toggled off in Share is neither announced NOR servable (the provider's serve gate

@@ -555,6 +555,16 @@ struct CardExportArgs {
     /// With `--out`: replace the file if it exists.
     #[arg(long, requires = "out")]
     force: bool,
+    /// A model served by the built-in Mac engine (`provide --engine-kind mlx-swift`): its MLX model
+    /// folder, as given to `provide --model-dir`. That engine runs inside the provider's process, where
+    /// nothing else can detect it, so the card is built from the folder (name, canonical id and weight
+    /// digest, without loading it). `--model` must then be the name it is served under.
+    #[arg(long = "model-dir")]
+    model_dir: Option<std::path::PathBuf>,
+    /// With `--model-dir`: the name the provider serves it under, when `provide` was given one
+    /// (`--model-name`). Default: the name `provide` would choose.
+    #[arg(long = "model-name", requires = "model_dir")]
+    model_name: Option<String>,
 }
 
 #[derive(Copy, Clone, clap::ValueEnum)]
@@ -1218,6 +1228,17 @@ fn run() -> Result<(), String> {
                 .unwrap_or(0);
             match args.action {
                 CardAction::Export(a) => {
+                    let built_in = match &a.model_dir {
+                        None => Vec::new(),
+                        #[cfg(all(feature = "mlx-swift", target_os = "macos", target_arch = "aarch64"))]
+                        Some(dir) => vec![openhydra_agent::adapters::mlx_swift::MlxSwiftAdapter::describe(
+                            dir,
+                            a.model_name.as_deref(),
+                        )
+                        .map_err(|e| format!("built-in engine model: {e}"))?],
+                        #[cfg(not(all(feature = "mlx-swift", target_os = "macos", target_arch = "aarch64")))]
+                        Some(_) => return Err("--model-dir is for the built-in Mac engine, which this build doesn't include".into()),
+                    };
                     let out = openhydra_agent::cards::run_export(
                         &a.model,
                         a.share_policy_file,
@@ -1228,6 +1249,7 @@ fn run() -> Result<(), String> {
                         now_ms,
                         a.swarm,
                         a.swarms_dir,
+                        built_in,
                     )?;
                     if let Some(path) = &a.out {
                         let written = openhydra_agent::cards::write_card_file(path, &out.card, a.force, now_ms)?;

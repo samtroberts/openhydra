@@ -2244,6 +2244,9 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
             if let Some(ids) = gateway_model_ids(gateway_port) {
                 base["gateway_models"] = serde_json::json!(ids);
             }
+            // The providers of imported cards the gateway can use: they serve models the network may
+            // not announce, so the Models view counts them, and a bootstrap among them is a peer.
+            base["card_providers"] = serde_json::json!(usable_card_providers());
         }
         if prov {
             // Provider base carries the served side (peers, served counters, `served` ledger
@@ -3042,6 +3045,27 @@ async fn web_search(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The imported cards the gateway can use — every public card, and a private card when a credential
+/// for its swarm is held (the gateway's own rule) — as `{libp2p_peer_id, openhydra_peer_id, model_id,
+/// private}`.
+fn usable_card_providers() -> Vec<serde_json::Value> {
+    let now = now_unix_ms();
+    let creds = openhydra_agent::swarms::CredentialStore::new(swarms_dir());
+    openhydra_agent::cards::CardStore::new(cards_file_path())
+        .valid_cards(now)
+        .into_iter()
+        .filter(|c| c.swarm_public_key.is_empty() || creds.credential_for_swarm(&c.swarm_public_key, now).is_some())
+        .map(|c| {
+            serde_json::json!({
+                "libp2p_peer_id": c.libp2p_peer_id,
+                "openhydra_peer_id": c.openhydra_peer_id,
+                "model_id": c.model_id,
+                "private": !c.swarm_public_key.is_empty(),
+            })
+        })
+        .collect()
 }
 
 /// The model ids the local gateway lists at `/v1/models` (without `openhydra/auto`), or `None` when
