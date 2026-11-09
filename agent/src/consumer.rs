@@ -3616,6 +3616,11 @@ impl ConsumerNode {
         let delivered = std::cell::Cell::new(false);
         // The providers the lookups for this request found (a public card's possible fallbacks).
         let seen = std::cell::RefCell::new(Vec::new());
+        // Every card provider just failed for us (within the last minute): one look, not the usual
+        // patient retries for a provider that only just joined. Otherwise each request would wait
+        // ~30 s on a provider known to be down before saying so (live, 10 Nov).
+        let now = now_unix_ms();
+        let known_down = !card_peers.is_empty() && card_peers.iter().all(|p| self.briefly_unavailable(&p.libp2p_peer_id, model, now));
         let first = {
             let mut track = |d: &str| {
                 delivered.set(true);
@@ -3623,7 +3628,11 @@ impl ConsumerNode {
             };
             // A private card's model is never looked up on the network: its name isn't asked about
             // publicly, and nobody found there could serve it anyway.
-            self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
+            if known_down {
+                self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
+            } else {
+                self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
+            }
         };
         let err = match first {
             Ok(summary) => return Ok(summary),
@@ -3697,6 +3706,31 @@ impl ConsumerNode {
         }
         let _ = self.net.invalidate_discover(model);
         pick(self.net.discover(model).unwrap_or_default())
+    }
+
+    /// [`serve_passes`](Self::serve_passes) without the retries: one [`serve_once`](Self::serve_once).
+    #[allow(clippy::too_many_arguments)]
+    fn serve_one_pass(
+        self: &Arc<Self>,
+        model: &str,
+        messages: &[ChatMessage],
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        tools: &[Value],
+        think: Option<bool>,
+        policy: &AssurancePolicy,
+        only: Option<&std::collections::HashSet<String>>,
+        no_discovery: bool,
+        seen: Option<&std::cell::RefCell<Vec<DiscoveredPeer>>>,
+        cancel: &dyn Fn() -> bool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ServeSummary, AdapterError> {
+        let noted = std::cell::RefCell::new(std::collections::HashSet::new());
+        let req_span = tracing::Span::current();
+        match self.serve_once(model, messages, max_tokens, temperature, tools, think, policy, only, no_discovery, seen, cancel, now_unix_ms(), &noted, &req_span, on_delta) {
+            AttemptOutcome::Served(summary) => Ok(summary),
+            AttemptOutcome::Fatal(e) | AttemptOutcome::Retryable(e) | AttemptOutcome::NotReachableYet(e) | AttemptOutcome::AllShed(e) => Err(e),
+        }
     }
 
     /// Serve `model` with retries ([`run_passes`] over [`serve_once`](Self::serve_once)), among the
