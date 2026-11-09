@@ -118,6 +118,14 @@ struct NodeArgs {
     #[arg(long = "allow-peers-file")]
     allow_peers_file: Option<std::path::PathBuf>,
 
+    /// Join the private network keyed by this file (a go-libp2p / IPFS `swarm.key`; make one with
+    /// `openhydra-agent network-key --out <file>`). Every TCP connection and relay circuit is
+    /// encrypted with the key, so a node without it can't connect or relay at all. QUIC is off (it
+    /// can't carry the key), and so are OpenHydra's public bootstraps and relays: give the
+    /// deployment's own with `--bootstrap`. Every node of the deployment needs the same file.
+    #[arg(long = "private-network-key-file")]
+    private_network_key_file: Option<std::path::PathBuf>,
+
     /// Serve a read-only introspection endpoint (peers / DHT / swarm / transfer
     /// counters as JSON) on this address, e.g. `127.0.0.1:9464` or `127.0.0.1:0`
     /// (ephemeral). Off unless set; bind loopback unless you mean to expose it. If
@@ -157,6 +165,32 @@ impl NodeArgs {
                 eprintln!("openhydra-agent: {e}");
                 std::process::exit(2);
             }
+        }
+        if let Some(path) = &self.private_network_key_file {
+            // Process-wide, before any node starts. Only the fingerprint is ever printed.
+            let fail = |e: String| -> ! {
+                eprintln!("openhydra-agent: --private-network-key-file {}: {e}", path.display());
+                std::process::exit(2);
+            };
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| fail(e.to_string()));
+            let key = openhydra_network::transport::parse_private_network_key(&text).unwrap_or_else(|e| fail(e));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                    eprintln!(
+                        "openhydra-agent: warning: {} can be read by other users; anyone with it can join the network (chmod 600 it)",
+                        path.display()
+                    );
+                }
+            }
+            if let Err(e) = openhydra_network::transport::set_private_network_key(key) {
+                fail(e);
+            }
+            eprintln!(
+                "openhydra-agent: private network {} (TCP and relay circuits only; no QUIC, no OpenHydra public bootstraps or relays)",
+                openhydra_network::transport::private_network_fingerprint(&key)
+            );
         }
         let mut config = NodeConfig {
             enable_peer_relay: self.peer_relay,
@@ -216,6 +250,35 @@ enum Role {
     /// `refbuild` and hands gateways signed round packs, issuing every text once network-wide.
     /// See `registry init`. No swarm.
     Registry(registry_cli::RegistryArgs),
+    /// Write a new private-network key file for a private deployment (every node then runs with
+    /// `--private-network-key-file <file>`). Readable by you only; never overwrites a file. No swarm.
+    NetworkKey(NetworkKeyArgs),
+}
+
+/// `network-key` — see [`Role::NetworkKey`].
+#[derive(Args)]
+struct NetworkKeyArgs {
+    /// Where to write the key file.
+    #[arg(long)]
+    out: std::path::PathBuf,
+}
+
+/// Write a new private-network key to `out`, created readable by its owner only, failing if the
+/// file exists. Returns the key's fingerprint.
+fn write_network_key(out: &std::path::Path) -> Result<String, String> {
+    use std::io::Write;
+    let text = openhydra_network::transport::new_private_network_key_file();
+    let key = openhydra_network::transport::parse_private_network_key(&text)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    file.write_all(text.as_bytes()).map_err(|e| format!("{}: {e}", out.display()))?;
+    Ok(openhydra_network::transport::private_network_fingerprint(&key))
 }
 
 /// `probe` — see [`Role::Probe`].
@@ -1105,6 +1168,12 @@ fn run() -> Result<(), String> {
         Role::Disconnect(args) => return connect_cli::run_disconnect(args),
         Role::Refbuild(args) => return refbuild::run(args),
         Role::Registry(args) => return registry_cli::run(args),
+        Role::NetworkKey(args) => {
+            let fingerprint = write_network_key(&args.out)?;
+            println!("private network key written to {} (fingerprint {fingerprint})", args.out.display());
+            println!("Copy it to every node of the deployment and run each with --private-network-key-file.");
+            return Ok(());
+        }
         Role::Card(args) => {
             // `card export` / `card verify`. No swarm.
             let config = cli.node.into_config();

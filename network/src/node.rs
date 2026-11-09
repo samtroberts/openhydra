@@ -129,37 +129,43 @@ pub fn start_node(
         .map(|s| s.parse().map_err(|e| format!("bad listen addr '{s}': {e}")))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // A private network (a pre-shared key) can't reach OpenHydra's public bootstraps or relays, which
+    // don't have its key: it runs as a private deployment, `--public-relays off`.
+    let public_relays = effective_public_relays(config);
+    if let Some(key) = crate::transport::private_network_key() {
+        info!(fingerprint = %crate::transport::private_network_fingerprint(&key), "private network: TCP and relay circuits keyed, no QUIC, no public bootstraps or relays");
+    }
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
     let mut bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
     // SL5: given none (a fresh CLI install), start from OpenHydra's own on the public network.
     if bootstrap_peers.is_empty() {
-        let defaults = crate::relay::default_bootstraps(config.public_relays);
+        let defaults = crate::relay::default_bootstraps(public_relays);
         if !defaults.is_empty() {
             info!(n = defaults.len(), "no --bootstrap given: starting from OpenHydra's public bootstraps");
             bootstrap_peers = parse_bootstrap_peers(&defaults)?;
         }
     }
     // A private deployment never contacts OpenHydra's own bootstraps, even ones it was given.
-    if config.public_relays == crate::relay::PublicRelays::Off {
+    if public_relays == crate::relay::PublicRelays::Off {
         let (kept, dropped) = crate::relay::without_public_bootstraps(bootstrap_peers);
         for (pid, addr) in &dropped {
             warn!(%pid, %addr, "--public-relays off: not using OpenHydra's public bootstrap");
         }
         bootstrap_peers = kept;
     }
-    let public_network = crate::relay::uses_public_network(&bootstrap_peers, config.public_relays);
+    let public_network = crate::relay::uses_public_network(&bootstrap_peers, public_relays);
     let network_id = crate::relay::network_id(&bootstrap_peers, public_network);
-    if config.public_relays == crate::relay::PublicRelays::Auto && !public_network {
+    if public_relays == crate::relay::PublicRelays::Auto && !public_network {
         // Said once, plainly: a node given only its own bootstraps relays through them alone (L9).
         info!("none of the bootstraps is OpenHydra's: using them as relays, not OpenHydra's (pass --public-relays on to use OpenHydra's relays too)");
     }
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
     // A private deployment never connects to OpenHydra's own peers, however it hears of them.
-    let fence_openhydra = config.public_relays == crate::relay::PublicRelays::Off;
+    let fence_openhydra = public_relays == crate::relay::PublicRelays::Off;
     // The relays this node reserves on and dials others through: its bootstraps, plus the
     // production relays on the public network (see `PublicRelays`).
-    let relays = crate::relay::relay_addrs(&bootstrap_peers, config.public_relays);
-    info!(relays = relays.len(), mode = ?config.public_relays, "relay set");
+    let relays = crate::relay::relay_addrs(&bootstrap_peers, public_relays);
+    info!(relays = relays.len(), mode = ?public_relays, "relay set");
     let enable_connection_reversal = config.enable_connection_reversal; // Tier-2 (captured into the thread)
 
     // #43-W2: resolve the opt-in PCP v6-pinhole wiring (gateway + the listen
@@ -264,7 +270,17 @@ pub fn check_bootstrap_addr(addr: &str) -> Result<(), String> {
 /// seed list). An unparsable bootstrap fails the node's start anyway.
 pub fn joins_public_network(config: &NodeConfig) -> bool {
     let bootstraps = parse_bootstrap_peers(&config.bootstrap_peers).unwrap_or_default();
-    crate::relay::uses_public_network(&bootstraps, config.public_relays)
+    crate::relay::uses_public_network(&bootstraps, effective_public_relays(config))
+}
+
+/// `config.public_relays`, or `Off` on a private network (a pre-shared key is set), whose key
+/// OpenHydra's public bootstraps and relays don't have.
+fn effective_public_relays(config: &NodeConfig) -> crate::relay::PublicRelays {
+    if crate::transport::private_network_key().is_some() {
+        crate::relay::PublicRelays::Off
+    } else {
+        config.public_relays
+    }
 }
 
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.

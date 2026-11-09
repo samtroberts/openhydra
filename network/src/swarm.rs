@@ -150,6 +150,9 @@ pub fn build_swarm(
     // AsyncRead+AsyncWrite stream. Upgrade it with Noise+Yamux to get the
     // same `(PeerId, StreamMuxerBox)` output type as the TCP transport.
     let relay_upgraded = relay_transport
+        // On a private network a circuit is keyed end to end too, so a relay can't be a way in.
+        .and_then(|conn, _| crate::transport::private_network_stream(conn))
+        .map_err(|e| e.either(std::io::Error::other, |e| e))
         .upgrade(libp2p::core::upgrade::Version::V1Lazy)
         .authenticate(
             libp2p::noise::Config::new(&keypair).expect("noise config for relay"),
@@ -163,7 +166,10 @@ pub fn build_swarm(
     // TCP last: fallback for /tcp/ addresses.
     // Errors unwrapped, so a dial error is the transport's own (`transport::addr_failure`).
     // Load simulation: OPENHYDRA_TEST_NO_QUIC=1 builds the node without QUIC (what a QUIC connection costs).
-    let quic_tcp = if std::env::var("OPENHYDRA_TEST_NO_QUIC").is_ok_and(|v| v == "1") {
+    // A private network has no QUIC: it can't carry the pre-shared key (see
+    // `transport::set_private_network_key`).
+    let private_network = crate::transport::private_network_key().is_some();
+    let quic_tcp = if private_network || std::env::var("OPENHYDRA_TEST_NO_QUIC").is_ok_and(|v| v == "1") {
         tcp_transport
     } else {
         crate::transport::either_transport(quic_transport, tcp_transport)
@@ -469,6 +475,10 @@ pub fn build_swarm(
     for addr in &opts.listen_addrs {
         if !ipv6_capable && crate::event_loop::is_ipv6_multiaddr(addr) {
             tracing::info!(%addr, "F-9: skipping IPv6 listen addr (no working outbound IPv6)");
+            continue;
+        }
+        if private_network && addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1 | libp2p::multiaddr::Protocol::Quic)) {
+            tracing::info!(%addr, "private network: not listening on QUIC (it can't carry the network key)");
             continue;
         }
         swarm.listen_on(addr.clone())?;

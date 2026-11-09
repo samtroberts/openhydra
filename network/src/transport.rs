@@ -17,6 +17,62 @@ pub const INBOUND_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub type BoxedTransport = libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>;
 
+/// This process's private-network key, when it runs a private network (enterprise phase 0.6). Set
+/// once, before the node starts, and shared by every swarm it builds.
+static PRIVATE_NETWORK_KEY: std::sync::OnceLock<libp2p::pnet::PreSharedKey> = std::sync::OnceLock::new();
+
+/// Make this process a member of the private network keyed by `key`: every TCP connection and relay
+/// circuit is then encrypted with it under Noise (libp2p `pnet`, compatible with go-libp2p and IPFS
+/// swarm keys), so a node without the key can't complete a connection, nor relay for one. QUIC
+/// can't carry a pre-shared key, so it is off; OpenHydra's public bootstraps and relays don't have
+/// the key, so they are off too. Fails if a key was already set.
+pub fn set_private_network_key(key: libp2p::pnet::PreSharedKey) -> Result<(), String> {
+    PRIVATE_NETWORK_KEY.set(key).map_err(|_| "a private network key is already set".to_string())
+}
+
+/// The private-network key, when one is set ([`set_private_network_key`]).
+pub fn private_network_key() -> Option<libp2p::pnet::PreSharedKey> {
+    PRIVATE_NETWORK_KEY.get().copied()
+}
+
+/// Parse a private-network key file: the go-libp2p / IPFS `swarm.key` format
+/// (`/key/swarm/psk/1.0.0/`, `/base16/`, then 64 hex digits). The error never quotes the file.
+pub fn parse_private_network_key(text: &str) -> Result<libp2p::pnet::PreSharedKey, String> {
+    text.parse::<libp2p::pnet::PreSharedKey>()
+        .map_err(|e| format!("not a private network key ({e}); expected /key/swarm/psk/1.0.0/, /base16/, then 64 hex digits"))
+}
+
+/// A new random private-network key, in the key-file format [`parse_private_network_key`] reads.
+pub fn new_private_network_key_file() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    // `PreSharedKey`'s `Display` is the key file itself.
+    libp2p::pnet::PreSharedKey::new(bytes).to_string()
+}
+
+/// A short id for `key` that is safe to show (go-libp2p's fingerprint): two nodes on the same
+/// network show the same one. Never print the key itself: its `Debug` and `Display` both show it.
+pub fn private_network_fingerprint(key: &libp2p::pnet::PreSharedKey) -> String {
+    key.fingerprint().to_string()
+}
+
+/// `stream`, encrypted with the private-network key when one is set; as it is otherwise. A failed
+/// key exchange reads as a failed handshake: whoever is there answered.
+pub async fn private_network_stream<S>(stream: S) -> std::io::Result<futures::future::Either<libp2p::pnet::PnetOutput<S>, S>>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Send + Unpin + 'static,
+{
+    match private_network_key() {
+        Some(key) => libp2p::pnet::PnetConfig::new(key)
+            .handshake(stream)
+            .await
+            .map(futures::future::Either::Left)
+            .map_err(handshake_failed),
+        None => Ok(futures::future::Either::Right(stream)),
+    }
+}
+
 /// The most a TCP connect may take (the SYN answered), before any handshake. Its own limit, inside
 /// [`OUTBOUND_SETUP_TIMEOUT`], so "nobody answered" is told apart from "answered, then stalled in the
 /// handshake" (a peer at its connection limit): see [`dial_means_unreachable`] (review 2026-10-29).
@@ -120,6 +176,9 @@ pub fn build_tcp_transport(
             TransportTimeoutError::TimerError(e) | TransportTimeoutError::Other(e) => e,
         });
     let tcp_transport = tcp
+        // On a private network, the key wraps the connection before anything else is said.
+        .and_then(|socket, _| private_network_stream(socket))
+        .map_err(|e| e.into_inner())
         .upgrade(libp2p::core::upgrade::Version::V1Lazy)
         .authenticate(noise::Config::new(keypair).expect("noise config"))
         .multiplex(yamux_config())
