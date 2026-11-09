@@ -1227,6 +1227,24 @@ fn stamp_load(chunk: &[u8], load: crate::serve::ProviderLoad) -> Vec<u8> {
     }
 }
 
+/// Counts a serve request as waiting for a serve worker for as long as it lives: made when the
+/// request is queued, moved into its job, and dropped when the job starts (or with the job, when
+/// the queue is full and it is shed).
+struct QueuedServe(Arc<std::sync::atomic::AtomicU32>);
+
+impl QueuedServe {
+    fn start(count: &Arc<std::sync::atomic::AtomicU32>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        QueuedServe(Arc::clone(count))
+    }
+}
+
+impl Drop for QueuedServe {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Counts a serve as running on this provider for as long as it lives.
 struct ServeSlot<'a>(&'a std::sync::atomic::AtomicU32);
 
@@ -1485,6 +1503,8 @@ pub struct Provider<A: EngineAdapter> {
     /// Serves running right now, and how many run at once, for the load each serve reports.
     running: std::sync::atomic::AtomicU32,
     serve_slots: std::sync::atomic::AtomicU32,
+    /// Serve requests waiting for a serve worker (queued behind the running ones).
+    queued_serves: Arc<std::sync::atomic::AtomicU32>,
     /// Recent decode speed across serves, tokens a second (a moving average; 0 until one is seen).
     recent_tok_s: std::sync::atomic::AtomicU32,
     /// The on-chain claim kept with each `settled_receipts` entry (same key), on a settlement chain.
@@ -1665,6 +1685,7 @@ impl<A: EngineAdapter> Provider<A> {
             self_consumer: None,
             running: std::sync::atomic::AtomicU32::new(0),
             serve_slots: std::sync::atomic::AtomicU32::new(1),
+            queued_serves: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             recent_tok_s: std::sync::atomic::AtomicU32::new(0),
             paid_generating: Arc::new(Mutex::new(HashMap::new())),
             next_reservation: std::sync::atomic::AtomicU64::new(0),
@@ -2098,11 +2119,13 @@ impl<A: EngineAdapter> Provider<A> {
         own
     }
 
-    /// This provider's load as a serve ends: the serves still running besides it, its slots, and its
-    /// recent speed.
+    /// This provider's load as a serve ends: the serves still running besides it and those queued
+    /// for a worker (so a full provider reports a load of 1 or more, and a long queue shows), its
+    /// slots, and its recent speed.
     fn load_now(&self) -> crate::serve::ProviderLoad {
+        let running = self.running.load(Ordering::SeqCst).saturating_sub(1);
         crate::serve::ProviderLoad {
-            in_flight: self.running.load(Ordering::SeqCst).saturating_sub(1),
+            in_flight: running.saturating_add(self.queued_serves.load(Ordering::SeqCst)),
             capacity: self.serve_slots.load(Ordering::SeqCst).max(1),
             decode_tok_s: self.recent_tok_s.load(Ordering::Relaxed),
         }
@@ -3331,7 +3354,9 @@ impl<A: EngineAdapter> Provider<A> {
                     // (and evict) a victim via a spoofed `reply_to`.
                     let src = source_peer.clone();
                     let queued = std::time::Instant::now();
+                    let waiting = QueuedServe::start(&self.queued_serves);
                     let accepted = pool.submit(move || {
+                        drop(waiting);
                         // Its consumer gave up waiting for the open while it queued: generating now
                         // would be for nobody.
                         if queued.elapsed() > STREAM_OPEN_STALE {
@@ -3370,7 +3395,11 @@ impl<A: EngineAdapter> Provider<A> {
                 } else {
                     &pool
                 };
+                // A serve request waits for a serve worker; counted in the load serves report.
+                let waiting = (std::ptr::eq(target, &pool) && data.first() == Some(&SERVE_REQUEST))
+                    .then(|| QueuedServe::start(&self.queued_serves));
                 let accepted = target.submit(move || {
+                    drop(waiting);
                     // F-C5: decode the serve request ONCE here and thread it through
                     // throttle / AUP / dispatch, instead of each re-decoding the (possibly
                     // large) prompt. `None` for non-serve or unparseable frames.
@@ -5220,6 +5249,31 @@ mod tests {
             assert_eq!(running.load(Ordering::SeqCst), 2);
         }
         assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_full_provider_says_so_and_its_queue_shows() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        provider.serve_slots.store(2, Ordering::SeqCst);
+        // The serve reporting (1) and another running fill both slots; three wait for a worker.
+        let _a = ServeSlot::start(&provider.running);
+        let _b = ServeSlot::start(&provider.running);
+        let waiting: Vec<QueuedServe> = (0..3).map(|_| QueuedServe::start(&provider.queued_serves)).collect();
+        let load = provider.load_now();
+        assert_eq!((load.in_flight, load.capacity), (4, 2), "1 other running + 3 queued, of 2 slots");
+        // A queued serve stops counting when its job starts, or when the job is shed with it.
+        let pool = crate::workpool::WorkerPool::with_queue(1, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut waiting = waiting.into_iter();
+        let started = waiting.next().unwrap();
+        // Accepted (it runs and drops its count) or shed (dropped with it): either way it stops counting.
+        let _accepted = pool.submit(move || {
+            drop(started);
+            tx.send(()).unwrap();
+        });
+        drop(waiting); // shed
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(provider.queued_serves.load(Ordering::SeqCst), 0);
     }
 
     #[test]

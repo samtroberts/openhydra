@@ -16,6 +16,25 @@
 //! A bootstrap of a private deployment (on a private network, e.g. `10.0.0.5`) declares the address
 //! its peers reach it at with `--external /ip4/10.0.0.5/tcp/4001` (repeatable): its relay hands that
 //! out in reservations. Globally routable listen addresses are confirmed on their own.
+//!
+//! A private deployment's bootstrap can hold its network key and peer allowlist, with the same
+//! meaning as the agent's flags of the same names:
+//! * `--private-network-key-file <path>`: join the private network keyed by this file (libp2p
+//!   `pnet`: `/key/swarm/psk/1.0.0/`, `/base16/`, 64 hex digits; make one with
+//!   `openhydra-agent network-key --out <file>`). Every TCP connection, and every circuit through
+//!   its relay, is keyed, so a node without the key can't connect to it or relay through it. QUIC is
+//!   off. The file must be readable by its owner only (`chmod 600`), or the bootstrap won't start;
+//!   only the key's fingerprint is ever printed. A keyed bootstrap refuses to run under one of
+//!   OpenHydra's own public bootstrap identities, and never connects to OpenHydra's public network.
+//! * `--allow-peers-file <path>`: connections only with the peers listed (one peer id per line, `#`
+//!   comments), on every transport; the `--peer` bootstraps are always allowed.
+//! * `--private-network-quic`: keep QUIC on with the key. QUIC can't carry the key, so it is guarded
+//!   by the allowlist instead; needs both of the above.
+//!
+//! Every flag: `--identity <path>`, `--listen <multiaddr>` (repeatable), `--peer <multiaddr>`
+//! (repeatable), `--external <multiaddr>` (repeatable), `--gossip-mesh-max <n>`, `--metrics-bind
+//! <loopback addr:port>`, and the three above. Anything else is an error (exit 2): a misspelt flag
+//! used to be ignored, so `--private-netwrok-key-file` would have started an open bootstrap.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,6 +63,9 @@ use openhydra_network::relay::{
 struct BootstrapBehaviour {
     /// Bounds on the incoming connections one network address can make the bootstrap hold.
     ip_limits: openhydra_network::ip_limits::Behaviour,
+    /// Refuses connections with peers off the allowlist (`--allow-peers-file`), and on a private
+    /// network with OpenHydra's own bootstraps and relays ([`openhydra_network::fence`]).
+    fence: openhydra_network::fence::Behaviour,
     /// Bounds on the connections other nodes can make the bootstrap hold.
     connection_limits: libp2p::connection_limits::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
@@ -103,8 +125,106 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The flags that take a value.
+const VALUE_FLAGS: &[&str] = &[
+    "--identity",
+    "--listen",
+    "--peer",
+    "--external",
+    "--gossip-mesh-max",
+    "--metrics-bind",
+    "--private-network-key-file",
+    "--allow-peers-file",
+];
+/// The flags that take none.
+const SWITCH_FLAGS: &[&str] = &["--private-network-quic"];
+
+const USAGE: &str = "usage: openhydra-bootstrap [--identity <path>] [--listen <multiaddr>]... [--peer <multiaddr>]... \
+[--external <multiaddr>]... [--gossip-mesh-max <n>] [--metrics-bind <127.0.0.1:port>] \
+[--private-network-key-file <path>] [--allow-peers-file <path>] [--private-network-quic]";
+
+/// Check the command line: every argument is a known flag, or the value right after one that takes
+/// a value. A misspelt flag is an error rather than ignored: ignoring it started a bootstrap without
+/// what the flag asked for, say an open one where a keyed one was meant.
+fn check_args(args: &[String]) -> Result<(), String> {
+    let mut i = 1; // args[0] is the program
+    while i < args.len() {
+        let a = args[i].as_str();
+        if SWITCH_FLAGS.contains(&a) {
+            i += 1;
+        } else if VALUE_FLAGS.contains(&a) {
+            match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => i += 2,
+                _ => return Err(format!("{a} needs a value")),
+            }
+        } else if a.starts_with('-') {
+            return Err(format!("unknown flag {a}"));
+        } else {
+            return Err(format!("unexpected argument {a:?} (not the value of a flag)"));
+        }
+    }
+    Ok(())
+}
+
+/// What `--private-network-key-file` / `--allow-peers-file` / `--private-network-quic` set up.
+struct PrivateNetwork {
+    /// The key's fingerprint, when keyed (never the key).
+    fingerprint: Option<String>,
+    /// Peers on the allowlist, when one is set.
+    allowed: Option<usize>,
+}
+
+/// Read the network key and the peer allowlist and set them for this process, before any transport
+/// is built (they can't change once one is: `transport::freeze_network_settings`). `peers`: the
+/// `--peer` bootstraps, always allowed (a bootstrap cut off from the rest of its mesh is no use).
+fn set_up_private_network(args: &[String], peers: &[Multiaddr]) -> Result<PrivateNetwork, String> {
+    let mut allowed = None;
+    if let Some(path) = parse_flag(args, "--allow-peers-file") {
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("--allow-peers-file {path}: {e}"))?;
+        let mut list = openhydra_network::fence::parse_allowlist(&text).map_err(|e| format!("--allow-peers-file {path}: {e}"))?;
+        list.extend(peers.iter().filter_map(|a| openhydra_network::fence::peer_id_in(&a.to_string())));
+        allowed = Some(list.len());
+        openhydra_network::fence::set_allowed_peers(list)?;
+    }
+    let mut fingerprint = None;
+    if let Some(path) = parse_flag(args, "--private-network-key-file") {
+        // Refused rather than warned about (the agent warns): a bootstrap is a long-running server,
+        // usually on a shared machine, and anyone who can read the file can join the network.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).map_err(|e| format!("--private-network-key-file {path}: {e}"))?.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "--private-network-key-file {path}: can be read by other users (mode {:o}); anyone with it can join the network. chmod 600 it",
+                    mode & 0o777
+                ));
+            }
+        }
+        // Errors never quote the file: it is the key.
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("--private-network-key-file {path}: {e}"))?;
+        let key = openhydra_network::transport::parse_private_network_key(&text)
+            .map_err(|e| format!("--private-network-key-file {path}: {e}"))?;
+        openhydra_network::transport::set_private_network_key(key)?;
+        fingerprint = Some(openhydra_network::transport::private_network_fingerprint(&key));
+    }
+    if args.iter().any(|a| a == "--private-network-quic") {
+        if fingerprint.is_none() || allowed.is_none() {
+            return Err("--private-network-quic needs --private-network-key-file and --allow-peers-file".into());
+        }
+        openhydra_network::transport::allow_quic_on_private_network().map_err(|e| format!("--private-network-quic: {e}"))?;
+    }
+    Ok(PrivateNetwork { fingerprint, allowed })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Err(e) = check_args(&args) {
+        eprintln!("openhydra-bootstrap: {e}\n{USAGE}");
+        std::process::exit(2);
+    }
+
     // Init tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -115,8 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
-    // Parse CLI args (minimal, no clap dependency).
-    let args: Vec<String> = std::env::args().collect();
+    // Parse CLI args (minimal, no clap dependency; checked above).
     let identity_path = parse_flag(&args, "--identity")
         .unwrap_or_else(|| "/opt/openhydra/.libp2p_identity.key".to_string());
     let listen_addrs: Vec<Multiaddr> = parse_flag_multi(&args, "--listen")?
@@ -142,6 +261,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peer_id = identity.libp2p_peer_id;
     let keypair = identity.keypair.clone();
+
+    // A private deployment's network key and peer allowlist, set before the transport is built.
+    let bootstrap_peers: Vec<Multiaddr> = parse_flag_multi(&args, "--peer")?.unwrap_or_default();
+    let private = set_up_private_network(&args, &bootstrap_peers).unwrap_or_else(|e| {
+        eprintln!("openhydra-bootstrap: {e}");
+        std::process::exit(2);
+    });
+    let keyed = private.fingerprint.is_some();
+    if keyed && public_bootstrap(&peer_id) {
+        // One of OpenHydra's own identities: the public network's peers would be told to use it and
+        // couldn't (they don't have the key), and its peer id would vouch for a private network.
+        eprintln!("openhydra-bootstrap: --private-network-key-file: {peer_id} is one of OpenHydra's public bootstraps; a private network's bootstrap needs its own identity (--identity)");
+        std::process::exit(2);
+    }
+    // Read once, here: from now on none of them can change.
+    openhydra_network::transport::freeze_network_settings();
+    let quic = openhydra_network::transport::quic_enabled();
+    if let Some(fingerprint) = &private.fingerprint {
+        info!(%fingerprint, quic, "private network: TCP and relay circuits keyed; no OpenHydra public bootstraps or relays");
+    }
+    if let Some(n) = private.allowed {
+        info!(peers = n, "peer allowlist: only these peers (and the --peer bootstraps) may connect");
+    }
+
     // The gossip mesh's upper bound (load tests A/B it; production keeps BOOTSTRAP_GOSSIP_MESH_MAX).
     let gossip_mesh_max: usize = match parse_flag(&args, "--gossip-mesh-max") {
         Some(v) => v.parse().map_err(|e| format!("--gossip-mesh-max: {e}"))?,
@@ -152,11 +295,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // Transport: QUIC + TCP (bootstrap is public, no relay needed)
+    // Transport: QUIC + TCP (bootstrap is public, no relay needed). On a private network the TCP
+    // transport is keyed (`transport::build_tcp_transport` reads the key set above), and QUIC, which
+    // can't carry the key, is left out unless the allowlist guards it (`--private-network-quic`).
     let tcp_transport = openhydra_network::transport::build_tcp_transport(&keypair)?;
-    let quic_transport = openhydra_network::transport::build_quic_transport(&keypair)?;
     // Errors unwrapped, so the dial-failure check can read them (`transport::dial_means_unreachable`).
-    let transport = openhydra_network::transport::either_transport(quic_transport, tcp_transport);
+    let transport = if quic {
+        let quic_transport = openhydra_network::transport::build_quic_transport(&keypair)?;
+        openhydra_network::transport::either_transport(quic_transport, tcp_transport)
+    } else {
+        tcp_transport
+    };
+    // A keyed bootstrap never dials OpenHydra's public network, however it hears of it (as a keyed
+    // agent node doesn't: `fence`). They don't have the key, so nothing would come of it but a
+    // packet to them saying where a private network's bootstrap is.
+    let transport = if keyed {
+        libp2p::Transport::boxed(openhydra_network::fence::FenceTransport::new(transport, openhydra_network::fence::Fenced::openhydra()))
+    } else {
+        transport
+    };
     // One of OpenHydra's own bootstraps never dials a private address (see `public_dials_only`); a
     // private deployment's does (its peers are private).
     let transport = if public_bootstrap(&keypair.public().to_peer_id()) {
@@ -196,9 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // silently refuse DHT operations.
     kademlia.set_mode(Some(kad::Mode::Server));
 
-    // Add other bootstrap peers to the routing table.
-    let bootstrap_peers: Vec<Multiaddr> = parse_flag_multi(&args, "--peer")?
-        .unwrap_or_default();
+    // Add other bootstrap peers to the routing table (`bootstrap_peers`, read above).
     let mut configured_peers = std::collections::HashSet::new();
     let mut dial_failures: HashMap<libp2p::PeerId, (u32, std::time::Instant)> = HashMap::new();
     let mut dial_back = DialBack::default();
@@ -380,6 +535,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let behaviour = BootstrapBehaviour {
         ip_limits: openhydra_network::ip_limits::Behaviour::new(openhydra_network::ip_limits::IpLimitsConfig::BOOTSTRAP),
+        // The peer allowlist, when one is set (set above, so `new` picks it up), and on a private
+        // network OpenHydra's own peers too. Neither: refuses nothing.
+        fence: openhydra_network::fence::Behaviour::new(keyed.then(openhydra_network::fence::Fenced::openhydra)),
         connection_limits: libp2p::connection_limits::Behaviour::new(openhydra_network::behaviour::bootstrap_connection_limits()),
         kademlia,
         relay_server,
@@ -404,12 +562,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
     // Addresses the operator says peers reach this bootstrap at (a private deployment's bootstrap is
     // on a private network, which isn't confirmed on its own): its relay puts these in reservations.
+    let is_quic = |a: &Multiaddr| a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1 | libp2p::multiaddr::Protocol::Quic));
     for addr in parse_flag_multi(&args, "--external")?.unwrap_or_default() {
+        if !quic && is_quic(&addr) {
+            // Handed out in reservations, it would send peers to a QUIC port nobody answers on.
+            info!(%addr, "private network: not using a QUIC --external address (no QUIC; see --private-network-quic)");
+            continue;
+        }
         info!(%addr, "external address (from --external)");
         swarm.add_external_address(addr);
     }
 
     for addr in &listen_addrs {
+        if !quic && is_quic(addr) {
+            info!(%addr, "private network: not listening on QUIC (it can't carry the network key; see --private-network-quic)");
+            continue;
+        }
         swarm.listen_on(addr.clone())?;
         info!(%addr, "listening");
     }
@@ -2078,5 +2246,47 @@ mod tests {
         let typo = parse_flag_multi(&args(&["--external", "/ip4/10.0.0.5/tpc/4001"]), "--external").unwrap_err();
         assert!(typo.contains("--external") && typo.contains("tpc"), "{typo}");
         assert!(parse_flag_multi(&args(&["--external"]), "--external").is_err(), "a missing value");
+    }
+
+    #[test]
+    fn unknown_flags_and_stray_arguments_are_errors() {
+        let args = |v: &[&str]| std::iter::once("openhydra-bootstrap").chain(v.iter().copied()).map(String::from).collect::<Vec<_>>();
+        // Everything the bootstrap takes (the production unit's flags among them).
+        let all = args(&[
+            "--identity", "/opt/openhydra/.libp2p_identity.key",
+            "--listen", "/ip4/0.0.0.0/tcp/4001", "--listen", "/ip4/0.0.0.0/udp/4001/quic-v1",
+            "--peer", "/ip4/10.0.0.6/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb",
+            "--external", "/ip4/10.0.0.5/tcp/4001", "--gossip-mesh-max", "6", "--metrics-bind", "127.0.0.1:9100",
+            "--private-network-key-file", "swarm.key", "--allow-peers-file", "peers.txt", "--private-network-quic",
+        ]);
+        assert_eq!(check_args(&all), Ok(()));
+        assert_eq!(check_args(&args(&[])), Ok(()));
+        // A misspelt key flag must not start an open bootstrap.
+        let typo = check_args(&args(&["--private-netwrok-key-file", "swarm.key"])).unwrap_err();
+        assert!(typo.contains("--private-netwrok-key-file"), "{typo}");
+        assert!(check_args(&args(&["-h"])).is_err());
+        assert!(check_args(&args(&["stray"])).is_err(), "a value with no flag");
+        assert!(check_args(&args(&["--identity"])).is_err(), "a missing value");
+        assert!(check_args(&args(&["--identity", "--private-network-quic"])).is_err(), "a flag isn't a value");
+    }
+
+    #[test]
+    fn a_key_file_others_can_read_is_refused_and_quic_needs_key_and_allowlist() {
+        // Both refused before anything is set, so this process's settings stay untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swarm.key");
+        std::fs::write(&path, openhydra_network::transport::new_private_network_key_file()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let args = vec!["x".to_string(), "--private-network-key-file".into(), path.to_string_lossy().into_owned()];
+            let e = set_up_private_network(&args, &[]).err().expect("a 0644 key file is refused");
+            assert!(e.contains("chmod 600"), "{e}");
+            assert!(!e.contains(&std::fs::read_to_string(&path).unwrap().lines().nth(2).unwrap().to_string()), "never the key");
+            assert!(openhydra_network::transport::private_network_key().is_none());
+        }
+        let e = set_up_private_network(&["x".into(), "--private-network-quic".into()], &[]).err().expect("QUIC alone is refused");
+        assert!(e.contains("--private-network-key-file") && e.contains("--allow-peers-file"), "{e}");
     }
 }

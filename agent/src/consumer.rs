@@ -750,27 +750,39 @@ const MAX_LOAD_REPORTS: usize = 4_096;
 /// promoted; one we haven't tried yet (50) always is.
 const SPREAD_REPUTATION_MARGIN: f64 = 10.0;
 
-/// How many leading `candidates` are equally eligible to share load with the first: the same `lead`
-/// key (refusals, availability, connection) and an `earned` reputation within
+/// How many `candidates` are equally eligible to share load with the first: the same `lead` key
+/// (refusals, availability, connection) and an `earned` reputation within
 /// [`SPREAD_REPUTATION_MARGIN`] of the first's, or of the neutral reputation when the first has
-/// earned more. Stops at the first that isn't.
+/// earned more. They are moved to the front (in their order), ahead of any of the same lead that
+/// fell short: one provider that failed us, ranked high on its own advertised figures, must not
+/// shut every provider behind it out of the spread.
 ///
 /// The floor is capped at neutral because honoured serves raise reputation: measured against the
 /// first's alone, a provider that served a few requests more would shut out every untried one, which
 /// would then never get the requests that could raise its own (seen live on 2026-11-09: one of two
 /// equal vLLM providers took 168 of 168).
-fn spread_eligible<T, K: PartialEq>(candidates: &[T], lead: &dyn Fn(&T) -> K, earned: &dyn Fn(&T) -> f64) -> usize {
+fn spread_eligible<T, K: PartialEq>(candidates: &mut Vec<T>, lead: &dyn Fn(&T) -> K, earned: &dyn Fn(&T) -> f64) -> usize {
     let Some(first) = candidates.first() else { return 0 };
     let floor = earned(first).min(NEUTRAL_REPUTATION) - SPREAD_REPUTATION_MARGIN;
     let key = lead(first);
-    candidates.iter().take_while(|c| lead(c) == key && earned(c) >= floor).count()
+    let same_lead = candidates.iter().take_while(|c| lead(c) == key).count();
+    let (mut eligible, mut short): (Vec<T>, Vec<T>) = candidates.drain(..same_lead).partition(|c| earned(c) >= floor);
+    let n = eligible.len();
+    eligible.append(&mut short);
+    candidates.splice(0..0, eligible);
+    n
 }
+
+/// The most serve slots a provider is believed to have, whatever it reports.
+const MAX_BELIEVED_CAPACITY: u32 = 64;
 
 /// How busy a provider looks: serves per serve slot from its fresh `report`, never less than the
 /// `open` serves this consumer has there; with no report, `open` against one slot.
 fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
     match report {
-        Some(l) => f64::from(l.in_flight.max(open)) / f64::from(l.capacity.max(1)),
+        // A provider's own word for its capacity is believed only up to a bound: claiming a huge one
+        // would make it look idle and win every draw.
+        Some(l) => f64::from(l.in_flight.max(open)) / f64::from(l.capacity.clamp(1, MAX_BELIEVED_CAPACITY)),
         None => f64::from(open),
     }
 }
@@ -780,11 +792,14 @@ fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
 /// ([`openhydra_protocol::model_id::public_model_id`]) when that is known. A stem a provider had to
 /// suffix (two checkpoints sharing it) can't be derived from the file name, so that stays unknown.
 fn weight_file_alias(requested: &str, known: &[String]) -> Option<String> {
-    if !openhydra_protocol::model_id::is_weight_file_name(requested) || known.iter().any(|m| m == requested) {
+    if known.iter().any(|m| m == requested) {
         return None;
     }
-    let stem = openhydra_protocol::model_id::public_model_id(requested);
-    (stem != requested && known.iter().any(|m| *m == stem)).then_some(stem)
+    // Only the exact old name — `<model>.<weight extension>`, a name the network accepted then — and
+    // never a path or a cleaned-up spelling of one, so a known model gains a handful of aliases, not
+    // an unbounded family of client-chosen strings.
+    let stem = openhydra_protocol::model_id::weight_file_stem(requested)?;
+    known.iter().any(|m| m == stem).then(|| stem.to_string())
 }
 
 /// How long our own provider's list of what it shares is used before asking again.
@@ -1047,6 +1062,7 @@ pub fn request_completion(
                     claimed_tokens: None,
                     recount_pending: false,
                     provider: String::new(),
+                    served_model: String::new(),
                 })
             }
         }
@@ -1570,6 +1586,7 @@ fn dispatch_stream_slice(
                     claimed_tokens: None,
                     recount_pending: false,
                     provider: String::new(),
+                    served_model: String::new(),
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
@@ -1838,6 +1855,13 @@ pub struct ConsumerNode {
     /// Phase 0.3: what our own provider (`self_provider`) shares, as it last told us, and when (unix
     /// ms). Its Device and Private models are never announced, so this is how we find them.
     own_models: Mutex<Option<(u64, crate::provider::OwnModels)>>,
+    /// Held while one request asks our own provider what it shares, so a burst of requests on an
+    /// expired list makes one ask (the rest use the last answer) instead of each waiting on it.
+    own_models_asking: Mutex<()>,
+    /// Whether this gateway lists and routes its own provider's Device and Private models. Off on a
+    /// gateway other machines can reach: those models are "this machine only", and its callers
+    /// aren't this machine.
+    own_models_allowed: bool,
     /// SL1: the signed list of providers OpenHydra runs ([`crate::seed_list`]). A model a seed
     /// serves is one `openhydra/auto` may pick, and a seed starts a little above an unknown provider
     /// in ranking. `None` = no list (a private deployment).
@@ -2224,6 +2248,8 @@ impl ConsumerNode {
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             own_models: Mutex::new(None),
+            own_models_asking: Mutex::new(()),
+            own_models_allowed: true,
             seeds: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
@@ -2527,6 +2553,13 @@ impl ConsumerNode {
         self
     }
 
+    /// Whether this gateway may list and route its own provider's Device and Private models
+    /// (builder form; on by default). A gateway other machines reach turns it off.
+    pub fn with_own_models(mut self, allowed: bool) -> Self {
+        self.own_models_allowed = allowed;
+        self
+    }
+
     /// M2: attach the imported-cards store so `serve_once` can route to card-pinned providers by peer
     /// id without live discovery (builder form). `None` leaves card routing off.
     pub fn with_cards(mut self, cards: Option<Arc<crate::cards::CardStore>>) -> Self {
@@ -2635,6 +2668,8 @@ impl ConsumerNode {
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             own_models: Mutex::new(None),
+            own_models_asking: Mutex::new(()),
+            own_models_allowed: true,
             seeds: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
@@ -3321,7 +3356,21 @@ impl ConsumerNode {
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
     /// Backs the gateway's `GET /v1/models`; empty until discovery has populated the cache.
     pub fn known_models(&self) -> Result<Vec<String>, String> {
-        let mut models = self.net.known_models()?;
+        let (mut models, local) = self.known_models_by_source()?;
+        for m in local {
+            if !models.contains(&m) {
+                models.push(m);
+            }
+        }
+        Ok(models)
+    }
+
+    /// [`known_models`](Self::known_models) in two parts: those the network announces (seen through
+    /// discovery, which churns), and those this node knows first-hand (its own provider's, and its
+    /// usable cards'), which are exact: one that leaves them (unshared, a credential expired) is gone.
+    pub fn known_models_by_source(&self) -> Result<(Vec<String>, Vec<String>), String> {
+        let announced = self.net.known_models()?;
+        let mut models = Vec::new();
         let now = now_unix_ms();
         // Our own provider's models, whatever their reach (Device and Private ones aren't announced).
         if let Some(own) = self.own_models(now) {
@@ -3336,7 +3385,7 @@ impl ConsumerNode {
                 models.push(m);
             }
         }
-        Ok(models)
+        Ok((announced, models))
     }
 
     /// The models of imported cards this gateway can use: every public card's, and a private card's
@@ -3363,15 +3412,20 @@ impl ConsumerNode {
     /// `None` without a `--self-provider`. A provider that can't be reached counts as sharing
     /// nothing until the next ask.
     fn own_models(&self, now: u64) -> Option<crate::provider::OwnModels> {
+        if !self.own_models_allowed {
+            return None;
+        }
         let own = self.self_provider.clone()?;
-        {
-            let cached = self.own_models.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((at, models)) = cached.as_ref() {
-                if now.saturating_sub(*at) < OWN_MODELS_TTL_MS {
-                    return Some(models.clone());
-                }
+        let cached = || -> Option<(u64, crate::provider::OwnModels)> { self.own_models.lock().unwrap_or_else(|e| e.into_inner()).clone() };
+        if let Some((at, models)) = cached() {
+            if now.saturating_sub(at) < OWN_MODELS_TTL_MS {
+                return Some(models);
             }
         }
+        // One ask at a time: while another request is asking, use the last answer (or nothing yet).
+        let Ok(_asking) = self.own_models_asking.try_lock() else {
+            return Some(cached().map(|(_, m)| m).unwrap_or_default());
+        };
         let fresh = self
             .net
             .proxy_forward_timeout(own, vec![crate::provider::OWN_MODELS_REQUEST], std::time::Duration::from_secs(3))
@@ -3600,7 +3654,7 @@ impl ConsumerNode {
                 connected.contains(&c.state_id),
             )
         };
-        let eligible = spread_eligible(&candidates, &lead, &earned);
+        let eligible = spread_eligible(&mut candidates, &lead, &earned);
         if tracing::enabled!(tracing::Level::DEBUG) {
             let order: Vec<_> = candidates
                 .iter()
@@ -3761,6 +3815,7 @@ impl ConsumerNode {
                     summary.proxy_roundtrip_ns = proxy_roundtrip_ns;
                     summary.streamed = streamed;
                     summary.provider = provider_libp2p.clone();
+                    summary.served_model = model.to_string();
                     // The tier the routing decision saw for this provider, for the client to see.
                     if !self.is_self_serve(&provider_libp2p) {
                         summary.authenticity = Some(self.authenticity_of(&provider.state_id, model_key_now, now));
@@ -7354,7 +7409,24 @@ mod tests {
         // A provider that still announces the file name (an older one) keeps it.
         let both = known(&["v1-5-pruned-emaonly-fp16.safetensors", "v1-5-pruned-emaonly-fp16"]);
         assert_eq!(weight_file_alias("v1-5-pruned-emaonly-fp16.safetensors", &both), None);
-        assert_eq!(weight_file_alias("models/SDXL\\juggernaut.safetensors", &known(&["models/SDXL/juggernaut"])).as_deref(), Some("models/SDXL/juggernaut"));
+        // Never a path or another spelling that cleans up to a known model: a client can't mint
+        // endless names for one model.
+        assert_eq!(weight_file_alias("models/SDXL\\juggernaut.safetensors", &known(&["models/SDXL/juggernaut"])), None);
+        assert_eq!(weight_file_alias("/aaa/qwen2.5:7b.gguf", &k), None, "a path");
+        assert_eq!(weight_file_alias("qwen2.5:7b.gguf.gguf", &k).as_deref(), Some("qwen2.5:7b"));
+        assert_eq!(weight_file_alias(&format!("{}.gguf", "x".repeat(10_000)), &known(&[&"x".repeat(10_000)])), None, "too long to be a model id");
+    }
+
+    #[test]
+    fn a_gateway_others_reach_never_lists_this_machines_own_models() {
+        let (_dir, node) = test_node();
+        let mut node = node.with_self_provider(Some("12D3KooWOwnProvider".into()));
+        // A cached answer is in hand, so a loopback gateway uses it without asking.
+        let mine = crate::provider::OwnModels { models: vec!["device-only".into()], ..Default::default() };
+        *node.own_models.lock().unwrap() = Some((1_000, mine));
+        assert_eq!(node.own_models(2_000).map(|m| m.models), Some(vec!["device-only".to_string()]));
+        node = node.with_own_models(false);
+        assert!(node.own_models(2_000).is_none(), "off on a gateway other machines reach");
     }
 
     fn test_node() -> (tempfile::TempDir, ConsumerNode) {
@@ -8259,15 +8331,21 @@ mod tests {
         let lead = |c: &(&str, bool, f64)| c.1;
         let earned = |c: &(&str, bool, f64)| c.2;
         // A connected first never shares with a stale record behind it.
-        assert_eq!(spread_eligible(&[("a", true, 50.0), ("b", false, 50.0)], &lead, &earned), 1);
-        // Equal peers share; one that failed us (50 → 30) does not, and nothing past it does.
-        let c = [("a", true, 50.0), ("b", true, 53.0), ("c", true, 30.0), ("d", true, 50.0)];
-        assert_eq!(spread_eligible(&c, &lead, &earned), 2);
+        assert_eq!(spread_eligible(&mut vec![("a", true, 50.0), ("b", false, 50.0)], &lead, &earned), 1);
+        // Equal peers share; one that failed us (50 → 30) does not, and doesn't shut out those
+        // behind it either: it moves behind them.
+        let mut c = vec![("a", true, 50.0), ("b", true, 53.0), ("c", true, 30.0), ("d", true, 50.0)];
+        assert_eq!(spread_eligible(&mut c, &lead, &earned), 3);
+        assert_eq!(c.iter().map(|c| c.0).collect::<Vec<_>>(), ["a", "b", "d", "c"]);
         // A provider that has served us well doesn't shut out one we haven't tried yet.
-        assert_eq!(spread_eligible(&[("a", true, 74.0), ("b", true, 50.0)], &lead, &earned), 2);
+        assert_eq!(spread_eligible(&mut vec![("a", true, 74.0), ("b", true, 50.0)], &lead, &earned), 2);
         // A failed one stays out however well the first has done.
-        assert_eq!(spread_eligible(&[("a", true, 74.0), ("b", true, 30.0)], &lead, &earned), 1);
-        assert_eq!(spread_eligible::<(&str, bool, f64), bool>(&[], &lead, &earned), 0);
+        assert_eq!(spread_eligible(&mut vec![("a", true, 74.0), ("b", true, 30.0)], &lead, &earned), 1);
+        // Nothing of another lead joins, and the order past the leading group is kept.
+        let mut c = vec![("a", true, 50.0), ("b", true, 20.0), ("c", false, 50.0), ("d", true, 50.0)];
+        assert_eq!(spread_eligible(&mut c, &lead, &earned), 1);
+        assert_eq!(c.iter().map(|c| c.0).collect::<Vec<_>>(), ["a", "b", "c", "d"]);
+        assert_eq!(spread_eligible::<(&str, bool, f64), bool>(&mut Vec::new(), &lead, &earned), 0);
     }
 
     #[test]

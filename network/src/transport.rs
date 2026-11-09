@@ -19,14 +19,40 @@ pub type BoxedTransport = libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p
 
 /// This process's private-network key, when it runs a private network (enterprise phase 0.6). Set
 /// once, before the node starts, and shared by every swarm it builds.
+///
+/// Never put a `PreSharedKey` (or a `libp2p::pnet::PnetConfig`, which holds one) in a struct that
+/// derives or implements `Debug` the default way: both types' own `Debug` prints the key in hex, so
+/// one `{:?}` in a log line would hand the network key to whoever reads the log.
 static PRIVATE_NETWORK_KEY: std::sync::OnceLock<libp2p::pnet::PreSharedKey> = std::sync::OnceLock::new();
 
+/// Set once the first swarm is built ([`freeze_network_settings`]): from then on the key, the peer
+/// allowlist and the QUIC switch can't change. A swarm reads them when it is built (whether it runs
+/// QUIC is decided then, once), so one set afterwards would apply to some of its parts and not
+/// others: say, a key that new TCP connections use while the QUIC listener it should have turned
+/// off keeps running.
+static NETWORK_SETTINGS_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse any later change to the private-network key, the peer allowlist and the QUIC switch.
+/// Called by whatever builds a swarm (`swarm::build_swarm`, the bootstrap), before it reads them.
+pub fn freeze_network_settings() {
+    NETWORK_SETTINGS_FROZEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Err if a swarm has already been built ([`freeze_network_settings`]). `what` names the setting.
+pub(crate) fn refuse_if_frozen(what: &str) -> Result<(), String> {
+    if NETWORK_SETTINGS_FROZEN.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(format!("{what} must be set before the first node starts; a node is already running"));
+    }
+    Ok(())
+}
+
 /// Make this process a member of the private network keyed by `key`: every TCP connection and relay
-/// circuit is then encrypted with it under Noise (libp2p `pnet`, compatible with go-libp2p and IPFS
-/// swarm keys), so a node without the key can't complete a connection, nor relay for one. QUIC
-/// can't carry a pre-shared key, so it is off; OpenHydra's public bootstraps and relays don't have
-/// the key, so they are off too. Fails if a key was already set.
+/// circuit is then encrypted with it under Noise (libp2p `pnet`), so a node without the key can't
+/// complete a connection, nor relay for one. QUIC can't carry a pre-shared key, so it is off;
+/// OpenHydra's public bootstraps and relays don't have the key, so they are off too. Fails if a key
+/// was already set, or a swarm was already built.
 pub fn set_private_network_key(key: libp2p::pnet::PreSharedKey) -> Result<(), String> {
+    refuse_if_frozen("the private network key")?;
     PRIVATE_NETWORK_KEY.set(key).map_err(|_| "a private network key is already set".to_string())
 }
 
@@ -39,6 +65,7 @@ static PRIVATE_NETWORK_QUIC: std::sync::atomic::AtomicBool = std::sync::atomic::
 /// Refused unless a peer allowlist is set ([`crate::fence::set_allowed_peers`]) — without one, QUIC
 /// would let in anyone.
 pub fn allow_quic_on_private_network() -> Result<(), String> {
+    refuse_if_frozen("QUIC on a private network")?;
     if crate::fence::allowed_peers().is_none() {
         return Err("QUIC on a private network needs a peer allowlist (it can't carry the network key)".into());
     }
@@ -58,8 +85,10 @@ pub fn private_network_key() -> Option<libp2p::pnet::PreSharedKey> {
     PRIVATE_NETWORK_KEY.get().copied()
 }
 
-/// Parse a private-network key file: the go-libp2p / IPFS `swarm.key` format
-/// (`/key/swarm/psk/1.0.0/`, `/base16/`, then 64 hex digits). The error never quotes the file.
+/// Parse a private-network key file: `/key/swarm/psk/1.0.0/`, `/base16/`, then 64 hex digits, one
+/// per line. Only the base16 encoding is read (libp2p `pnet` reads nothing else): a go-libp2p / IPFS
+/// `swarm.key` written as `/base64/` or `/bin/` is refused, and has to be rewritten in hex first. The
+/// error never quotes the file.
 pub fn parse_private_network_key(text: &str) -> Result<libp2p::pnet::PreSharedKey, String> {
     text.parse::<libp2p::pnet::PreSharedKey>()
         .map_err(|e| format!("not a private network key ({e}); expected /key/swarm/psk/1.0.0/, /base16/, then 64 hex digits"))
@@ -74,8 +103,9 @@ pub fn new_private_network_key_file() -> String {
     libp2p::pnet::PreSharedKey::new(bytes).to_string()
 }
 
-/// A short id for `key` that is safe to show (go-libp2p's fingerprint): two nodes on the same
-/// network show the same one. Never print the key itself: its `Debug` and `Display` both show it.
+/// A short id for `key` that is safe to show (libp2p `pnet`'s fingerprint, which it computes the way
+/// go-libp2p does): two nodes on the same network show the same one. Never print the key itself:
+/// its `Debug` and `Display` both show it.
 pub fn private_network_fingerprint(key: &libp2p::pnet::PreSharedKey) -> String {
     key.fingerprint().to_string()
 }
@@ -564,6 +594,25 @@ mod tests {
         let _held = silent_sockets(&addr).await;
         drive(&mut a, Duration::from_millis(1700)).await;
         assert!(!connects(&mut a, &addr).await);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn network_settings_cant_change_once_a_swarm_is_built() {
+        // As `swarm::build_swarm` does (other tests in this process build swarms, so it may be
+        // frozen already: either way, nothing below may take).
+        freeze_network_settings();
+        let key = parse_private_network_key(&new_private_network_key_file()).unwrap();
+        assert!(set_private_network_key(key).is_err());
+        assert!(private_network_key().is_none(), "refused before anything was set");
+        assert!(crate::fence::set_allowed_peers(std::collections::HashSet::new()).is_err());
+        assert!(crate::fence::allowed_peers().is_none());
+        assert!(allow_quic_on_private_network().is_err());
+        assert!(quic_enabled(), "no key: QUIC as before");
     }
 }
 

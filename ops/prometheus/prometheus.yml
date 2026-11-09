@@ -11,15 +11,24 @@ rule_files:
 
 scrape_configs:
   # An OpenHydra gateway (`openhydra-agent serve`): its /metrics on the gateway port (16527 by
-  # default). Dashboard: ops/grafana/openhydra_gateway_dashboard.json. A gateway bound to loopback
-  # answers only requests addressed to 127.0.0.1 / localhost on its own port (DNS-rebinding
-  # protection), so scrape it as ['localhost:16527'] from the same machine: Prometheus run there,
-  # or in a container with host networking. A name such as host.docker.internal, or a tunnel or
-  # proxy on another port, is refused (403). A gateway bound to another address needs --api-key.
+  # default). Dashboard: ops/grafana/openhydra_gateway_dashboard.json.
+  #
+  # The gateway binds 127.0.0.1 by default and then answers only requests addressed to 127.0.0.1 /
+  # localhost on its own port (DNS-rebinding protection). So run Prometheus on the gateway's machine
+  # (natively, or in a container with host networking: `network_mode: host`) and scrape
+  # localhost:16527. A name such as host.docker.internal, or a tunnel or proxy on another port, is
+  # refused (403).
+  #
+  # /metrics names every model served (Device and Private ones included) and the providers that
+  # served them, so it takes the gateway's API key when it has one (`--api-key`): uncomment
+  # `authorization` and put the key in the file. A gateway bound to another address must have a key.
   - job_name: openhydra_gateway
     static_configs:
-      - targets: ['gateway:16527']
+      - targets: ['localhost:16527']
     metrics_path: /metrics
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/openhydra_gateway.key
 
   - job_name: openhydra_node
     static_configs:

@@ -405,14 +405,32 @@ pub const WEIGHT_FILE_EXTENSIONS: [&str; 6] = [".safetensors", ".gguf", ".ckpt",
 
 /// `name` without a trailing [`WEIGHT_FILE_EXTENSIONS`] entry (any case), and whether it had one.
 fn strip_weight_extension(name: &str) -> (&str, bool) {
-    for ext in WEIGHT_FILE_EXTENSIONS {
-        if let Some(cut) = name.len().checked_sub(ext.len()) {
-            if cut > 0 && name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(ext) {
-                return (&name[..cut], true);
+    // Every trailing extension goes (`x.gguf.gguf` → `x`), so a stem never itself looks like a
+    // weight file's name.
+    let mut stem = name;
+    'strip: loop {
+        for ext in WEIGHT_FILE_EXTENSIONS {
+            if let Some(cut) = stem.len().checked_sub(ext.len()) {
+                if cut > 0 && stem.is_char_boundary(cut) && stem[cut..].eq_ignore_ascii_case(ext) {
+                    stem = &stem[..cut];
+                    continue 'strip;
+                }
             }
         }
+        break;
     }
-    (name, false)
+    (stem, stem.len() < name.len())
+}
+
+/// `name` without its weight-file extension(s), when it is a plain weight file's name the network
+/// accepts as a model id (`x.safetensors` → `x`): the name a model announced before its provider
+/// started announcing the stem. `None` for anything else (a path, a name the network refuses).
+pub fn weight_file_stem(name: &str) -> Option<&str> {
+    if !is_valid_model_id(name) {
+        return None;
+    }
+    let (stem, stripped) = strip_weight_extension(name);
+    stripped.then_some(stem)
 }
 
 /// Whether `name` is a weight file's name (it ends in one of [`WEIGHT_FILE_EXTENSIONS`]), which a
@@ -815,6 +833,7 @@ mod tests {
             ("sd_xl_base_1.0.safetensors", "sd_xl_base_1.0"),
             ("dreamshaper_8.ckpt", "dreamshaper_8"),
             ("Model.SafeTensors", "Model"),
+            ("x.gguf.gguf", "x"),
             ("gemma-3-4b-it-Q4_K_M.gguf", "gemma-3-4b-it-Q4_K_M"),
             ("pytorch_model.bin", "pytorch_model"),
             ("chat.gpt", "chat.gpt"),

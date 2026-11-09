@@ -14,7 +14,7 @@ import { renderChart } from "./chart";
 import { fmtNum, fmtUptime, modelIcon, fmtSigned, CREDITS_NOTE } from "./format";
 import { displayModelName, publicName } from "./models";
 import { exportCardModal, ensureImportSection } from "./cards";
-import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter } from "./swarmbinding";
+import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter, swarmChoices } from "./swarmbinding";
 
   let sharingBusy = false;
   // `confirmed`: the caller is the share dialog, which just recorded the user's choice.
@@ -344,11 +344,14 @@ import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter } from "./swarmbin
     if (askingBinding || store.get(SWARM_BINDING_ASKED, false)) return;
     askingBinding = true;
     try {
-      ensurePolicy();
+      // The policy as it is on disk, awaited: a provisional (still loading) one shows nothing shared,
+      // and the question would then never be asked this session.
+      await policyNow();
       let owned = [];
       try { owned = (await call("list_swarms")).filter((s) => s.role === "owner"); } catch { return; }
       const shared = policy.mode === "all" ? shareActiveModels() : [...policy.models];
-      const models = modelsToAskAbout({ shared, isGlobal, bindings: scope.swarms, owned, asked: false });
+      const isPrivate = (m) => effectiveScope(m) === "private";
+      const models = modelsToAskAbout({ shared, isPrivate, bindings: scope.swarms, owned, asked: false });
       if (!models.length) return;
       const names = owned.map((s) => s.label || "Unnamed swarm");
       const back = document.createElement("div");
@@ -369,12 +372,13 @@ import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter } from "./swarmbin
         $(".cur", back).onclick = () => done("current");
         back.onclick = (e) => { if (e.target === back) done("keep"); };
       });
-      store.set(SWARM_BINDING_ASKED, true);
-      if (answer !== "current") return;
+      // Answered only once the answer took effect: a save that failed asks again next time.
+      if (answer !== "current") { store.set(SWARM_BINDING_ASKED, true); return; }
       await reloadScope();
       const before = snapScope();
       scope.swarms = bindingsAfter("current", models, owned, scope.swarms || new Map());
       if (await savePolicy(policy.mode, [...policy.models], before)) {
+        store.set(SWARM_BINDING_ASKED, true);
         toast(`${models.length} private model${models.length === 1 ? "" : "s"} limited to your current swarm${owned.length === 1 ? "" : "s"}`);
       }
     } finally {
@@ -387,12 +391,13 @@ import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter } from "./swarmbin
     ensurePolicy(); await reloadScope();
     let owned = [];
     try { owned = (await call("list_swarms")).filter((s) => s.role === "owner"); } catch {}
-    if (!owned.length) { toast("Create a swarm first (Swarms tab)"); return; }
     const bound = new Set(scope.swarms?.get(m) || []);
+    // A model still bound to a swarm that's gone gets the chooser too, so it can be unbound.
+    if (!owned.length && !bound.size) { toast("Create a swarm first (Swarms tab)"); return; }
     const CHECKED = html` checked`;
     const back = document.createElement("div");
     back.className = "cmodal-back";
-    const rows = owned.map((sw) => html`<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer"><input type="checkbox" data-pk="${sw.swarm_public_key}"${bound.has(sw.swarm_public_key) ? CHECKED : ""}/><span><b>${sw.label || "Unnamed swarm"}</b> <span class="mut mono" style="font-size:10.5px">${sw.fingerprint}</span></span></label>`);
+    const rows = swarmChoices(owned, [...bound]).map((sw) => html`<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer"><input type="checkbox" data-pk="${sw.swarm_public_key}"${sw.checked ? CHECKED : ""}/><span><b>${sw.label || "Unnamed swarm"}</b> <span class="mut mono" style="font-size:10.5px">${sw.fingerprint}</span>${sw.gone ? html` <span class="mut" style="font-size:11px">(no longer exists: nobody can use the model through it)</span>` : ""}</span></label>`);
     setHTML(back, html`<div class="cmodal"><div class="cmodal-h"><b>Which swarms can use ${displayModelName(m)}?</b></div>
       <div class="cmodal-b">
       <label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="swmode" value="all"${bound.size ? "" : CHECKED}/><span><b>Every swarm I own</b>, including ones I create later</span></label>

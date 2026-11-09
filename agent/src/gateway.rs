@@ -743,24 +743,20 @@ fn latest_ant_user_text(messages: &[AntMessage]) -> Option<String> {
     }
 }
 
-/// Query the currently-served models on a blocking thread (empty on error) — the **live** set,
-/// used for routing/`auto` resolution (never route to a model no provider currently serves).
-async fn known_models_async(state: &AppState) -> Vec<String> {
-    let node = state.node.clone();
-    tokio::task::spawn_blocking(move || node.known_models())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default()
-}
-
 /// The **browse** set for `/v1/models` and the `/models` command: the live set, smoothed by the
 /// sticky cache so a provider that briefly drops off the network (a flaky-NAT node aging out of
 /// `known_peers`) doesn't flicker out of the catalog mid-session. Routing/`auto` still use the
-/// live set (`known_models_async`), so a sticky-but-currently-unserved model resolves on-demand
+/// live set (`ConsumerNode::known_models`), so a sticky-but-currently-unserved model resolves on-demand
 /// or falls back — never routes to a dead peer.
 async fn browse_models(state: &AppState) -> Vec<String> {
-    let live = known_models_async(state).await;
+    // Only what the network announces is smoothed: this node's own provider's models and its usable
+    // cards' are known exactly, so one unshared, or whose credential expired, leaves the list at once.
+    let node = state.node.clone();
+    let (live, exact) = tokio::task::spawn_blocking(move || node.known_models_by_source())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
     let node = state.node.clone();
     // A model its last provider withdrew leaves the list at once; smoothing is for churn, not that.
     let withdrawn = tokio::task::spawn_blocking(move || node.recently_withdrawn())
@@ -768,7 +764,14 @@ async fn browse_models(state: &AppState) -> Vec<String> {
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
-    state.model_cache.merge(live, &withdrawn)
+    let mut models = state.model_cache.merge(live, &withdrawn);
+    for m in exact {
+        if !models.contains(&m) {
+            models.push(m);
+        }
+    }
+    models.sort();
+    models
 }
 
 /// Sticky browse-list cache: a model stays listed for `ttl` after it was last seen live. Decoupled
@@ -1395,6 +1398,7 @@ fn spawn_byok_worker(
                     claimed_tokens: None,
                     recount_pending: false,
                     provider: String::new(),
+                    served_model: String::new(),
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -1404,6 +1408,13 @@ fn spawn_byok_worker(
         }
     });
     (rx, started)
+}
+
+/// The model name a completion's metrics are labelled by: the name it was served under, or (for a
+/// serve that doesn't report one) the requested name. Never an arbitrary client string otherwise:
+/// metric labels are kept for the life of the process and shown on `/metrics`.
+fn served_label<'a>(summary: &'a ServeSummary, requested: &'a str) -> &'a str {
+    if summary.served_model.is_empty() { requested } else { &summary.served_model }
 }
 
 /// `stream: true` → SSE. First an assistant-role chunk, then content deltas, then a
@@ -1443,7 +1454,7 @@ fn stream_response(
                     summary.streamed,
                 );
                 let e = &summary.metrics.engine;
-                metrics.record_model(&model_s, &summary.provider, ttft, e.eval_count, e.eval_duration_ns);
+                metrics.record_model(served_label(&summary, &model_s), &summary.provider, ttft, e.eval_count, e.eval_duration_ns);
                 // Tool calls (if any) ride the final chunk's delta with finish_reason
                 // "tool_calls"; a plain completion finishes "stop" with an empty delta.
                 // (Incremental per-argument streaming of tool_calls is a later refinement —
@@ -1525,7 +1536,7 @@ async fn buffered_response(
                 summary.streamed,
             );
             let e = &summary.metrics.engine;
-            metrics.record_model(&model, &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
+            metrics.record_model(served_label(&summary, &model), &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
             Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall)))
                 .into_response()
         }
@@ -1909,10 +1920,12 @@ async fn anthropic_buffered_response(
     metrics: Arc<Metrics>,
 ) -> Response {
     let mut content = String::new();
+    let mut ttft: Option<std::time::Duration> = None;
     let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass)>> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
             GatewayEvent::Delta(t) => {
+                ttft.get_or_insert_with(|| started.elapsed());
                 if content.len() + t.len() > MAX_BUFFERED_COMPLETION_BYTES {
                     outcome = Some(Err(too_large_to_buffer()));
                     break;
@@ -1929,7 +1942,7 @@ async fn anthropic_buffered_response(
             log_completion(&summary, wall);
             metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns, summary.streamed);
             let e = &summary.metrics.engine;
-            metrics.record_model(&model, &summary.provider, None, e.eval_count, e.eval_duration_ns);
+            metrics.record_model(served_label(&summary, &model), &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
             Json(anthropic_message_object(&id, &model, &content, &summary)).into_response()
         }
         Some(Err((m, (status, _)))) => {
@@ -2027,9 +2040,12 @@ async fn anthropic_stream_worker(
     // stall — i.e. AFTER `message_start` (canonical + SDK-safe); `biased` makes a ready frame win, so
     // pings never appear once tokens are flowing.
     let mut ev = first;
+    // Time to the first token, for the per-model metrics (the chat endpoint records the same).
+    let mut ttft: Option<std::time::Duration> = None;
     'drain: loop {
         match ev {
             GatewayEvent::Delta(t) => {
+                ttft.get_or_insert_with(|| started.elapsed());
                 if out.send((
                     "content_block_delta",
                     json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } }),
@@ -2042,7 +2058,7 @@ async fn anthropic_stream_worker(
                 log_completion(&summary, wall);
                 metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns, summary.streamed);
                 let e = &summary.metrics.engine;
-                metrics.record_model(&model, &summary.provider, None, e.eval_count, e.eval_duration_ns);
+                metrics.record_model(served_label(&summary, &model), &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
                 if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 }))).await.is_err() {
                     return;
                 }
@@ -2412,6 +2428,8 @@ pub fn router(
     byok: ByokConfig,
     embeddings_cfg: EmbeddingConfig,
     self_provider: Option<String>,
+    // Whether only this machine can reach the gateway (it is bound to loopback).
+    loopback_only: bool,
     cards: Option<Arc<crate::cards::CardStore>>,
     seeds: Option<Arc<crate::seed_list::SeedStore>>,
     creds: Option<Arc<crate::swarms::CredentialStore>>,
@@ -2447,6 +2465,9 @@ pub fn router(
     let node = node
         .with_stats(stats)
         .with_self_provider(self_provider)
+        // Our own provider's Device and Private models are for this machine; a gateway other
+        // machines reach doesn't list or route them (its callers aren't this machine).
+        .with_own_models(loopback_only)
         .with_cards(cards)
         .with_seeds(seeds)
         .with_credentials(creds)
@@ -2507,10 +2528,12 @@ pub fn router(
         sessions: Arc::new(SessionModels::new(slash::DEFAULT_SESSION_TTL)),
         model_cache: Arc::new(ModelStickyCache::new(MODEL_STICKY_TTL)),
     };
-    // The `/v1/*` routes are auth-gated then rate-limited; `/health` and `/metrics` stay open
-    // for liveness probes and Prometheus scraping. `route_layer`s run outermost-last, so
-    // adding `rate_limit` first and `require_api_key` last makes auth run *before* the
-    // limiter — the limiter can then key off the validated API key.
+    // The `/v1/*` routes are auth-gated then rate-limited; `/health` stays open for liveness
+    // probes. `route_layer`s run outermost-last, so adding `rate_limit` first and
+    // `require_api_key` last makes auth run *before* the limiter — the limiter can then key off
+    // the validated API key. `/metrics` takes the same API key (Prometheus sends it with
+    // `authorization: credentials_file`): it names every model served — this machine's Device and
+    // Private ones included — and the providers that served them.
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
@@ -2518,9 +2541,12 @@ pub fn router(
         .route("/v1/models", get(list_models))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+    let metrics = Router::new()
+        .route("/metrics", get(metrics_endpoint))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(metrics_endpoint))
+        .merge(metrics)
         .merge(v1)
         .with_state(state)
 }
@@ -2585,7 +2611,10 @@ pub fn serve_http(
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local = listener.local_addr()?;
-        let mut app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, seeds, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, audit_replay, assurance);
+        if !local.ip().is_loopback() && self_provider.is_some() {
+            tracing::warn!(%local, "this gateway is reachable from other machines: its own provider's Device and Private models are not listed or routed here (bind it to 127.0.0.1 to use them)");
+        }
+        let mut app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, local.ip().is_loopback(), cards, seeds, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, audit_replay, assurance);
         // A loopback-only gateway answers only requests addressed to loopback (DNS rebinding:
         // a web page can point its own host name at 127.0.0.1, but not change the Host header the
         // browser sends). A gateway bound to a LAN/public address is reached by other names, so it
@@ -2675,6 +2704,7 @@ mod tests {
             claimed_tokens: None,
             recount_pending: false,
             provider: String::new(),
+            served_model: String::new(),
         }
     }
 
@@ -2750,6 +2780,7 @@ mod tests {
             ByokConfig::empty(),
             EmbeddingConfig::empty(),
             None,
+            true,
             None,
             None,
             None,
@@ -2770,10 +2801,15 @@ mod tests {
 
     /// The status line of `GET /v1/models` with `headers` (each "Name: value").
     async fn models_status(port: u16, headers: &[&str]) -> String {
+        get_status(port, "/v1/models", headers).await
+    }
+
+    /// The status line of `GET path` with `headers` (each "Name: value").
+    async fn get_status(port: u16, path: &str, headers: &[&str]) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
-        s.write_all(format!("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra}Connection: close\r\n\r\n").as_bytes())
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra}Connection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let mut out = String::new();
@@ -2789,6 +2825,11 @@ mod tests {
         assert!(models_status(port, &["Authorization: Bearer oh-local"]).await.contains(" 401 "), "the old placeholder");
         assert!(models_status(port, &[&format!("Authorization: Bearer {key}")]).await.contains(" 200 "));
         assert!(models_status(port, &[&format!("x-api-key: {key}")]).await.contains(" 200 "), "Anthropic-style header");
+        // `/metrics` names the models served and who served them: it takes the key too.
+        assert!(get_status(port, "/metrics", &[]).await.contains(" 401 "), "metrics without the key");
+        assert!(get_status(port, "/metrics", &[&format!("Authorization: Bearer {key}")]).await.contains(" 200 "));
+        // Liveness stays open.
+        assert!(get_status(port, "/health", &[]).await.contains(" 200 "));
     }
 
     #[tokio::test]

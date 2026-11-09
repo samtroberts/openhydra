@@ -118,7 +118,8 @@ struct NodeArgs {
     #[arg(long = "allow-peers-file")]
     allow_peers_file: Option<std::path::PathBuf>,
 
-    /// Join the private network keyed by this file (a go-libp2p / IPFS `swarm.key`; make one with
+    /// Join the private network keyed by this file (a `swarm.key` in the `/base16/` encoding, as
+    /// go-libp2p / IPFS write it; their `/base64/` and `/bin/` keys aren't read. Make one with
     /// `openhydra-agent network-key --out <file>`). Every TCP connection and relay circuit is
     /// encrypted with the key, so a node without it can't connect or relay at all. QUIC is off (it
     /// can't carry the key; see `--private-network-quic`), and so are OpenHydra's public bootstraps
@@ -266,7 +267,9 @@ enum Role {
     /// See `registry init`. No swarm.
     Registry(registry_cli::RegistryArgs),
     /// Write a new private-network key file for a private deployment (every node then runs with
-    /// `--private-network-key-file <file>`). Readable by you only; never overwrites a file. No swarm.
+    /// `--private-network-key-file <file>`). Never overwrites a file. On macOS and Linux it is readable
+    /// by you only; on Windows it takes its folder's permissions, so keep it in a folder only you can
+    /// read. No swarm.
     NetworkKey(NetworkKeyArgs),
 }
 
@@ -456,6 +459,10 @@ struct SwarmForgetArgs {
     /// or checked for it again and every member's access ends.
     #[arg(long)]
     yes: bool,
+    /// The share-policy file, to name the models still bound to a swarm you own once it is gone
+    /// (they stay bound, and so are served to nobody, until you change their swarms).
+    #[arg(long = "share-policy-file")]
+    share_policy_file: Option<PathBuf>,
     #[command(flatten)]
     dir: SwarmDirArg,
 }
@@ -1423,7 +1430,7 @@ fn run() -> Result<(), String> {
                 SwarmAction::Forget(a) => {
                     let dir = resolve_dir(a.dir.swarms_dir);
                     let pk = a.swarm.trim();
-                    match openhydra_agent::swarms::read_swarm(&dir, pk)? {
+                    let owned = match openhydra_agent::swarms::read_swarm(&dir, pk)? {
                         None => return Err(format!("no swarm {pk} in {}", dir.display()).into()),
                         Some(rec) if rec.role == openhydra_agent::swarms::SwarmRole::Owner && !a.yes => {
                             return Err(format!(
@@ -1432,10 +1439,34 @@ fn run() -> Result<(), String> {
                             )
                             .into())
                         }
-                        Some(_) => {}
-                    }
+                        Some(rec) => rec.role == openhydra_agent::swarms::SwarmRole::Owner,
+                    };
                     openhydra_agent::swarms::forget_swarm(&dir, pk)?;
                     println!("forgot swarm {pk}");
+                    if owned {
+                        // A model bound to it stays bound (dropping the binding could open the model
+                        // to every swarm): say which, so the user isn't left wondering why nobody can
+                        // use them.
+                        let key = pk.to_ascii_lowercase();
+                        let bound: Vec<String> = a
+                            .share_policy_file
+                            .as_deref()
+                            .and_then(|p| openhydra_agent::share_policy::SharePolicy::load(p).ok())
+                            .map(|p| p.swarms.iter().filter(|(_, s)| s.contains(&key)).map(|(m, _)| m.clone()).collect())
+                            .unwrap_or_default();
+                        if !bound.is_empty() {
+                            eprintln!(
+                                "openhydra-agent: still bound to the forgotten swarm (served to nobody through it until you change \
+                                 their swarms): {}",
+                                bound.join(", ")
+                            );
+                        } else if a.share_policy_file.is_none() {
+                            eprintln!(
+                                "openhydra-agent: a model bound to this swarm stays bound to it, and is served to nobody through it, \
+                                 until you change its swarms (pass --share-policy-file to list them)"
+                            );
+                        }
+                    }
                 }
                 SwarmAction::RemoteScope(a) => {
                     use openhydra_network::identity::Identity;

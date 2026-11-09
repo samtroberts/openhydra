@@ -119,8 +119,11 @@ impl Transport for FenceTransport {
 static ALLOWED_PEERS: std::sync::OnceLock<HashSet<PeerId>> = std::sync::OnceLock::new();
 
 /// Allow connections with `peers` only, for every node this process starts afterwards. Set once,
-/// before the first node starts (like `node::disable_mdns`); a second call is an error.
+/// before the first node starts (like `node::disable_mdns`); a second call is an error, and so is a
+/// call after a swarm was built ([`crate::transport::freeze_network_settings`]): that swarm decided
+/// whether to run QUIC without it.
 pub fn set_allowed_peers(peers: HashSet<PeerId>) -> Result<(), String> {
+    crate::transport::refuse_if_frozen("the peer allowlist")?;
     ALLOWED_PEERS.set(peers).map_err(|_| "the peer allowlist is already set".to_string())
 }
 

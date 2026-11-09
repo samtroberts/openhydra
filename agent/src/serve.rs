@@ -532,6 +532,10 @@ pub struct ServeSummary {
     /// Consumer-side: the provider that served (its libp2p id), for per-provider metrics. Empty
     /// provider-side.
     pub provider: String,
+    /// Consumer-side: the name the model was served under (the announced name: an old weight-file
+    /// name the client asked for resolves to its stem). Metrics label by this, never by whatever
+    /// string the client sent. Empty provider-side.
+    pub served_model: String,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -562,6 +566,7 @@ pub fn handle_serve_request(
                 claimed_tokens: None,
                 recount_pending: false,
                 provider: String::new(),
+                served_model: String::new(),
             };
         }
     };
@@ -711,6 +716,7 @@ pub fn handle_serve_request_watched(
                 claimed_tokens: None,
                 recount_pending: false,
                 provider: String::new(),
+                served_model: String::new(),
             }
         }
         Err(e) => {
@@ -728,6 +734,8 @@ pub fn handle_serve_request_watched(
                 recount_pending: false,
 
                 provider: String::new(),
+
+                served_model: String::new(),
             }
         }
     }

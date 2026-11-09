@@ -55,6 +55,10 @@ fn a_peer_off_the_allowlist_cannot_reach_a_listed_one() {
     let (a_id, b_id) = (id("a"), id("b"));
     let _c_id = id("c");
     openhydra_network::fence::set_allowed_peers(HashSet::from([a_id, b_id])).unwrap();
+    // A fenced node given no bootstrap isn't sent to OpenHydra's public ones (the allowlist would
+    // refuse them): it doesn't count as on the public network.
+    let unbootstrapped = NodeConfig { bootstrap_peers: Vec::new(), ..NodeConfig::default() };
+    assert!(!openhydra_network::node::joins_public_network(&unbootstrapped));
 
     let a_port = free_port();
     let a = node(dir.path(), "a", a_port, None);

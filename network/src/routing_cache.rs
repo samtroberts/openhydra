@@ -44,15 +44,39 @@ const MAX_ADDRS_PER_NODE: usize = 4;
 /// Derive the routing-cache path from the identity-key path: a sibling
 /// `routing_cache.json`. Keeping it next to the identity ties the cache to the
 /// node's own data dir without introducing a new config knob. A private
-/// deployment (`private`: no OpenHydra relays) keeps its own,
-/// `routing_cache.private.json`, so it never dials the public peers a node
+/// deployment (`private_scope`: which one, see [`private_scope`]) keeps its own,
+/// `routing_cache.<scope>.json`, so it never dials the public peers a node
 /// remembers from the public network, and going back keeps those (review
-/// 2026-10-14, M1).
-pub fn cache_path_for(identity_path: &Path, private: bool) -> PathBuf {
-    let name = if private { "routing_cache.private.json" } else { "routing_cache.json" };
+/// 2026-10-14, M1); and one deployment's never dials another's, which a single
+/// `routing_cache.private.json` for them all did when a node moved between them.
+pub fn cache_path_for(identity_path: &Path, private_scope: Option<&str>) -> PathBuf {
+    let name = match private_scope {
+        Some(scope) => format!("routing_cache.{scope}.json"),
+        None => "routing_cache.json".to_string(),
+    };
     match identity_path.parent() {
         Some(dir) => dir.join(name),
         None => PathBuf::from(name),
+    }
+}
+
+/// Which private deployment a routing cache belongs to, safe as part of a file name: on a private
+/// network (a network key), the first 16 hex digits of the key's fingerprint, never the key; else
+/// the network id ([`crate::relay::network_id`]: a hash of its bootstraps, or its own name). The key
+/// comes first because it is what decides who can be reached: two deployments can't share one, and
+/// a node given one deployment's key can't use the other's peers whatever its bootstraps.
+pub fn private_scope(network_id: &str, key_fingerprint: Option<&str>) -> String {
+    match key_fingerprint {
+        Some(fp) => {
+            let short: String = fp.chars().filter(char::is_ascii_hexdigit).take(16).collect();
+            format!("private-key-{short}")
+        }
+        // Network ids are hex or a checked name (letters, digits, `.`, `_`, `-`) already; anything
+        // else is replaced, so no id can name another directory (with no `/`, `..` can't).
+        None => network_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+            .collect(),
     }
 }
 
@@ -141,11 +165,30 @@ mod tests {
 
     #[test]
     fn test_cache_path_sibling_of_identity() {
-        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), false);
+        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), None);
         assert_eq!(p, PathBuf::from("/opt/openhydra/routing_cache.json"));
         // A private deployment keeps its own.
-        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), true);
-        assert_eq!(p, PathBuf::from("/opt/openhydra/routing_cache.private.json"));
+        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), Some("private-0123456789abcdef"));
+        assert_eq!(p, PathBuf::from("/opt/openhydra/routing_cache.private-0123456789abcdef.json"));
+    }
+
+    #[test]
+    fn each_private_deployment_keeps_its_own_cache() {
+        let key = |text: &str| crate::transport::private_network_fingerprint(&crate::transport::parse_private_network_key(text).unwrap());
+        let (a, b) = (key(&crate::transport::new_private_network_key_file()), key(&crate::transport::new_private_network_key_file()));
+        // Keyed: by the key's fingerprint, whatever the network id; another key, another file.
+        let sa = private_scope("private-0123456789abcdef", Some(&a));
+        assert_eq!(sa, format!("private-key-{}", &a[..16]));
+        assert_eq!(sa, private_scope("private-name-lab", Some(&a)));
+        assert_ne!(sa, private_scope("private-0123456789abcdef", Some(&b)));
+        // Unkeyed: by the network id.
+        assert_eq!(private_scope("private-0123456789abcdef", None), "private-0123456789abcdef");
+        assert_ne!(private_scope("private-0123456789abcdef", None), private_scope("private-fedcba9876543210", None));
+        assert_eq!(private_scope("private-name-acme-lab.1", None), "private-name-acme-lab.1");
+        // Never a path, whatever it is given.
+        assert_eq!(private_scope("../x/y", None), ".._x_y");
+        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), Some(&private_scope("../../etc", None)));
+        assert_eq!(p.parent(), Some(Path::new("/opt/openhydra")));
     }
 
     #[test]

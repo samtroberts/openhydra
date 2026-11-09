@@ -102,7 +102,7 @@ fn only_nodes_with_the_network_key_can_connect() {
     let key = transport::parse_private_network_key(&file).unwrap();
     transport::set_private_network_key(key).unwrap();
     assert!(transport::set_private_network_key(key).is_err(), "set once");
-    assert!(!format!("{}", transport::private_network_fingerprint(&key)).contains(file.lines().nth(2).unwrap()));
+    assert!(!transport::private_network_fingerprint(&key).contains(file.lines().nth(2).unwrap()));
 
     let dir = tempfile::tempdir().unwrap();
     let a_id = Identity::load_or_create(&dir.path().join("a.key")).unwrap().libp2p_peer_id;
@@ -115,6 +115,8 @@ fn only_nodes_with_the_network_key_can_connect() {
         None,
     );
     let a_addr = format!("/ip4/127.0.0.1/tcp/{a_port}/p2p/{a_id}");
+    // A node is running: the network settings can't change under it any more.
+    assert!(openhydra_network::fence::set_allowed_peers(std::collections::HashSet::new()).is_err(), "too late for an allowlist");
     let b = node(dir.path(), "b", vec![format!("/ip4/127.0.0.1/tcp/{}", free_port())], Some(a_addr.clone()));
     let a_id = a_id.to_base58();
 

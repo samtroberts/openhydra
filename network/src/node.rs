@@ -141,6 +141,11 @@ pub fn start_node(
     }
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
     let mut bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
+    if bootstrap_peers.is_empty() && fenced_without_bootstraps(config) {
+        // Not OpenHydra's public bootstraps: the allowlist would refuse every one of them, and the
+        // node would sit there with no clear reason why.
+        info!("peer allowlist set and no --bootstrap given: not using OpenHydra's public bootstraps (a fenced node only reaches the peers it is given; pass --bootstrap)");
+    }
     // SL5: given none (a fresh CLI install), start from OpenHydra's own on the public network.
     if bootstrap_peers.is_empty() {
         let defaults = crate::relay::default_bootstraps(public_relays);
@@ -185,7 +190,13 @@ pub fn start_node(
     // event loop.
     // Kept apart for a private deployment: a node that was once on the public network must not dial
     // the public peers it remembers (M1).
-    let routing_cache_path = Some(crate::routing_cache::cache_path_for(&config.identity_path, !public_network));
+    // Each private deployment keeps its own too (by its network key, else its network id), so a node
+    // moved from one to another doesn't dial the first one's peers.
+    let private_scope = (!public_network).then(|| {
+        let fingerprint = crate::transport::private_network_key().map(|k| crate::transport::private_network_fingerprint(&k));
+        crate::routing_cache::private_scope(&network_id, fingerprint.as_deref())
+    });
+    let routing_cache_path = Some(crate::routing_cache::cache_path_for(&config.identity_path, private_scope.as_deref()));
 
     // Create the command channel.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(256);
@@ -278,13 +289,21 @@ pub fn joins_public_network(config: &NodeConfig) -> bool {
 }
 
 /// `config.public_relays`, or `Off` on a private network (a pre-shared key is set), whose key
-/// OpenHydra's public bootstraps and relays don't have.
+/// OpenHydra's public bootstraps and relays don't have; `Off` too for a node with a peer allowlist
+/// and no bootstraps ([`fenced_without_bootstraps`]).
 fn effective_public_relays(config: &NodeConfig) -> crate::relay::PublicRelays {
-    if crate::transport::private_network_key().is_some() {
+    if crate::transport::private_network_key().is_some() || fenced_without_bootstraps(config) {
         crate::relay::PublicRelays::Off
     } else {
         config.public_relays
     }
+}
+
+/// A peer allowlist is set ([`crate::fence::set_allowed_peers`]) and `config` names no bootstrap. The
+/// node then reaches only the peers it is given: OpenHydra's public bootstraps and relays aren't
+/// filled in (the allowlist would refuse them), and it doesn't count as on the public network.
+fn fenced_without_bootstraps(config: &NodeConfig) -> bool {
+    crate::fence::allowed_peers().is_some() && config.bootstrap_peers.is_empty()
 }
 
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.

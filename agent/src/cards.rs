@@ -66,12 +66,6 @@ pub fn build_card(
     card
 }
 
-/// Run the `card export` subcommand: load the identity, detect `model` locally, run the reach gate,
-/// then build + sign the card. Two modes: a PUBLIC card (no `--swarm`) requires the model to be
-/// Global + consented; a PRIVATE card (`--swarm <pk>`, M4) requires the model to be shared with reach
-/// Private and the node to OWN that swarm (`--swarms-dir`), so the card names the swarm its provider
-/// gates on. `now_ms` is injected (no hidden clock).
-#[allow(clippy::too_many_arguments)]
 /// A model bound to some swarms is served only to them, so a card for any other swarm would point
 /// its members at a refusal.
 fn card_swarm_allowed(
@@ -89,6 +83,12 @@ fn card_swarm_allowed(
     }
 }
 
+/// Run the `card export` subcommand: load the identity, detect `model` locally, run the reach gate,
+/// then build + sign the card. Two modes: a PUBLIC card (no `--swarm`) requires the model to be
+/// Global + consented; a PRIVATE card (`--swarm <pk>`, M4) requires the model to be shared with reach
+/// Private and the node to OWN that swarm (`--swarms-dir`), so the card names the swarm its provider
+/// gates on. `now_ms` is injected (no hidden clock).
+#[allow(clippy::too_many_arguments)]
 pub fn run_export(
     model: &str,
     share_policy_file: Option<PathBuf>,
@@ -123,8 +123,11 @@ pub fn run_export(
     let id = openhydra_network::identity::Identity::load_or_create(identity_path)
         .map_err(|e| format!("load identity: {e}"))?;
 
-    // Detect the model on a local engine (fast localhost probes; no swarm).
-    let engines = crate::detect::detect_engines();
+    // Detect the model on a local engine (fast localhost probes; no swarm). Models of the built-in
+    // engine, when the caller describes some, are the only ones: the provider running that engine
+    // serves only them (and names them among themselves), and a same-named model on another engine
+    // running here must not lend the card its weights.
+    let engines = if built_in.is_empty() { crate::detect::detect_engines() } else { Vec::new() };
     let all: Vec<&DetectedModel> = engines.iter().flat_map(|e| &e.models).chain(built_in.iter()).collect();
     // The name the provider announces each model under: assigned over every detected model, as its
     // announce pass does. `--model` may be either name (a ComfyUI checkpoint's file name, or the stem
@@ -191,38 +194,91 @@ pub fn run_export(
 /// The file extension the desktop app opens cards from (a double-click on one imports it).
 pub const CARD_FILE_EXTENSION: &str = "openhydra";
 
-/// Save `card` as a `.openhydra` file at `path`, adding the extension when `path` has none, and
-/// return where it was written. The file holds the card's JSON, which is what the app opens and
-/// `card import --file` reads. The card is verified first (signature, expiry, privacy, schema), so a
-/// file is never written for a card nobody could import. An existing file is replaced only with
-/// `overwrite` (a save dialog asks first; the command line asks for `--force`).
-pub fn write_card_file(path: &Path, card: &Card, overwrite: bool, now_ms: u64) -> Result<PathBuf, String> {
-    verify_card(card, now_ms).map_err(|e| format!("not saving an invalid card: {e}"))?;
-    let path = if path.extension().is_some() { path.to_path_buf() } else { path.with_extension(CARD_FILE_EXTENSION) };
-    let json = card.to_json().map_err(|e| e.to_string())?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true);
-    if overwrite {
-        opts.create(true).truncate(true);
+/// `path` ending in `.openhydra`: as given when it already does, otherwise with the extension added
+/// after the whole name (`Qwen2.5-7B` → `Qwen2.5-7B.openhydra`, not `Qwen2.openhydra`).
+pub fn card_file_path(path: &Path) -> PathBuf {
+    let has_ext = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(CARD_FILE_EXTENSION));
+    if has_ext {
+        path.to_path_buf()
     } else {
-        opts.create_new(true);
+        let mut p = path.as_os_str().to_owned();
+        p.push(".");
+        p.push(CARD_FILE_EXTENSION);
+        PathBuf::from(p)
     }
-    let mut file = opts.open(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            format!("{} already exists (pass --force to replace it)", path.display())
-        } else {
-            format!("{}: {e}", path.display())
-        }
-    })?;
-    use std::io::Write;
-    file.write_all(json.as_bytes()).and_then(|_| file.write_all(b"\n")).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(path)
 }
 
-/// A file name for `model`'s card: the model name with anything a file system dislikes replaced,
-/// and the `.openhydra` extension (e.g. `Qwen/Qwen2.5-7B-Instruct` → `Qwen-Qwen2.5-7B-Instruct.openhydra`).
+/// Save `card` as a `.openhydra` file at `path` (the extension added when it isn't there, see
+/// [`card_file_path`]), and return where it was written. The file holds the card's JSON, which is
+/// what the app opens and `card import --file` reads. The card is verified first (signature, expiry,
+/// privacy, schema), so a file is never written for a card nobody could import.
+///
+/// An existing file is replaced only with `overwrite` (a save dialog asks first; the command line
+/// asks for `--force`), and only when it is itself a card: `--force` with a mistyped path must not
+/// destroy a key or a document. A link is never followed. The new file is written beside the old one
+/// and renamed over it, so a failed write leaves the old card whole.
+pub fn write_card_file(path: &Path, card: &Card, overwrite: bool, now_ms: u64) -> Result<PathBuf, String> {
+    verify_card(card, now_ms).map_err(|e| format!("not saving an invalid card: {e}"))?;
+    let path = card_file_path(path);
+    let shown = path.display();
+    let json = card.to_json().map_err(|e| e.to_string())?;
+    let mut body = json.into_bytes();
+    body.push(b'\n');
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A new file: never replaces anything that appears meanwhile.
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("{shown} already exists (pass --force to replace it)")
+                } else {
+                    format!("{shown}: {e}")
+                }
+            })?;
+            use std::io::Write;
+            if let Err(e) = file.write_all(&body) {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("{shown}: {e}"));
+            }
+            Ok(path)
+        }
+        Err(e) => Err(format!("{shown}: {e}")),
+        Ok(_) if !overwrite => Err(format!("{shown} already exists (pass --force to replace it)")),
+        Ok(meta) if !meta.file_type().is_file() => {
+            Err(format!("{shown} is not a regular file (a link or a folder); not replacing it"))
+        }
+        Ok(_) => {
+            let old = std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))?;
+            let is_card = std::str::from_utf8(&old).ok().is_some_and(|t| Card::from_json(t.trim()).is_ok());
+            if !is_card {
+                return Err(format!("{shown} exists and is not a card; not replacing it"));
+            }
+            // Beside it (so the rename stays on one file system), under a name nothing else uses.
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let mut tmp_name = path.file_name().unwrap_or_default().to_owned();
+            tmp_name.push(format!(".{}-{nanos}.tmp", std::process::id()));
+            let tmp = path.with_file_name(tmp_name);
+            let written = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(&body)?;
+                f.sync_all()
+            });
+            if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, &path)) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("{shown}: {e}"));
+            }
+            Ok(path)
+        }
+    }
+}
+
+/// A file name for `model`'s card: the name the model is announced under (so an engine's path, e.g.
+/// llama.cpp's `/Users/alice/models/x.gguf`, leaves only `x`: no folder or user name travels with
+/// the file) with anything a file system dislikes replaced, and the `.openhydra` extension (e.g.
+/// `Qwen/Qwen2.5-7B-Instruct` → `Qwen-Qwen2.5-7B-Instruct.openhydra`).
 pub fn card_file_name(model: &str) -> String {
-    let stem: String = model
+    let public = openhydra_protocol::model_id::public_model_id(model);
+    let stem: String = public
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
         .collect();
@@ -578,6 +634,29 @@ mod tests {
         let err = write_card_file(&written, &card, false, 1_000).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
         assert!(write_card_file(&written, &card, true, 1_000).is_ok(), "replaced when asked");
+        assert_eq!(parse_and_verify(&std::fs::read_to_string(&written).unwrap(), 1_000).unwrap().card, card);
+        // A dotted name keeps its whole name and still gets the extension.
+        let dotted = write_card_file(&dir.path().join("Qwen2.5-7B"), &card, false, 1_000).unwrap();
+        assert_eq!(dotted, dir.path().join("Qwen2.5-7B.openhydra"));
+        assert_eq!(write_card_file(&dir.path().join("x.OPENHYDRA"), &card, false, 1_000).unwrap(), dir.path().join("x.OPENHYDRA"));
+        // `--force` never replaces a file that isn't a card (a mistyped path to a key), nor a link.
+        let key = dir.path().join("id.key.openhydra");
+        std::fs::write(&key, b"not a card").unwrap();
+        let err = write_card_file(&key, &card, true, 1_000).unwrap_err();
+        assert!(err.contains("not a card"), "{err}");
+        assert_eq!(std::fs::read(&key).unwrap(), b"not a card");
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("elsewhere");
+            std::fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.openhydra");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(write_card_file(&link, &card, true, 1_000).is_err(), "a link is not followed");
+            assert!(write_card_file(&link, &card, false, 1_000).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        }
+        // No temporary file is left behind.
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
         // A tampered or expired card is not saved.
         let mut tampered = card.clone();
         tampered.model_id = "qwen3:8b".into();
@@ -592,6 +671,9 @@ mod tests {
         assert_eq!(card_file_name("Qwen/Qwen2.5-7B-Instruct"), "Qwen-Qwen2.5-7B-Instruct.openhydra");
         assert_eq!(card_file_name("qwen3:1.7b"), "qwen3-1.7b.openhydra");
         assert_eq!(card_file_name("///"), "model.openhydra");
+        // An engine's path leaves only the model's own name: no folder or user name in the file name.
+        assert_eq!(card_file_name("/Users/alice/models/Qwen3.5-9B-Q4_K_M.gguf"), "Qwen3.5-9B-Q4_K_M.openhydra");
+        assert_eq!(card_file_name("v1-5-pruned-emaonly-fp16.safetensors"), "v1-5-pruned-emaonly-fp16.openhydra");
     }
 
     /// A ComfyUI checkpoint is carded under its stem; the verifier stays as strict as ever (a card

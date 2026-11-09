@@ -19,5 +19,5 @@ It prints a JSON summary:
 It exits 1 when the p95 misses `--ttft-p95-target`, or when any request failed (unless
 `--allow-errors`).
 
-The gateway's own view is at `/metrics`. Besides the existing request histograms, it now has
+The gateway's own view is at `/metrics` (send the gateway's API key when it has one). Besides the existing request histograms, it now has
 `openhydra_time_to_first_token_seconds` and `openhydra_decode_tokens_per_second`, each by model.

@@ -1585,7 +1585,9 @@ fn save_card_file(app: tauri::AppHandle, model: String, card: openhydra_agent::C
         .dialog()
         .file()
         .set_title("Save OpenHydra card")
-        .set_file_name(openhydra_agent::cards::card_file_name(&model))
+        // Named after the model the card is for (its announced name, never an engine's file path:
+        // the file name travels with the file). `model` is only the fallback.
+        .set_file_name(openhydra_agent::cards::card_file_name(if card.model_id.is_empty() { &model } else { &card.model_id }))
         .add_filter("OpenHydra card", &[openhydra_agent::cards::CARD_FILE_EXTENSION]);
     if let Some(w) = app.get_webview_window("main") {
         d = d.set_parent(&w);
@@ -1596,7 +1598,11 @@ fn save_card_file(app: tauri::AppHandle, model: String, card: openhydra_agent::C
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let written = openhydra_agent::cards::write_card_file(&path, &card, true, now_ms)?;
+    // The dialog asked before replacing the path it returned. When the extension had to be added
+    // (some Linux dialogs return the name as typed) the final path is one it never asked about, so
+    // an existing file there is kept.
+    let confirmed = openhydra_agent::cards::card_file_path(&path) == path;
+    let written = openhydra_agent::cards::write_card_file(&path, &card, confirmed, now_ms)?;
     Ok(Some(written.display().to_string()))
 }
 
@@ -2114,7 +2120,7 @@ fn forget_swarm(app: tauri::AppHandle, swarm_public_key: String) -> Result<(), S
         native_confirm(
             &app,
             "Delete swarm?",
-            &format!("Delete “{label}”? This destroys its group key: you can't issue any more credentials for it (existing members keep theirs until they expire)."),
+            &format!("Delete “{label}”? This destroys its group key: you can't issue any more credentials for it (existing members keep theirs until they expire). A model limited to this swarm stays limited to it, so nobody can use it until you change its swarms."),
             "Delete",
         )
     } else {

@@ -34,6 +34,28 @@ const SPEED_BUCKETS: &[f64] = &[5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0];
 /// without bound.
 const MAX_MODEL_SERIES: usize = 256;
 
+/// A pair with no completion for this long gives up its series to a new pair when the registry is
+/// full (provider ids change from run to run; a long-running gateway would otherwise count every
+/// provider that joined after the first 256 pairs as `other`). Prometheus reads the dropped
+/// series' disappearance as a counter reset, which `rate()` handles.
+const SERIES_IDLE_SECS: u64 = 3_600;
+
+/// Label values longer than this are cut (at a character boundary): a model name is a short
+/// identifier, and every series repeats its labels on each of its ~27 lines.
+const MAX_LABEL_BYTES: usize = 128;
+
+/// `v` cut to at most [`MAX_LABEL_BYTES`], at a character boundary.
+fn bounded_label(v: &str) -> &str {
+    if v.len() <= MAX_LABEL_BYTES {
+        return v;
+    }
+    let mut end = MAX_LABEL_BYTES;
+    while !v.is_char_boundary(end) {
+        end -= 1;
+    }
+    &v[..end]
+}
+
 /// A Prometheus label value with `\`, `"` and line breaks escaped (model names come from clients).
 fn label_value(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
@@ -43,6 +65,8 @@ fn label_value(v: &str) -> String {
 struct ModelTimings {
     ttft: Histogram,
     decode_speed: Histogram,
+    /// When this pair last completed (seconds since the registry was made).
+    last_used_secs: u64,
 }
 
 /// A fixed-bucket cumulative histogram backed by atomics. `counts[i]` holds the number of
@@ -120,6 +144,8 @@ pub struct Metrics {
     stream_first_ack: Histogram,
     /// Time to first token and decode speed, per (model, provider) ([`MAX_MODEL_SERIES`] at most).
     per_model: std::sync::Mutex<std::collections::BTreeMap<(String, String), ModelTimings>>,
+    /// The registry's epoch, for [`ModelTimings::last_used_secs`].
+    started: std::time::Instant,
 }
 
 impl Default for Metrics {
@@ -142,6 +168,7 @@ impl Metrics {
             proxy_roundtrip: Histogram::new(LATENCY_BUCKETS),
             stream_first_ack: Histogram::new(LATENCY_BUCKETS),
             per_model: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -178,14 +205,38 @@ impl Metrics {
     /// speed (when the engine reported enough tokens over enough time to mean anything: at least 2
     /// tokens over at least 1 ms). Sum the series over `provider` for a model's figures.
     pub fn record_model(&self, model: &str, provider: &str, ttft: Option<Duration>, eval_count: u64, eval_duration_ns: u64) {
+        self.record_model_at(self.started.elapsed().as_secs(), model, provider, ttft, eval_count, eval_duration_ns);
+    }
+
+    /// [`record_model`](Self::record_model) at `now_secs` (since the registry was made).
+    fn record_model_at(&self, now_secs: u64, model: &str, provider: &str, ttft: Option<Duration>, eval_count: u64, eval_duration_ns: u64) {
         let mut m = self.per_model.lock().unwrap_or_else(|e| e.into_inner());
         let provider = if provider.is_empty() { "local" } else { provider };
-        let key = (model.to_string(), provider.to_string());
-        let key = if m.contains_key(&key) || m.len() < MAX_MODEL_SERIES { key } else { ("other".into(), "other".into()) };
+        let key = (bounded_label(model).to_string(), bounded_label(provider).to_string());
+        let key = if m.contains_key(&key) || m.len() < MAX_MODEL_SERIES {
+            key
+        } else {
+            // Full: the pair idle longest gives up its series, if it has been idle long enough.
+            let idle = m
+                .iter()
+                .filter(|(k, _)| k.0 != "other" || k.1 != "other")
+                .min_by_key(|(_, t)| t.last_used_secs)
+                .filter(|(_, t)| now_secs.saturating_sub(t.last_used_secs) >= SERIES_IDLE_SECS)
+                .map(|(k, _)| k.clone());
+            match idle {
+                Some(old) => {
+                    m.remove(&old);
+                    key
+                }
+                None => ("other".into(), "other".into()),
+            }
+        };
         let t = m.entry(key).or_insert_with(|| ModelTimings {
             ttft: Histogram::new(LATENCY_BUCKETS),
             decode_speed: Histogram::new(SPEED_BUCKETS),
+            last_used_secs: now_secs,
         });
+        t.last_used_secs = now_secs;
         if let Some(ttft) = ttft {
             t.ttft.observe(ttft.as_secs_f64());
         }
@@ -307,5 +358,28 @@ mod tests {
         assert!(out.contains("model=\"other\",provider=\"other\""), "overflow goes to other");
         let series = out.lines().filter(|l| l.starts_with("openhydra_time_to_first_token_seconds_count")).count();
         assert_eq!(series, MAX_MODEL_SERIES + 1, "bounded: {series}");
+    }
+
+    #[test]
+    fn long_labels_are_cut_and_idle_series_make_room() {
+        let m = Metrics::new();
+        let long = "é".repeat(10_000); // 2 bytes a character: the cut must land on a boundary
+        m.record_model_at(0, &long, "12D3KooWA", Some(Duration::from_millis(10)), 0, 0);
+        let out = m.render_prometheus();
+        let longest = out.lines().map(str::len).max().unwrap_or(0);
+        assert!(longest < 400, "a client's long model name can't make huge lines: {longest}");
+        // Fill the registry at t=0, then a new pair an hour later takes the idle one's place.
+        for i in 0..MAX_MODEL_SERIES {
+            m.record_model_at(0, &format!("m{i}"), "12D3KooWA", Some(Duration::from_millis(10)), 0, 0);
+        }
+        m.record_model_at(10, "busy", "12D3KooWB", Some(Duration::from_millis(10)), 0, 0);
+        let out = m.render_prometheus();
+        assert!(out.contains("model=\"other\",provider=\"other\""), "full and nothing idle long enough: other");
+        assert!(!out.contains("model=\"busy\""), "{out}");
+        m.record_model_at(SERIES_IDLE_SECS, "fresh", "12D3KooWC", Some(Duration::from_millis(10)), 0, 0);
+        let out = m.render_prometheus();
+        assert!(out.contains("model=\"fresh\",provider=\"12D3KooWC\""), "an idle pair made room");
+        let series = out.lines().filter(|l| l.starts_with("openhydra_time_to_first_token_seconds_count")).count();
+        assert!(series <= MAX_MODEL_SERIES + 1, "still bounded (plus `other`): {series}");
     }
 }

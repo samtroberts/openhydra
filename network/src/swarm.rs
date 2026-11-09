@@ -67,7 +67,8 @@ pub struct SwarmOptions {
     /// table then takes no private address ([`routable_on_public_network`]), so none goes into a DHT
     /// answer. Off (a private deployment, a local test) takes every address.
     pub public_network: bool,
-    /// LAN discovery (mDNS); off with `--no-mdns` ([`crate::node::disable_mdns`]).
+    /// LAN discovery (mDNS); off with `--no-mdns` ([`crate::node::disable_mdns`]), and on a private
+    /// network whatever this says ([`build_swarm`]).
     pub enable_mdns: bool,
     /// Which network this node is on, told to peers in identify ([`crate::relay::network_id`]).
     pub network_id: String,
@@ -134,6 +135,10 @@ pub fn build_swarm(
 > {
     let peer_id = identity.libp2p_peer_id;
     let keypair = identity.keypair.clone();
+
+    // The key, the allowlist and the QUIC switch are read below, once; from here on they can't change
+    // (a later change would apply to some of this swarm's parts and not others).
+    crate::transport::freeze_network_settings();
 
     // Transport: TCP + Noise + Yamux
     let tcp_transport = crate::transport::build_tcp_transport(&keypair)?;
@@ -296,8 +301,14 @@ pub fn build_swarm(
             .with_cache_size(0),
     );
 
-    // mDNS (LAN discovery), unless turned off (`--no-mdns`).
-    let mdns = if opts.enable_mdns {
+    // mDNS (LAN discovery), unless turned off (`--no-mdns`). Always off on a private network: mDNS
+    // announces our peer id and addresses to anyone on the LAN, and a private deployment's members
+    // are told where each other are (its bootstraps), so the announcement helps only outsiders.
+    let keyed = crate::transport::private_network_key().is_some();
+    if keyed && opts.enable_mdns {
+        tracing::info!("private network: mDNS (LAN discovery) is off, so the LAN doesn't learn this node's peer id and addresses");
+    }
+    let mdns = if opts.enable_mdns && !keyed {
         Toggle::from(Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?))
     } else {
         Toggle::from(None)
