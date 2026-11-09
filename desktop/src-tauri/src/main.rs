@@ -2221,6 +2221,7 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
     if !prov && !gw {
         return Ok(None);
     }
+    let gateway_port = state.settings.lock().map(|s| s.gateway_port).unwrap_or(16527);
     // The two roles hold different halves of the economy: the provider process tracks
     // take-side credit + serve-rate caps; the gateway (consumer) tracks earned reputation of
     // the providers it used + give-side credit. Fetch provider-first for the base snapshot
@@ -2234,6 +2235,14 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
         if prov {
             if let Some(share) = fetch_status(PROVIDER_STATUS_PORT, "/status/share") {
                 base["share"] = share;
+            }
+        }
+        // What the gateway can serve (its `/v1/models`): besides the models the network announces,
+        // this machine's own Private and Device models and the models of imported cards it can use,
+        // none of which are announced. The model picker lists these too.
+        if gw {
+            if let Some(ids) = gateway_model_ids(gateway_port) {
+                base["gateway_models"] = serde_json::json!(ids);
             }
         }
         if prov {
@@ -3033,6 +3042,23 @@ async fn web_search(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The model ids the local gateway lists at `/v1/models` (without `openhydra/auto`), or `None` when
+/// it doesn't answer.
+fn gateway_model_ids(port: u16) -> Option<Vec<String>> {
+    use openhydra_agent::adapter::HttpClient;
+    let body = gateway_client().ok()?.get(&format!("http://127.0.0.1:{port}/v1/models")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some(
+        v.get("data")?
+            .as_array()?
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+            .filter(|id| *id != "openhydra/auto")
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Is the local gateway answering? (backend-side to avoid webview CORS)

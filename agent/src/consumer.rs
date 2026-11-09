@@ -3310,15 +3310,41 @@ impl ConsumerNode {
     /// Backs the gateway's `GET /v1/models`; empty until discovery has populated the cache.
     pub fn known_models(&self) -> Result<Vec<String>, String> {
         let mut models = self.net.known_models()?;
+        let now = now_unix_ms();
         // Our own provider's models, whatever their reach (Device and Private ones aren't announced).
-        if let Some(own) = self.own_models(now_unix_ms()) {
+        if let Some(own) = self.own_models(now) {
             for m in own.models {
                 if !models.contains(&m) {
                     models.push(m);
                 }
             }
         }
+        for m in self.usable_card_models(now) {
+            if !models.contains(&m) {
+                models.push(m);
+            }
+        }
         Ok(models)
+    }
+
+    /// The models of imported cards this gateway can use: every public card's, and a private card's
+    /// when we hold a credential for its swarm (a private model we'd be refused isn't offered). A
+    /// private card's model is never announced, so without this it could be asked for by name but
+    /// wasn't listed (live, 9 Nov: the app showed no models after importing one).
+    fn usable_card_models(&self, now: u64) -> Vec<String> {
+        let Some(cards) = &self.cards else { return Vec::new() };
+        let member = |swarm: &str| {
+            self.creds.as_ref().is_some_and(|c| c.credential_for_swarm(swarm, now).is_some())
+        };
+        let mut models: Vec<String> = cards
+            .valid_cards(now)
+            .into_iter()
+            .filter(|c| c.swarm_public_key.is_empty() || member(&c.swarm_public_key))
+            .map(|c| c.model_id)
+            .collect();
+        models.sort();
+        models.dedup();
+        models
     }
 
     /// What our own provider shares (phase 0.3), asked of it at most every [`OWN_MODELS_TTL_MS`];
@@ -7256,6 +7282,41 @@ mod tests {
             public_key: hex::encode(pk),
         };
         assert!(gated.auto_candidates_from(vec![p], None, now).tiers.is_empty());
+    }
+
+    /// An imported public card's model is listed; a private card's only once this gateway holds a
+    /// credential for its swarm (live, 9 Nov: a private card's model was usable by name but never
+    /// listed, so the app showed no models).
+    #[test]
+    fn imported_cards_are_listed_when_usable() {
+        use openhydra_network::card::{sign_card, PricingMode};
+        let (dir, node) = test_node();
+        let provider = openhydra_network::identity::Identity::load_or_create(&dir.path().join("provider.key")).unwrap();
+        let owner_dir = dir.path().join("owner-swarms");
+        let member_dir = dir.path().join("member-swarms");
+        let swarm = crate::swarms::create_swarm(&owner_dir, "Team", 1_000).unwrap();
+        let now = now_unix_ms();
+        let detected = |m: &str| crate::adapter::DetectedModel {
+            engine_ref: m.into(), canonical_id: String::new(), family: String::new(), params: String::new(),
+            quant: String::new(), size_bytes: 0, weight_digest: String::new(),
+        };
+        let card = |m: &str, swarm: Option<String>| {
+            let c = crate::cards::build_card(&detected(m), m, &provider.openhydra_peer_id, now, 3_600, PricingMode::Reciprocal, None, swarm);
+            sign_card(c, &provider.keypair).unwrap()
+        };
+        let cards_path = dir.path().join("cards.json");
+        crate::cards::add_card(&cards_path, &card("public-model", None)).unwrap();
+        crate::cards::add_card(&cards_path, &card("private-model", Some(swarm.swarm_public_key.clone()))).unwrap();
+        let creds = crate::swarms::CredentialStore::new(member_dir.clone());
+        let node = node.with_cards(Some(crate::cards::CardStore::new(cards_path))).with_credentials(Some(creds));
+        assert_eq!(node.usable_card_models(now_unix_ms()), vec!["public-model".to_string()], "not a member yet");
+        // Enrol in the private card's swarm.
+        let member = openhydra_network::identity::Identity::load_or_create(&dir.path().join("member.key")).unwrap();
+        let req = crate::swarms::build_enrollment_request(&member, &swarm.swarm_public_key, "me", now).unwrap();
+        let approved = crate::swarms::approve_member(&owner_dir, &swarm.swarm_public_key, &req.magnet, "me", 3_600_000, now).unwrap();
+        crate::swarms::accept_credential(&member_dir, &member, &approved.magnet, "", now).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100)); // the store rescans on a newer mtime
+        assert_eq!(node.usable_card_models(now_unix_ms()), vec!["private-model".to_string(), "public-model".to_string()]);
     }
 
     fn test_node() -> (tempfile::TempDir, ConsumerNode) {

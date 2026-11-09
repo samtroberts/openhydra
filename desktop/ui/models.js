@@ -55,7 +55,10 @@ export function modelIdle(m) {
 export function netModels() {
   const now = Date.now();
   const net = Object.keys(seenModels).filter((m) => now - seenModels[m] < STICKY_MS);
-  return [...new Set([...net, ...localSharedModels()])].filter((m) => !looksLikeAuto(m)).sort();
+  // Plus what our gateway can serve that the network doesn't announce: this machine's own Private and
+  // Device models and imported cards' models (the gateway's `/v1/models`, in the snapshot).
+  const viaGateway = Array.isArray(snap?.gateway_models) ? snap.gateway_models : [];
+  return [...new Set([...net, ...localSharedModels(), ...viaGateway])].filter((m) => !looksLikeAuto(m)).sort();
 }
 // Human-readable model name. Path-addressed engines (llama.cpp) report the model as an absolute
 // path (`/home/alice/models/Qwen3.5-9B-Q4_K_M.gguf`); show the GGUF file name so the operator's
