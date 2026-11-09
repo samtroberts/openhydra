@@ -105,6 +105,24 @@ pub const REMOTE_SCOPE_SET: u8 = 0x15;
 /// blob that doesn't decode as a [`FetchChunksResponse`].
 pub const STREAM_CLOSE: u8 = 0x19;
 
+/// Own-models request (phase 0.3), from this machine's own gateway: `0x1A`, no body. Replied with
+/// json [`OwnModels`]: every model this provider shares, whatever its reach, so the gateway it runs
+/// beside can use its Device and Private models, which are never announced and (Device) never
+/// carded. Anyone else gets an empty list, so it can't be used to look for private models.
+pub const OWN_MODELS_REQUEST: u8 = 0x1A;
+
+/// The reply to [`OWN_MODELS_REQUEST`]: this provider's ids and the names its shared models are
+/// served under (empty for anyone but this machine).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OwnModels {
+    /// This provider's OpenHydra peer id.
+    pub peer_id: String,
+    /// This provider's public key (hex).
+    pub public_key: String,
+    /// The models it shares, by the name it serves them under.
+    pub models: Vec<String>,
+}
+
 /// How long a completed (or in-flight) serve result stays fetchable. Must comfortably exceed
 /// the NAT/relay re-establishment window (~10–70s) so a reconnecting consumer still finds it.
 const RESULT_TTL_MS: u64 = 120_000;
@@ -869,7 +887,7 @@ const CONTROL_WORKERS: usize = 2;
 /// Whether an inbound message (by its first byte) is answered apart from generations (receipts on
 /// a pool of their own, the rest on the control pool): quick work that must not wait behind them.
 fn is_control_message(method: Option<u8>) -> bool {
-    matches!(method, Some(FETCH_CHUNKS) | Some(STREAM_CLOSE) | Some(FETCH_RESULT) | Some(RECEIPT_REQUEST))
+    matches!(method, Some(FETCH_CHUNKS) | Some(STREAM_CLOSE) | Some(FETCH_RESULT) | Some(RECEIPT_REQUEST) | Some(OWN_MODELS_REQUEST))
 }
 
 /// Ready fetches of one buffered result answered (round 9 B9-8): a consumer that lost a reply
@@ -2052,6 +2070,28 @@ impl<A: EngineAdapter> Provider<A> {
     /// The peers that count as this machine for the reach gate: this node, and the co-located
     /// consumer (the desktop's gateway dials with its own key, so without it the app couldn't use
     /// its own Device or Private models).
+    /// The answer to an [`OWN_MODELS_REQUEST`] from `source_peer`: every model this provider shares,
+    /// by public name, when `source_peer` is this machine (this node or its `--self-consumer`
+    /// gateway); nothing otherwise.
+    fn own_models_for(&self, source_peer: &str) -> OwnModels {
+        let mut reply = OwnModels {
+            peer_id: self.net.openhydra_peer_id().to_string(),
+            public_key: self.net.public_key_hex().to_string(),
+            models: Vec::new(),
+        };
+        if !self.own_peers().contains(&source_peer) {
+            return reply;
+        }
+        let names = self.public_names.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let detected: Vec<String> = self.detected.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+        let mut models: Vec<String> =
+            detected.iter().filter(|e| self.policy.is_shared(e)).map(|e| names.public(e).to_string()).collect();
+        models.sort();
+        models.dedup();
+        reply.models = models;
+        reply
+    }
+
     fn own_peers(&self) -> Vec<&str> {
         let mut own = vec![self.net.libp2p_peer_id()];
         own.extend(self.self_consumer.as_deref());
@@ -3539,6 +3579,7 @@ impl<A: EngineAdapter> Provider<A> {
         match data.first() {
             // M5: an owner-authorised remote-control device flips a model's share scope on this rig.
             Some(&REMOTE_SCOPE_SET) => self.handle_remote_scope_set(source_peer, &data[1..]),
+            Some(&OWN_MODELS_REQUEST) => serde_json::to_vec(&self.own_models_for(source_peer)).unwrap_or_default(),
             // Device attestation challenge (Phase 0). Rate-limited per authenticated peer before any
             // signing; publicly-announced models are attestable, and a private one by a swarm member
             // that recently passed its gate. Anyone else gets the same refusal as for an unshared
@@ -4567,6 +4608,46 @@ mod tests {
         assert!(off_chain.with_settlement_peg(10).payment_gate(&req(long, None), "c").is_ok(), "off Solana: any length");
     }
 
+    /// Phase 0.3: this machine's own gateway learns every model its provider shares, whatever the
+    /// reach (Device and Private are never announced), and anyone else learns nothing.
+    #[test]
+    fn only_this_machine_hears_which_models_are_shared() {
+        use crate::share_policy::Scope;
+        let (_dir, provider) = test_provider(StubAdapter);
+        let mut provider = provider.with_self_consumer(Some("12D3KooWDesktopGateway".into()));
+        let mut policy = SharePolicy::share_all();
+        policy.mode = crate::share_policy::ShareMode::List;
+        policy.models = ["dev", "priv", "pub", "/srv/models/Rig 2"].iter().map(|m| m.to_string()).collect();
+        policy.scopes.insert("dev".into(), Scope::Device);
+        policy.scopes.insert("priv".into(), Scope::Private);
+        policy.scopes.insert("pub".into(), Scope::Global);
+        policy.scopes.insert("/srv/models/Rig 2".into(), Scope::Private);
+        provider.policy = PolicyWatcher::r#static(policy);
+        let detected = |r: &str| DetectedModel {
+            engine_ref: r.into(), canonical_id: String::new(), family: String::new(), params: String::new(),
+            quant: String::new(), size_bytes: 0, weight_digest: String::new(),
+        };
+        let all = ["dev", "priv", "pub", "unshared", "/srv/models/Rig 2"];
+        provider.detected.lock().unwrap().extend(all.iter().map(|m| (m.to_string(), detected(m))));
+        *provider.public_names.lock().unwrap() = PublicNames::from_engine_refs(all);
+        let rig2 = provider.public_names.lock().unwrap().public("/srv/models/Rig 2").to_string();
+        assert_ne!(rig2, "/srv/models/Rig 2", "a path is served under a cleaned-up name");
+        let mut expected = vec!["dev".to_string(), "priv".into(), "pub".into(), rig2];
+        expected.sort();
+        let own = provider.net.libp2p_peer_id().to_string();
+        for asker in [own.as_str(), "12D3KooWDesktopGateway"] {
+            let r = provider.own_models_for(asker);
+            assert_eq!(r.models, expected, "{asker}: every shared model, by served name; not the unshared one");
+            assert_eq!(r.peer_id, provider.net.openhydra_peer_id());
+        }
+        assert!(provider.own_models_for("12D3KooWSomeoneElse").models.is_empty(), "anyone else hears nothing");
+        // Through the dispatcher, as the wire request.
+        let wire: OwnModels = serde_json::from_slice(&provider.dispatch("12D3KooWDesktopGateway", &[OWN_MODELS_REQUEST], None)).unwrap();
+        assert_eq!(wire.models, expected);
+        let wire: OwnModels = serde_json::from_slice(&provider.dispatch("12D3KooWSomeoneElse", &[OWN_MODELS_REQUEST], None)).unwrap();
+        assert!(wire.models.is_empty());
+    }
+
     /// Round 9 P9-2 / round 10 X10-1: verifiers of one model take turns; another model's wait
     /// doesn't count.
     #[test]
@@ -4591,7 +4672,7 @@ mod tests {
     /// Round 8 G8-1: polls, closes, fetches and receipts go to the control pool; serves don't.
     #[test]
     fn quick_messages_have_their_own_workers() {
-        for m in [FETCH_CHUNKS, STREAM_CLOSE, FETCH_RESULT, RECEIPT_REQUEST] {
+        for m in [FETCH_CHUNKS, STREAM_CLOSE, FETCH_RESULT, RECEIPT_REQUEST, OWN_MODELS_REQUEST] {
             assert!(is_control_message(Some(m)));
         }
         for m in [SERVE_REQUEST, SERVE_STREAM, ATTEST_CHALLENGE, PROMPT_SCORE_CHALLENGE] {

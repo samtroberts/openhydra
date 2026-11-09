@@ -775,6 +775,9 @@ fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
     }
 }
 
+/// How long our own provider's list of what it shares is used before asking again.
+const OWN_MODELS_TTL_MS: u64 = 15_000;
+
 /// How long a conversation stays with the provider that served it last. Engines evict an idle
 /// prompt cache; after this the conversation is placed like any other request.
 const AFFINITY_TTL_MS: u64 = 10 * 60 * 1000;
@@ -1820,6 +1823,9 @@ pub struct ConsumerNode {
     /// M2: imported `.openhydra` cards — verified providers pinned locally and dialable by peer id
     /// without live discovery. Merged into the candidate set in `serve_once`. `None` = no store.
     cards: Option<Arc<crate::cards::CardStore>>,
+    /// Phase 0.3: what our own provider (`self_provider`) shares, as it last told us, and when (unix
+    /// ms). Its Device and Private models are never announced, so this is how we find them.
+    own_models: Mutex<Option<(u64, crate::provider::OwnModels)>>,
     /// SL1: the signed list of providers OpenHydra runs ([`crate::seed_list`]). A model a seed
     /// serves is one `openhydra/auto` may pick, and a seed starts a little above an unknown provider
     /// in ranking. `None` = no list (a private deployment).
@@ -2205,6 +2211,7 @@ impl ConsumerNode {
             affinity: Mutex::new(HashMap::new()),
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
+            own_models: Mutex::new(None),
             seeds: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
@@ -2615,6 +2622,7 @@ impl ConsumerNode {
             affinity: Mutex::new(HashMap::new()),
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
+            own_models: Mutex::new(None),
             seeds: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
@@ -3301,7 +3309,39 @@ impl ConsumerNode {
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
     /// Backs the gateway's `GET /v1/models`; empty until discovery has populated the cache.
     pub fn known_models(&self) -> Result<Vec<String>, String> {
-        self.net.known_models()
+        let mut models = self.net.known_models()?;
+        // Our own provider's models, whatever their reach (Device and Private ones aren't announced).
+        if let Some(own) = self.own_models(now_unix_ms()) {
+            for m in own.models {
+                if !models.contains(&m) {
+                    models.push(m);
+                }
+            }
+        }
+        Ok(models)
+    }
+
+    /// What our own provider shares (phase 0.3), asked of it at most every [`OWN_MODELS_TTL_MS`];
+    /// `None` without a `--self-provider`. A provider that can't be reached counts as sharing
+    /// nothing until the next ask.
+    fn own_models(&self, now: u64) -> Option<crate::provider::OwnModels> {
+        let own = self.self_provider.clone()?;
+        {
+            let cached = self.own_models.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((at, models)) = cached.as_ref() {
+                if now.saturating_sub(*at) < OWN_MODELS_TTL_MS {
+                    return Some(models.clone());
+                }
+            }
+        }
+        let fresh = self
+            .net
+            .proxy_forward_timeout(own, vec![crate::provider::OWN_MODELS_REQUEST], std::time::Duration::from_secs(3))
+            .ok()
+            .and_then(|r| serde_json::from_slice::<crate::provider::OwnModels>(&r).ok())
+            .unwrap_or_default();
+        *self.own_models.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, fresh.clone()));
+        Some(fresh)
     }
 
     /// Models their last known provider withdrew in the last few minutes (and nobody serves now).
@@ -3435,6 +3475,24 @@ impl ConsumerNode {
                 if !fresh.is_empty() {
                     tracing::info!(model, n = fresh.len(), "M2: added card-pinned providers");
                     peers.extend(fresh);
+                }
+            }
+        }
+        // Phase 0.3: our own provider, for a model it shares at any reach. Its Device and Private
+        // models are never announced (and a Device one has no card), so without this the gateway
+        // beside it could never use them; its scope gate lets this machine in.
+        if let (Some(own), Some(mine)) = (self.self_provider.clone(), self.own_models(now)) {
+            if mine.models.iter().any(|m| m == model) && !peers.iter().any(|p| p.libp2p_peer_id == own) {
+                let p = DiscoveredPeer {
+                    peer_id: mine.peer_id,
+                    libp2p_peer_id: own.clone(),
+                    model_id: model.to_string(),
+                    public_key: mine.public_key,
+                    connected: self.net.peer_rtt(&own).is_some(),
+                    ..Default::default()
+                };
+                if allowed(&p) {
+                    peers.push(p);
                 }
             }
         }
