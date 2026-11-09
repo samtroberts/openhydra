@@ -11,8 +11,11 @@ rule_files:
 
 scrape_configs:
   # An OpenHydra gateway (`openhydra-agent serve`): its /metrics on the gateway port (16527 by
-  # default). Dashboard: ops/grafana/openhydra_gateway_dashboard.json. Outside Docker use
-  # ['localhost:16527']; from Docker Desktop, ['host.docker.internal:16527'].
+  # default). Dashboard: ops/grafana/openhydra_gateway_dashboard.json. A gateway bound to loopback
+  # answers only requests addressed to 127.0.0.1 / localhost on its own port (DNS-rebinding
+  # protection), so scrape it as ['localhost:16527'] from the same machine: Prometheus run there,
+  # or in a container with host networking. A name such as host.docker.internal, or a tunnel or
+  # proxy on another port, is refused (403). A gateway bound to another address needs --api-key.
   - job_name: openhydra_gateway
     static_configs:
       - targets: ['gateway:16527']
