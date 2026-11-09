@@ -118,6 +118,15 @@ struct NodeArgs {
     #[arg(long = "allow-peers-file")]
     allow_peers_file: Option<std::path::PathBuf>,
 
+    /// Allow connections with the peers this node's swarm credentials name, kept current while it
+    /// runs: on a provider, the members of every swarm it owns (`--swarms-dir`; a member approved
+    /// now gets in, one revoked or expired is cut off within seconds) and its `--self-consumer`; on a
+    /// gateway, the providers of its imported cards (`--cards-file`) and its `--self-provider`. Any
+    /// other peer is refused, as with `--allow-peers-file` (the two add up). The `--bootstrap` peers
+    /// are always allowed.
+    #[arg(long = "allow-swarm-peers")]
+    allow_swarm_peers: bool,
+
     /// Join the private network keyed by this file (a `swarm.key` in the `/base16/` encoding, as
     /// go-libp2p / IPFS write it; their `/base64/` and `/bin/` keys aren't read. Make one with
     /// `openhydra-agent network-key --out <file>`). Every TCP connection and relay circuit is
@@ -129,9 +138,10 @@ struct NodeArgs {
     private_network_key_file: Option<std::path::PathBuf>,
 
     /// Keep QUIC on with `--private-network-key-file`. QUIC can't carry the network key, so its
-    /// connections are guarded by `--allow-peers-file` instead (required): TCP and relay circuits
-    /// need the key, QUIC needs a listed peer id. QUIC punches through NATs better than TCP.
-    #[arg(long = "private-network-quic", requires_all = ["private_network_key_file", "allow_peers_file"])]
+    /// connections are guarded by a peer allowlist instead (`--allow-peers-file` or
+    /// `--allow-swarm-peers`, required): TCP and relay circuits need the key, QUIC needs an allowed
+    /// peer id. QUIC punches through NATs better than TCP.
+    #[arg(long = "private-network-quic", requires = "private_network_key_file")]
     private_network_quic: bool,
 
     /// Serve a read-only introspection endpoint (peers / DHT / swarm / transfer
@@ -140,6 +150,31 @@ struct NodeArgs {
     /// `OPENHYDRA_STATUS_TOKEN` is set, requests must send it as a bearer token.
     #[arg(long = "status-bind")]
     status_bind: Option<String>,
+}
+
+/// `--allow-swarm-peers` was given: the provider or gateway keeps the peers its credentials name
+/// allowed ([`keep_credential_peers`]).
+static ALLOW_SWARM_PEERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How often the peers the credentials name are worked out again (a few small files are read).
+const CREDENTIAL_PEERS_EVERY: Duration = Duration::from_secs(5);
+
+/// With `--allow-swarm-peers`, allow the peers `peers` names (asked with the time now, unix ms) now
+/// and every few seconds while the process runs, so an approval or a revocation takes effect without
+/// a restart. Without it, nothing.
+fn keep_credential_peers(what: &'static str, peers: impl Fn(u64) -> std::collections::HashSet<String> + Send + 'static) {
+    if !ALLOW_SWARM_PEERS.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let first = peers(now());
+    eprintln!("openhydra-agent: --allow-swarm-peers: {} peer(s) allowed by {what}, kept current", first.len());
+    openhydra_network::fence::set_credential_peer_ids(first.iter().map(String::as_str));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(CREDENTIAL_PEERS_EVERY);
+        let now_peers = peers(now());
+        openhydra_network::fence::set_credential_peer_ids(now_peers.iter().map(String::as_str));
+    });
 }
 
 impl NodeArgs {
@@ -156,23 +191,37 @@ impl NodeArgs {
                 std::process::exit(2);
             }
         }
-        if let Some(path) = &self.allow_peers_file {
+        if self.private_network_quic && self.allow_peers_file.is_none() && !self.allow_swarm_peers {
+            eprintln!("openhydra-agent: --private-network-quic needs a peer allowlist: --allow-peers-file or --allow-swarm-peers");
+            std::process::exit(2);
+        }
+        if self.allow_peers_file.is_some() || self.allow_swarm_peers {
             // Process-wide, before any node starts. The configured bootstraps are always allowed (a
-            // node that can't reach them can't join anything).
-            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-                eprintln!("openhydra-agent: --allow-peers-file {}: {e}", path.display());
-                std::process::exit(2);
-            });
-            let mut peers = openhydra_network::fence::parse_allowlist(&text).unwrap_or_else(|e| {
-                eprintln!("openhydra-agent: --allow-peers-file {}: {e}", path.display());
-                std::process::exit(2);
-            });
+            // node that can't reach them can't join anything). The peers the credentials name are
+            // added once the provider or gateway starts (`keep_credential_peers`).
+            let mut peers = std::collections::HashSet::new();
+            if let Some(path) = &self.allow_peers_file {
+                let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                    eprintln!("openhydra-agent: --allow-peers-file {}: {e}", path.display());
+                    std::process::exit(2);
+                });
+                peers = openhydra_network::fence::parse_allowlist(&text).unwrap_or_else(|e| {
+                    eprintln!("openhydra-agent: --allow-peers-file {}: {e}", path.display());
+                    std::process::exit(2);
+                });
+            }
             peers.extend(self.bootstrap.iter().filter_map(|a| openhydra_network::fence::peer_id_in(a)));
-            eprintln!("openhydra-agent: peer allowlist: {} peer(s) may connect (from {})", peers.len(), path.display());
+            let from = match (&self.allow_peers_file, self.allow_swarm_peers) {
+                (Some(p), true) => format!("{} and this node's swarm credentials", p.display()),
+                (Some(p), false) => p.display().to_string(),
+                (None, _) => "the bootstraps and this node's swarm credentials".to_string(),
+            };
+            eprintln!("openhydra-agent: peer allowlist: {} peer(s) may connect (from {from})", peers.len());
             if let Err(e) = openhydra_network::fence::set_allowed_peers(peers) {
                 eprintln!("openhydra-agent: {e}");
                 std::process::exit(2);
             }
+            ALLOW_SWARM_PEERS.store(self.allow_swarm_peers, std::sync::atomic::Ordering::SeqCst);
         }
         if let Some(path) = &self.private_network_key_file {
             // Process-wide, before any node starts. Only the fingerprint is ever printed.
@@ -2064,6 +2113,16 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         provider = provider
             .with_swarm_authorizer(openhydra_agent::swarms::SwarmAuthorizer::new(dir));
     }
+    // --allow-swarm-peers: the members of the swarms this provider owns, and its own gateway.
+    if ALLOW_SWARM_PEERS.load(std::sync::atomic::Ordering::SeqCst) {
+        let dir = args.swarms_dir.clone().ok_or("--allow-swarm-peers on a provider needs --swarms-dir (the swarms whose members may connect)")?;
+        let own_gateway = args.self_consumer.clone();
+        keep_credential_peers("the members of the swarms this provider owns", move |now| {
+            let mut peers = openhydra_agent::swarms::owned_member_peer_ids(&dir, now);
+            peers.extend(own_gateway.clone());
+            peers
+        });
+    }
 
     let provider = std::sync::Arc::new(provider);
     if args.warm_up_secs > 0 {
@@ -2193,6 +2252,18 @@ fn serve(
         eprintln!("openhydra-agent: swarm credentials from {}", p.display());
         openhydra_agent::swarms::CredentialStore::new(p)
     });
+    // --allow-swarm-peers: the providers of this gateway's imported cards, and its own provider.
+    if ALLOW_SWARM_PEERS.load(std::sync::atomic::Ordering::SeqCst) {
+        if cards.is_none() && args.self_provider.is_none() {
+            return Err("--allow-swarm-peers on a gateway needs --cards-file or --self-provider (the providers it may reach)".into());
+        }
+        let (cards, own) = (cards.clone(), args.self_provider.clone());
+        keep_credential_peers("this gateway's imported cards", move |now| {
+            let mut peers = cards.as_ref().map(|c| c.provider_peer_ids(now)).unwrap_or_default();
+            peers.extend(own.clone());
+            peers
+        });
+    }
     // Phase 0 device attestation of providers (opt-in).
     let provider_attest = if args.attest_providers {
         let mut trusted = vec![openhydra_agent::attest::binary_hash()

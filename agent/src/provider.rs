@@ -1227,6 +1227,25 @@ fn stamp_load(chunk: &[u8], load: crate::serve::ProviderLoad) -> Vec<u8> {
     }
 }
 
+/// A provider's load as its advert carries it ([`Provider::advert_load`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AdvertLoad {
+    /// Serves running and queued, as a share of its serve slots (0–100).
+    load_pct: f64,
+    /// Serves waiting for a worker.
+    queue_depth: u32,
+    /// Recent decode speed, tokens a second (0 until one is measured).
+    throughput_tok_s: f64,
+}
+
+impl AdvertLoad {
+    fn apply(self, record: &mut PeerRecord) {
+        record.load_pct = self.load_pct;
+        record.queue_depth = self.queue_depth;
+        record.throughput_tok_s = self.throughput_tok_s;
+    }
+}
+
 /// Counts a serve request as waiting for a serve worker for as long as it lives: made when the
 /// request is queued, moved into its job, and dropped when the job starts (or with the job, when
 /// the queue is full and it is shed).
@@ -2117,6 +2136,19 @@ impl<A: EngineAdapter> Provider<A> {
         let mut own = vec![self.net.libp2p_peer_id()];
         own.extend(self.self_consumer.as_deref());
         own
+    }
+
+    /// This provider's load for its advert, as it is now: serves running and queued against its
+    /// slots, the queue, and its recent decode speed.
+    fn advert_load(&self) -> AdvertLoad {
+        let running = self.running.load(Ordering::SeqCst);
+        let queued = self.queued_serves.load(Ordering::SeqCst);
+        let slots = self.serve_slots.load(Ordering::SeqCst).max(1);
+        AdvertLoad {
+            load_pct: (f64::from(running.saturating_add(queued)) / f64::from(slots) * 100.0).min(100.0),
+            queue_depth: queued,
+            throughput_tok_s: f64::from(self.recent_tok_s.load(Ordering::Relaxed)),
+        }
     }
 
     /// This provider's load as a serve ends: the serves still running besides it and those queued
@@ -3175,9 +3207,11 @@ impl<A: EngineAdapter> Provider<A> {
             if !policy.announce_globally(&model.engine_ref) {
                 continue;
             }
-            // Load is reported with each serve, not in the advert: an advert is two minutes old at
-            // best, and self-reported load there would weigh against earned reputation in ranking.
-            let record = build_peer_record(
+            // Load rides each serve's final frame (fresh, for the consumers it served) and the
+            // advert (for the ones it hasn't served yet, up to one re-announce old). Ranking bounds
+            // what a self-reported figure can do (`compute_routing_score` clamps it; earned
+            // reputation and the spread's own count of open serves outweigh a claim).
+            let mut record = build_peer_record(
                 model,
                 names.public(&model.engine_ref),
                 self.net.openhydra_peer_id(),
@@ -3186,6 +3220,7 @@ impl<A: EngineAdapter> Provider<A> {
                 &self.host,
                 self.port,
             );
+            self.advert_load().apply(&mut record);
             if let Err(e) = self.net.announce(record) {
                 outcome = Err(AdapterError::Http(format!("announce: {e}")));
                 break;
@@ -5249,6 +5284,25 @@ mod tests {
             assert_eq!(running.load(Ordering::SeqCst), 2);
         }
         assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_advert_carries_the_providers_load() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        provider.serve_slots.store(4, Ordering::SeqCst);
+        assert_eq!(provider.advert_load(), AdvertLoad { load_pct: 0.0, queue_depth: 0, throughput_tok_s: 0.0 }, "idle");
+        let _a = ServeSlot::start(&provider.running);
+        let _b = ServeSlot::start(&provider.running);
+        let _q = QueuedServe::start(&provider.queued_serves);
+        provider.note_speed(42.0);
+        let load = provider.advert_load();
+        assert_eq!(load, AdvertLoad { load_pct: 75.0, queue_depth: 1, throughput_tok_s: 42.0 });
+        let mut record = PeerRecord::default();
+        load.apply(&mut record);
+        assert_eq!((record.load_pct, record.queue_depth, record.throughput_tok_s), (75.0, 1, 42.0));
+        // Over-full is full.
+        let _more: Vec<QueuedServe> = (0..9).map(|_| QueuedServe::start(&provider.queued_serves)).collect();
+        assert_eq!(provider.advert_load().load_pct, 100.0);
     }
 
     #[test]

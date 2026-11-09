@@ -423,6 +423,12 @@ impl CardStore {
         let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         c.cards.iter().filter(|card| now_ms < card.expires_at).cloned().collect()
     }
+
+    /// The peer ids of the providers of every unexpired imported card: the peers a gateway's cards
+    /// let in (`--allow-swarm-peers`). Importing a card is a deliberate choice of that provider.
+    pub fn provider_peer_ids(&self, now_ms: u64) -> std::collections::HashSet<String> {
+        self.valid_cards(now_ms).into_iter().map(|c| c.libp2p_peer_id).filter(|p| !p.is_empty()).collect()
+    }
 }
 
 #[cfg(test)]

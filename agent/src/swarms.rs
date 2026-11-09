@@ -531,6 +531,33 @@ pub fn accept_credential(
 
 /// Forget a swarm entirely (owner or member): delete its file. For an owner this destroys the group
 /// key, so no further credentials can be issued.
+/// The peer ids of every member of a swarm this node owns, as of `now_ms`: approved, not revoked,
+/// not expired. These are the peers an owner's credentials let in (`--allow-swarm-peers`). A record
+/// that can't be read, or a member key that isn't one, is skipped.
+pub fn owned_member_peer_ids(dir: &Path, now_ms: u64) -> std::collections::HashSet<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Default::default() };
+    let mut peers = std::collections::HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(rec) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<SwarmRecord>(&b).ok()) else { continue };
+        if rec.role != SwarmRole::Owner {
+            continue;
+        }
+        for m in &rec.members {
+            if now_ms >= m.expires_at || rec.revoked.contains(&m.member_public_key) {
+                continue;
+            }
+            if let Ok(p) = openhydra_network::membership::peer_id_of_public_key_hex(&m.member_public_key) {
+                peers.insert(p.to_string());
+            }
+        }
+    }
+    peers
+}
+
 pub fn forget_swarm(dir: &Path, swarm_public_key: &str) -> Result<(), String> {
     let path = swarm_file_path(dir, swarm_public_key)?;
     match std::fs::remove_file(&path) {

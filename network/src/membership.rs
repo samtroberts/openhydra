@@ -563,6 +563,13 @@ fn ed_pubkey_from_hex(
         .map_err(|e| MembershipError::Crypto(format!("bad ed25519 public_key: {e}")))
 }
 
+/// The libp2p peer id of an Ed25519 public key (hex), as a member record or credential carries it:
+/// the peer id that member's node connects as.
+pub fn peer_id_of_public_key_hex(hex_str: &str) -> Result<libp2p::PeerId, MembershipError> {
+    let ed = ed_pubkey_from_hex(hex_str)?;
+    Ok(libp2p::PeerId::from_public_key(&libp2p::identity::PublicKey::from(ed)))
+}
+
 /// A short, human-verifiable fingerprint of a public key (hex) for out-of-band confirmation before
 /// approval — anti-mis-enrollment. `SHA256(pubkey_bytes)[..8]` rendered as four space-separated
 /// upper-hex groups (e.g. `A1B2 C3D4 E5F6 0718`). Returns "invalid-key" for un-decodable input rather

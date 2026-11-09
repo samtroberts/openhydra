@@ -132,6 +132,34 @@ pub fn allowed_peers() -> Option<&'static HashSet<PeerId>> {
     ALLOWED_PEERS.get()
 }
 
+/// Peers allowed besides the fixed allowlist because the node's swarm credentials name them (the
+/// agent's `--allow-swarm-peers`: an owner's approved members, a gateway's card providers). Unlike
+/// the fixed list it changes while the node runs: a member approved now gets in, and one revoked or
+/// expired is cut off (its open connections closed within one poll of the fence, seconds at most).
+/// It counts only while an allowlist is set ([`set_allowed_peers`]); it never turns one on.
+static CREDENTIAL_PEERS: std::sync::RwLock<Option<HashSet<PeerId>>> = std::sync::RwLock::new(None);
+/// Bumped on every change to [`CREDENTIAL_PEERS`], so each fence re-checks its open connections.
+static CREDENTIAL_PEERS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replace the peers the node's credentials allow ([`CREDENTIAL_PEERS`]).
+pub fn set_credential_peers(peers: HashSet<PeerId>) {
+    let mut slot = CREDENTIAL_PEERS.write().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref() != Some(&peers) {
+        *slot = Some(peers);
+        CREDENTIAL_PEERS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// [`set_credential_peers`] from base58 peer ids; one that doesn't parse is left out.
+pub fn set_credential_peer_ids<'a>(peers: impl IntoIterator<Item = &'a str>) {
+    set_credential_peers(peers.into_iter().filter_map(|p| p.parse().ok()).collect());
+}
+
+/// Whether the node's credentials allow `peer` ([`set_credential_peers`]).
+fn credential_peer(peer: &PeerId) -> bool {
+    CREDENTIAL_PEERS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(peer))
+}
+
 /// Read an allowlist file: one base58 peer id per line; blank lines and `#` comments are ignored.
 /// Any line that isn't a peer id is an error, so a typo can't silently shut a peer out.
 pub fn parse_allowlist(text: &str) -> Result<HashSet<PeerId>, String> {
@@ -179,16 +207,39 @@ impl std::error::Error for FencedPeer {}
 pub struct Behaviour {
     fenced: Option<Fenced>,
     allowed: Option<HashSet<PeerId>>,
+    /// Whether the process's credential-allowed peers ([`set_credential_peers`]) count too.
+    credentials: bool,
+    /// Open connections, so a peer whose credential lapses can be cut off.
+    open: std::collections::HashMap<ConnectionId, PeerId>,
+    /// The [`CREDENTIAL_PEERS_GENERATION`] the open connections were last checked against.
+    checked_generation: u64,
+    /// Connections to close, found by that check.
+    to_close: std::collections::VecDeque<(PeerId, ConnectionId)>,
 }
 
 impl Behaviour {
-    /// The process's allowlist ([`set_allowed_peers`]) applies.
+    /// The process's allowlist ([`set_allowed_peers`]) applies, and the peers its credentials allow
+    /// ([`set_credential_peers`]).
     pub fn new(fenced: Option<Fenced>) -> Self {
-        Self::with_allowlist(fenced, allowed_peers().cloned())
+        Self { credentials: true, ..Self::with_allowlist(fenced, allowed_peers().cloned()) }
     }
 
     pub fn with_allowlist(fenced: Option<Fenced>, allowed: Option<HashSet<PeerId>>) -> Self {
-        Self { fenced, allowed }
+        Self {
+            fenced,
+            allowed,
+            credentials: false,
+            open: std::collections::HashMap::new(),
+            checked_generation: CREDENTIAL_PEERS_GENERATION.load(std::sync::atomic::Ordering::SeqCst),
+            to_close: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn allows(&self, p: &PeerId) -> bool {
+        match &self.allowed {
+            None => true,
+            Some(a) => a.contains(p) || (self.credentials && credential_peer(p)),
+        }
     }
 
     fn check_peer(&self, peer: Option<PeerId>) -> Result<(), ConnectionDenied> {
@@ -196,7 +247,7 @@ impl Behaviour {
         if self.fenced.as_ref().is_some_and(|f| f.peer(&p)) {
             return Err(ConnectionDenied::new(FencedPeer));
         }
-        if self.allowed.as_ref().is_some_and(|a| !a.contains(&p)) {
+        if !self.allows(&p) {
             return Err(ConnectionDenied::new(NotAllowed));
         }
         Ok(())
@@ -253,13 +304,42 @@ impl NetworkBehaviour for Behaviour {
         Ok(dummy::ConnectionHandler)
     }
 
-    fn on_swarm_event(&mut self, _event: FromSwarm) {}
+    fn on_swarm_event(&mut self, event: FromSwarm) {
+        match event {
+            FromSwarm::ConnectionEstablished(e) if self.credentials && self.allowed.is_some() => {
+                self.open.insert(e.connection_id, e.peer_id);
+            }
+            FromSwarm::ConnectionClosed(e) => {
+                self.open.remove(&e.connection_id);
+            }
+            _ => {}
+        }
+    }
 
     fn on_connection_handler_event(&mut self, _peer: PeerId, _id: ConnectionId, event: THandlerOutEvent<Self>) {
         match event {}
     }
 
     fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        // The credential-allowed peers changed: close every open connection with a peer no longer
+        // allowed (a member revoked or expired). The swarm polls its behaviours on every event, and
+        // ping runs every few seconds, so this is seen promptly without a waker of its own.
+        if self.credentials && self.allowed.is_some() {
+            let now = CREDENTIAL_PEERS_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+            if now != self.checked_generation {
+                self.checked_generation = now;
+                let gone: Vec<(PeerId, ConnectionId)> =
+                    self.open.iter().filter(|(_, p)| !self.allows(p)).map(|(c, p)| (*p, *c)).collect();
+                self.to_close.extend(gone);
+            }
+        }
+        if let Some((peer_id, connection)) = self.to_close.pop_front() {
+            self.open.remove(&connection);
+            return Poll::Ready(ToSwarm::CloseConnection {
+                peer_id,
+                connection: libp2p::swarm::CloseConnection::One(connection),
+            });
+        }
         Poll::Pending
     }
 }
@@ -340,6 +420,34 @@ mod allowlist_tests {
         // The fence still applies to a listed peer.
         let fenced = Fenced { ips: HashSet::new(), peers: HashSet::from([a]) };
         assert!(Behaviour::with_allowlist(Some(fenced), Some(HashSet::from([a]))).check_peer(Some(a)).is_err());
+    }
+
+    #[test]
+    fn credential_peers_come_and_go_while_the_node_runs() {
+        let (listed, member, stranger) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut fence = Behaviour { credentials: true, ..Behaviour::with_allowlist(None, Some(HashSet::from([listed]))) };
+        set_credential_peers(HashSet::from([member]));
+        assert!(fence.check_peer(Some(member)).is_ok(), "a member its credentials name gets in");
+        assert!(fence.check_peer(Some(listed)).is_ok());
+        assert!(fence.check_peer(Some(stranger)).is_err());
+        // Credential peers never open a node with no allowlist, nor one built without them.
+        assert!(Behaviour::with_allowlist(None, Some(HashSet::new())).check_peer(Some(member)).is_err());
+        // Both are connected; the member is revoked: its connection is closed, the listed peer's kept.
+        let (cm, cl) = (ConnectionId::new_unchecked(1), ConnectionId::new_unchecked(2));
+        fence.open.insert(cm, member);
+        fence.open.insert(cl, listed);
+        fence.checked_generation = CREDENTIAL_PEERS_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+        set_credential_peers(HashSet::new());
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match fence.poll(&mut cx) {
+            Poll::Ready(ToSwarm::CloseConnection { peer_id, connection: libp2p::swarm::CloseConnection::One(c) }) => {
+                assert_eq!((peer_id, c), (member, cm));
+            }
+            _ => panic!("the revoked member's connection wasn't closed"),
+        }
+        assert!(fence.poll(&mut cx).is_pending(), "nothing else to close");
+        assert!(fence.check_peer(Some(member)).is_err(), "and it can't come back");
     }
 
     #[test]
