@@ -191,16 +191,9 @@ impl Handler {
 /// doesn't fit is dropped, as gossip may (the peer misses it, as it would a lost forward).
 pub(crate) const MAX_QUEUED_BYTES: usize = 256 * 1024;
 
-/// OpenHydra patch: the send-queue cap in use: [`MAX_QUEUED_BYTES`], or
-/// `OPENHYDRA_TEST_GOSSIP_QUEUE_KB` (bootstrap load simulation, plan E4).
+/// OpenHydra patch: the send-queue cap in use: [`MAX_QUEUED_BYTES`].
 fn max_queued_bytes() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("OPENHYDRA_TEST_GOSSIP_QUEUE_KB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map_or(MAX_QUEUED_BYTES, |kb| kb.max(1) * 1024)
-    })
+    MAX_QUEUED_BYTES
 }
 
 /// OpenHydra patch: the most messages a connection's send queue holds, whatever their size.

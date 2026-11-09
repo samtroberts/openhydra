@@ -1394,6 +1394,7 @@ fn spawn_byok_worker(
                     streamed: false,
                     claimed_tokens: None,
                     recount_pending: false,
+                    provider: String::new(),
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -1442,7 +1443,7 @@ fn stream_response(
                     summary.streamed,
                 );
                 let e = &summary.metrics.engine;
-                metrics.record_model(&model_s, ttft, e.eval_count, e.eval_duration_ns);
+                metrics.record_model(&model_s, &summary.provider, ttft, e.eval_count, e.eval_duration_ns);
                 // Tool calls (if any) ride the final chunk's delta with finish_reason
                 // "tool_calls"; a plain completion finishes "stop" with an empty delta.
                 // (Incremental per-argument streaming of tool_calls is a later refinement —
@@ -1524,7 +1525,7 @@ async fn buffered_response(
                 summary.streamed,
             );
             let e = &summary.metrics.engine;
-            metrics.record_model(&model, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
+            metrics.record_model(&model, &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
             Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall)))
                 .into_response()
         }
@@ -1928,7 +1929,7 @@ async fn anthropic_buffered_response(
             log_completion(&summary, wall);
             metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns, summary.streamed);
             let e = &summary.metrics.engine;
-            metrics.record_model(&model, None, e.eval_count, e.eval_duration_ns);
+            metrics.record_model(&model, &summary.provider, None, e.eval_count, e.eval_duration_ns);
             Json(anthropic_message_object(&id, &model, &content, &summary)).into_response()
         }
         Some(Err((m, (status, _)))) => {
@@ -2041,7 +2042,7 @@ async fn anthropic_stream_worker(
                 log_completion(&summary, wall);
                 metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns, summary.streamed);
                 let e = &summary.metrics.engine;
-                metrics.record_model(&model, None, e.eval_count, e.eval_duration_ns);
+                metrics.record_model(&model, &summary.provider, None, e.eval_count, e.eval_duration_ns);
                 if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 }))).await.is_err() {
                     return;
                 }
@@ -2673,6 +2674,7 @@ mod tests {
             streamed: false,
             claimed_tokens: None,
             recount_pending: false,
+            provider: String::new(),
         }
     }
 

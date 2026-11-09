@@ -165,11 +165,10 @@ pub fn build_swarm(
     // QUIC second: handles /udp/.../quic-v1 addresses (faster, UDP hole punch).
     // TCP last: fallback for /tcp/ addresses.
     // Errors unwrapped, so a dial error is the transport's own (`transport::addr_failure`).
-    // Load simulation: OPENHYDRA_TEST_NO_QUIC=1 builds the node without QUIC (what a QUIC connection costs).
-    // A private network has no QUIC: it can't carry the pre-shared key (see
-    // `transport::set_private_network_key`).
-    let private_network = crate::transport::private_network_key().is_some();
-    let quic_tcp = if private_network || std::env::var("OPENHYDRA_TEST_NO_QUIC").is_ok_and(|v| v == "1") {
+    // A private network has no QUIC, which can't carry the pre-shared key, unless a peer allowlist
+    // guards it (`transport::allow_quic_on_private_network`).
+    let no_quic = !crate::transport::quic_enabled();
+    let quic_tcp = if no_quic {
         tcp_transport
     } else {
         crate::transport::either_transport(quic_transport, tcp_transport)
@@ -291,8 +290,7 @@ pub fn build_swarm(
             // Which network we're on (`net=…`), so a node of another one on the same LAN isn't
             // joined to ours (review 2026-10-29).
             .with_agent_version(format!("openhydra-agent/{} net={}", env!("CARGO_PKG_VERSION"), opts.network_id))
-            // Load simulation (plan E7): OPENHYDRA_TEST_IDENTIFY_PUSH=0 stops the pushes.
-            .with_push_listen_addr_updates(std::env::var("OPENHYDRA_TEST_IDENTIFY_PUSH").map_or(true, |v| v != "0"))
+            .with_push_listen_addr_updates(true)
             // No address cache: identify would offer every address a peer claims (its loopback, its
             // LAN) to our dials. The admissible ones reach Kademlia, which offers those (L10).
             .with_cache_size(0),
@@ -477,8 +475,8 @@ pub fn build_swarm(
             tracing::info!(%addr, "F-9: skipping IPv6 listen addr (no working outbound IPv6)");
             continue;
         }
-        if private_network && addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1 | libp2p::multiaddr::Protocol::Quic)) {
-            tracing::info!(%addr, "private network: not listening on QUIC (it can't carry the network key)");
+        if no_quic && addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1 | libp2p::multiaddr::Protocol::Quic)) {
+            tracing::info!(%addr, "private network: not listening on QUIC (it can't carry the network key; see --private-network-quic)");
             continue;
         }
         swarm.listen_on(addr.clone())?;

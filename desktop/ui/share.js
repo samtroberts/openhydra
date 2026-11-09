@@ -14,6 +14,7 @@ import { renderChart } from "./chart";
 import { fmtNum, fmtUptime, modelIcon, fmtSigned, CREDITS_NOTE } from "./format";
 import { displayModelName, publicName } from "./models";
 import { exportCardModal, ensureImportSection } from "./cards";
+import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter } from "./swarmbinding";
 
   let sharingBusy = false;
   // `confirmed`: the caller is the share dialog, which just recorded the user's choice.
@@ -103,7 +104,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     if (scopeLoaded) return Promise.resolve();
     if (!scopeLoadPromise) {
       scopeLoadPromise = call("read_share_policy")
-        .then((r) => loadScope(r))
+        .then((r) => { loadScope(r); setTimeout(askSwarmBindingOnce, 0); })
         .catch(() => { scopeLoaded = true; })   // read failed → keep the safe default; don't loop
         .finally(() => { renderShare(); });
     }
@@ -334,6 +335,51 @@ import { exportCardModal, ensureImportSection } from "./cards";
     if (state?.settings) state.settings.sharing_confirmed = true;   // until the next poll brings it
     toast(`Sharing ${picked.models.length} model${picked.models.length === 1 ? "" : "s"} with ${picked.reach === "global" ? "everyone" : "your swarms"}`);
     if (!running) await setSharing(true, true);
+  }
+  // Asked once (phase 0.2): Private models shared before swarm binding are open to every swarm you
+  // own, including ones you create later. Keep that, or limit them to the swarms you own now; either
+  // way each model's badge changes it later. Any answer, a dismissal included, counts as asked.
+  let askingBinding = false;
+  async function askSwarmBindingOnce() {
+    if (askingBinding || store.get(SWARM_BINDING_ASKED, false)) return;
+    askingBinding = true;
+    try {
+      ensurePolicy();
+      let owned = [];
+      try { owned = (await call("list_swarms")).filter((s) => s.role === "owner"); } catch { return; }
+      const shared = policy.mode === "all" ? shareActiveModels() : [...policy.models];
+      const models = modelsToAskAbout({ shared, isGlobal, bindings: scope.swarms, owned, asked: false });
+      if (!models.length) return;
+      const names = owned.map((s) => s.label || "Unnamed swarm");
+      const back = document.createElement("div");
+      back.className = "cmodal-back";
+      setHTML(back, html`<div class="cmodal" data-binding-question><div class="cmodal-h"><b>Which swarms can use your private models?</b></div>
+        <div class="cmodal-b">
+        <p>${models.length === 1 ? "1 private model is" : `${models.length} private models are`} open to every swarm you own (${names.join(", ")}), and to any swarm you create later.</p>
+        <p class="mut" style="font-size:12px">${models.map((m) => displayModelName(m)).join(", ")}</p>
+        <p>Keep that, or limit ${models.length === 1 ? "it" : "them"} to the swarms you own now? You can change each model later from its swarms badge.</p>
+        </div>
+        <div class="cmodal-f"><button class="btn ghost sm keep">Keep: every swarm I own</button><button class="btn sm brand cur">Limit to my current swarms</button></div></div>`);
+      document.body.appendChild(back);
+      const answer = await new Promise((resolve) => {
+        const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done("keep"); } };
+        const done = (v) => { document.removeEventListener("keydown", onKey, true); back.remove(); resolve(v); };
+        document.addEventListener("keydown", onKey, true);
+        $(".keep", back).onclick = () => done("keep");
+        $(".cur", back).onclick = () => done("current");
+        back.onclick = (e) => { if (e.target === back) done("keep"); };
+      });
+      store.set(SWARM_BINDING_ASKED, true);
+      if (answer !== "current") return;
+      await reloadScope();
+      const before = snapScope();
+      scope.swarms = bindingsAfter("current", models, owned, scope.swarms || new Map());
+      if (await savePolicy(policy.mode, [...policy.models], before)) {
+        toast(`${models.length} private model${models.length === 1 ? "" : "s"} limited to your current swarm${owned.length === 1 ? "" : "s"}`);
+      }
+    } finally {
+      askingBinding = false;
+    }
   }
   // Choose which of your swarms can use a Private model. "Every swarm I own" removes the binding
   // (any owned swarm, including ones created later); otherwise only the ticked swarms are served.

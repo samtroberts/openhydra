@@ -142,43 +142,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peer_id = identity.libp2p_peer_id;
     let keypair = identity.keypair.clone();
-    // Load-test switches (bootstrap load simulation, 30 Oct): `--test-load` relaxes the per-IP and
-    // per-network limits (a few load-generator addresses would hit them at once); `--test-caps
-    // R,C,N` sets the relay's reservation and circuit caps and the incoming-connection cap. Never on
-    // a production bootstrap: refused outright on its identity.
-    let test_load = args.iter().any(|a| a == "--test-load");
-    let test_caps: Option<(usize, usize, u32)> = match parse_flag(&args, "--test-caps") {
-        Some(v) => {
-            let n: Vec<&str> = v.split(',').collect();
-            match (n.first().and_then(|x| x.parse().ok()), n.get(1).and_then(|x| x.parse().ok()), n.get(2).and_then(|x| x.parse().ok())) {
-                (Some(r), Some(c), Some(i)) => Some((r, c, i)),
-                _ => return Err("--test-caps takes RESERVATIONS,CIRCUITS,INCOMING[,CIRCUITS_PER_PEER]".into()),
-            }
-        }
-        None => None,
-    };
-    let test_circuits_per_peer: Option<usize> =
-        parse_flag(&args, "--test-caps").and_then(|v| v.split(',').nth(3).and_then(|x| x.parse().ok()));
-    // Load-test experiments (plan E5, E6): `--test-idle-timeout SECS` replaces the 300 s idle
-    // timeout; `--test-ping-close N` closes a connection after N ping failures in a row.
-    let test_idle_timeout: Option<u64> = match parse_flag(&args, "--test-idle-timeout") {
-        Some(v) => Some(v.parse().map_err(|e| format!("--test-idle-timeout: {e}"))?),
-        None => None,
-    };
-    let test_ping_close: Option<u32> = match parse_flag(&args, "--test-ping-close") {
-        Some(v) => Some(v.parse().map_err(|e| format!("--test-ping-close: {e}"))?),
-        None => None,
-    };
-    // Plan E1: `--test-close-dialback` closes a dial-back connection once it has connected (it
-    // proved the peer reachable; the peer's own connection carries everything else).
-    let test_close_dialback = args.iter().any(|a| a == "--test-close-dialback");
-    let test_any = test_load || test_caps.is_some() || test_idle_timeout.is_some() || test_ping_close.is_some() || test_close_dialback;
-    if test_any && public_bootstrap(&peer_id) {
-        return Err("--test-* flags are for load tests and never run on a production bootstrap".into());
-    }
-    if test_any {
-        warn!(test_load, ?test_caps, ?test_idle_timeout, ?test_ping_close, test_close_dialback, "LOAD-TEST MODE: limits relaxed; not for production");
-    }
     // The gossip mesh's upper bound (load tests A/B it; production keeps BOOTSTRAP_GOSSIP_MESH_MAX).
     let gossip_mesh_max: usize = match parse_flag(&args, "--gossip-mesh-max") {
         Some(v) => v.parse().map_err(|e| format!("--gossip-mesh-max: {e}"))?,
@@ -289,13 +252,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Relay server — accepts reservations from NATted peers.
     let relay_server = relay::Behaviour::new(peer_id, {
         let mut cfg = relay::Config {
-            max_reservations: test_caps.map_or(256, |c| c.0),
-            max_circuits: test_caps.map_or(512, |c| c.1),
+            max_reservations: 256,
+            max_circuits: 512,
             // Audit 4.1: 8 → 4. A free Ed25519 identity can hold up to this
             // many circuit slots; halving it doubles the identities an
             // attacker needs to squat all 512 slots. The single-host vector
             // is closed by the per-IP firewall caps in network_limits.sh.
-            max_circuits_per_peer: test_circuits_per_peer.unwrap_or(4),
+            max_circuits_per_peer: 4,
             // Durations stay at 1h until F-6 client-side circuit MIGRATION
             // lands (lowering them without migration would cut long relayed
             // inferences mid-session — F-5 renewal alone isn't enough; the
@@ -327,18 +290,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // its whole carrier-NAT address or /48 shares (review 2026-10-30).
         cfg.reservation_rate_limiters.push(Box::new(L::reservations_per_peer()));
         cfg.circuit_src_rate_limiters.push(Box::new(L::circuits_per_peer()));
-        if !test_load {
-            cfg.reservation_rate_limiters.insert(0, Box::new(HoldingsLimiter::new(
-                net_holdings.clone(), Held::Reservations, openhydra_network::relay::MAX_RESERVATIONS_PER_NETWORK)));
-            cfg.reservation_rate_limiters.push(Box::new(L::reservations_per_v4()));
-            cfg.reservation_rate_limiters.push(Box::new(L::reservations_per_64()));
-            cfg.reservation_rate_limiters.push(Box::new(L::reservations_per_48()));
-            cfg.circuit_src_rate_limiters.insert(0, Box::new(HoldingsLimiter::new(
-                net_holdings.clone(), Held::Circuits, openhydra_network::relay::MAX_CIRCUITS_PER_NETWORK)));
-            cfg.circuit_src_rate_limiters.push(Box::new(L::circuits_per_v4()));
-            cfg.circuit_src_rate_limiters.push(Box::new(L::circuits_per_64()));
-            cfg.circuit_src_rate_limiters.push(Box::new(L::circuits_per_48()));
-        }
+        cfg.reservation_rate_limiters.insert(0, Box::new(HoldingsLimiter::new(
+            net_holdings.clone(), Held::Reservations, openhydra_network::relay::MAX_RESERVATIONS_PER_NETWORK)));
+        cfg.reservation_rate_limiters.push(Box::new(L::reservations_per_v4()));
+        cfg.reservation_rate_limiters.push(Box::new(L::reservations_per_64()));
+        cfg.reservation_rate_limiters.push(Box::new(L::reservations_per_48()));
+        cfg.circuit_src_rate_limiters.insert(0, Box::new(HoldingsLimiter::new(
+            net_holdings.clone(), Held::Circuits, openhydra_network::relay::MAX_CIRCUITS_PER_NETWORK)));
+        cfg.circuit_src_rate_limiters.push(Box::new(L::circuits_per_v4()));
+        cfg.circuit_src_rate_limiters.push(Box::new(L::circuits_per_64()));
+        cfg.circuit_src_rate_limiters.push(Box::new(L::circuits_per_48()));
         cfg
     });
 
@@ -418,17 +379,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let behaviour = BootstrapBehaviour {
-        ip_limits: openhydra_network::ip_limits::Behaviour::new(if test_load {
-            openhydra_network::ip_limits::IpLimitsConfig { max_pending_per_ip: 1_000_000, max_established_per_ip: 1_000_000, max_established_per_v6: 1_000_000, exempt_loopback: true }
-        } else {
-            openhydra_network::ip_limits::IpLimitsConfig::BOOTSTRAP
-        }),
-        connection_limits: libp2p::connection_limits::Behaviour::new(match test_caps {
-            Some((_, _, incoming)) => openhydra_network::behaviour::bootstrap_connection_limits()
-                .with_max_established_incoming(Some(incoming))
-                .with_max_pending_incoming(Some(incoming.max(512))),
-            None => openhydra_network::behaviour::bootstrap_connection_limits(),
-        }),
+        ip_limits: openhydra_network::ip_limits::Behaviour::new(openhydra_network::ip_limits::IpLimitsConfig::BOOTSTRAP),
+        connection_limits: libp2p::connection_limits::Behaviour::new(openhydra_network::behaviour::bootstrap_connection_limits()),
         kademlia,
         relay_server,
         autonat_v2_server,
@@ -442,7 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 5.6: Reduced from 600s to 300s to match peer nodes and
     // reclaim dead connections faster.
     let swarm_config = SwarmConfig::with_tokio_executor()
-        .with_idle_connection_timeout(Duration::from_secs(test_idle_timeout.unwrap_or(300)));
+        .with_idle_connection_timeout(Duration::from_secs(300));
 
     let transport = openhydra_network::transport::with_setup_timeouts(
         transport,
@@ -471,11 +423,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut provider_quota = openhydra_network::dht::PutQuota::default();
     let mut total_circuits: u64 = 0;
     let mut denied_circuits: u64 = 0;
-    // Load tests: each open connection's kind (transport, direction), for the metrics endpoint;
-    // ping failures in a row per connection (`--test-ping-close`); connections closed for them.
+    // Each open connection's kind (transport, direction), for the metrics endpoint.
     let mut conn_kinds: std::collections::HashMap<libp2p::swarm::ConnectionId, &'static str> = Default::default();
-    let mut ping_fails: std::collections::HashMap<libp2p::swarm::ConnectionId, u32> = Default::default();
-    let mut ping_closed: u64 = 0;
 
     // Load tests read this every second (`--metrics-bind`, loopback only; off by default).
     let metrics_json = std::sync::Arc::new(std::sync::Mutex::new(String::from("{}")));
@@ -554,7 +503,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "gossip_rejected": gossip_rejected,
                     "gossip_ignored": gossip_ignored,
                     "conn_kinds": conn_kinds.values().fold(std::collections::BTreeMap::<&str, u64>::new(), |mut m, k| { *m.entry(k).or_default() += 1; m }),
-                    "ping_closed": ping_closed,
                 });
                 if let Ok(mut b) = metrics_json.lock() {
                     *b = json.to_string();
@@ -744,7 +692,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // and within its publisher's and network's share of the store.
                                         match openhydra_network::dht::check_put_record(&record, now_ms()) {
                                             Ok(peer_record) => {
-                                                let origin = if test_load { Some(source.to_base58()) } else { moved_conns.origin_of(&source) }.unwrap_or_else(|| format!("relayed:{source}"));
+                                                let origin = moved_conns.origin_of(&source).unwrap_or_else(|| format!("relayed:{source}"));
                                                 let newer = openhydra_network::dht::newer_than_stored(
                                                     swarm.behaviour_mut().kademlia.store_mut().get(&record.key).as_deref(),
                                                     &peer_record,
@@ -763,7 +711,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // libp2p-kad only hands on a provider record from the provider itself;
                                     // each provider and network gets its share of the provider store.
                                     kad::InboundRequest::AddProvider { record: Some(provider) } => {
-                                        let origin = if test_load { Some(provider.provider.to_base58()) } else { moved_conns.origin_of(&provider.provider) }.unwrap_or_else(|| format!("relayed:{}", provider.provider));
+                                        let origin = moved_conns.origin_of(&provider.provider).unwrap_or_else(|| format!("relayed:{}", provider.provider));
                                         if !provider_quota.admit(&provider.key, &provider.provider.to_base58(), &origin, std::time::Instant::now()) {
                                             debug!(provider = %provider.provider, %origin, "kademlia: refused an ADD_PROVIDER over its share");
                                         } else if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().add_provider(provider) {
@@ -859,7 +807,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 // are free, connections from many networks aren't (review
                                                 // 2026-10-29). A provider connects to every bootstrap itself.
                                                 // (Load tests: one generator's many peers share an address; count each peer as its own network.)
-                                                Ok(()) => match if test_load { moved_conns.origin_of(&author).map(|_| author.to_base58()) } else { moved_conns.origin_of(&author) } {
+                                                Ok(()) => match moved_conns.origin_of(&author) {
                                                     Some(origin) => {
                                                         if let Err(e) = openhydra_network::dht::check_record_age(&rec, now_ms()) {
                                                             debug!(%author_str, %e, "C7 registry: refused advert (time)");
@@ -951,19 +899,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(rtt) => {
                                         debug!(%peer, ?rtt, "ping: success");
                                         moved_conns.ping_ok(connection, std::time::Instant::now());
-                                        ping_fails.remove(&connection);
                                     }
                                     Err(error) => {
-                                        if let Some(n) = test_ping_close.filter(|_| !matches!(error, ping::Failure::Unsupported)) {
-                                            let fails = ping_fails.entry(connection).or_default();
-                                            *fails += 1;
-                                            if *fails >= n {
-                                                ping_fails.remove(&connection);
-                                                ping_closed += 1;
-                                                swarm.close_connection(connection);
-                                                continue;
-                                            }
-                                        }
                                         // (Debug: every connection of every peer can produce one every
                                         // 15–35 s, so a remote could fill the journal with them.)
                                         debug!(%peer, %error, "ping: failure");
@@ -1029,9 +966,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dial_failures.remove(&p);
                         if dial_back.finished(&connection_id) {
                             info!(%p, "dial-back connected: the routing table can list it now");
-                            if test_close_dialback {
-                                swarm.close_connection(connection_id);
-                            }
                         }
                         if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = &endpoint {
                             dial_back.inbound(p, send_back_addr);
@@ -1045,7 +979,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         moved_conns.closed(connection_id);
                         conn_kinds.remove(&connection_id);
-                        ping_fails.remove(&connection_id);
                         relay_ledger.connection_closed(p, endpoint.is_relayed()); relay_ledger.sync(&net_holdings);
                         // Only a connection that broke (an I/O error: a reset, a QUIC idle timeout —
                         // what every killed provider's last connection showed, e2e test 30 Oct) can

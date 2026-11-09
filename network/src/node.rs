@@ -133,7 +133,11 @@ pub fn start_node(
     // don't have its key: it runs as a private deployment, `--public-relays off`.
     let public_relays = effective_public_relays(config);
     if let Some(key) = crate::transport::private_network_key() {
-        info!(fingerprint = %crate::transport::private_network_fingerprint(&key), "private network: TCP and relay circuits keyed, no QUIC, no public bootstraps or relays");
+        info!(
+            fingerprint = %crate::transport::private_network_fingerprint(&key),
+            quic = crate::transport::quic_enabled(),
+            "private network: TCP and relay circuits keyed, QUIC only with a peer allowlist, no public bootstraps or relays"
+        );
     }
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
     let mut bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;

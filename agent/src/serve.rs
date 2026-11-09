@@ -529,6 +529,9 @@ pub struct ServeSummary {
     /// Consumer-side: the tokenizer check of this serve's bill is still running (the counters were
     /// busy); `tokens` is the bill until it settles.
     pub recount_pending: bool,
+    /// Consumer-side: the provider that served (its libp2p id), for per-provider metrics. Empty
+    /// provider-side.
+    pub provider: String,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -558,6 +561,7 @@ pub fn handle_serve_request(
                 streamed: false,
                 claimed_tokens: None,
                 recount_pending: false,
+                provider: String::new(),
             };
         }
     };
@@ -706,6 +710,7 @@ pub fn handle_serve_request_watched(
                 streamed: false,
                 claimed_tokens: None,
                 recount_pending: false,
+                provider: String::new(),
             }
         }
         Err(e) => {
@@ -721,6 +726,8 @@ pub fn handle_serve_request_watched(
                 streamed: false,
                 claimed_tokens: None,
                 recount_pending: false,
+
+                provider: String::new(),
             }
         }
     }

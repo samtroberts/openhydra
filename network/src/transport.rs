@@ -30,6 +30,29 @@ pub fn set_private_network_key(key: libp2p::pnet::PreSharedKey) -> Result<(), St
     PRIVATE_NETWORK_KEY.set(key).map_err(|_| "a private network key is already set".to_string())
 }
 
+/// Whether QUIC stays on with the private-network key ([`allow_quic_on_private_network`]).
+static PRIVATE_NETWORK_QUIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep QUIC on alongside the private-network key. QUIC can't carry the key, so a QUIC connection is
+/// guarded by the peer allowlist instead (QUIC's TLS handshake proves the peer's id, and the fence
+/// refuses any id not on the list): TCP and relay circuits need the key, QUIC needs a listed id.
+/// Refused unless a peer allowlist is set ([`crate::fence::set_allowed_peers`]) — without one, QUIC
+/// would let in anyone.
+pub fn allow_quic_on_private_network() -> Result<(), String> {
+    if crate::fence::allowed_peers().is_none() {
+        return Err("QUIC on a private network needs a peer allowlist (it can't carry the network key)".into());
+    }
+    PRIVATE_NETWORK_QUIC.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Whether this node runs QUIC: always off the private network; on it, only when allowed and a peer
+/// allowlist is set (checked again here, so QUIC never runs unguarded).
+pub fn quic_enabled() -> bool {
+    private_network_key().is_none()
+        || (PRIVATE_NETWORK_QUIC.load(std::sync::atomic::Ordering::Acquire) && crate::fence::allowed_peers().is_some())
+}
+
 /// The private-network key, when one is set ([`set_private_network_key`]).
 pub fn private_network_key() -> Option<libp2p::pnet::PreSharedKey> {
     PRIVATE_NETWORK_KEY.get().copied()
@@ -253,21 +276,9 @@ pub fn addrs_refused_as_in_use(error: &libp2p::swarm::DialError) -> Vec<libp2p::
         .collect()
 }
 
-/// The yamux settings: libp2p's defaults, unless a load test sets
-/// `OPENHYDRA_TEST_YAMUX_WINDOW_KB` (receive window and buffer per stream) or
-/// `OPENHYDRA_TEST_YAMUX_STREAMS` (streams per connection) — bootstrap load simulation, 30 Oct.
-#[allow(deprecated)]
+/// The yamux settings: libp2p's defaults.
 fn yamux_config() -> yamux::Config {
-    let mut cfg = yamux::Config::default();
-    if let Some(kb) = std::env::var("OPENHYDRA_TEST_YAMUX_WINDOW_KB").ok().and_then(|v| v.parse::<u32>().ok()) {
-        // yamux 0.12 refuses a window under its 256 KiB default (it panics): only the buffer can shrink.
-        cfg.set_receive_window_size(kb.max(256) * 1024);
-        cfg.set_max_buffer_size(kb as usize * 1024);
-    }
-    if let Some(n) = std::env::var("OPENHYDRA_TEST_YAMUX_STREAMS").ok().and_then(|v| v.parse::<usize>().ok()) {
-        cfg.set_max_num_streams(n);
-    }
-    cfg
+    yamux::Config::default()
 }
 
 /// Two transports in one, trying `a` first: [`libp2p::core::transport::OrTransport`] with its
@@ -398,20 +409,11 @@ pub fn build_quic_transport(
     keypair: &identity::Keypair,
 ) -> std::io::Result<libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>>
 {
-    let mut quic_config = libp2p::quic::Config::new(keypair)
+    let quic_config = libp2p::quic::Config::new(keypair)
         .initial_mtu(1452)
         .congestion_controller_factory(Arc::new(
             quinn::congestion::BbrConfig::default(),
         ));
-    // Load simulation (plan E3): OPENHYDRA_TEST_QUIC_WINDOW_KB caps the per-stream and per-connection receive
-    // windows (default 10 MB / 15 MB), OPENHYDRA_TEST_QUIC_STREAMS the concurrent streams (default 256).
-    if let Some(kb) = std::env::var("OPENHYDRA_TEST_QUIC_WINDOW_KB").ok().and_then(|v| v.parse::<u32>().ok()) {
-        quic_config.max_stream_data = kb.max(64) * 1024;
-        quic_config.max_connection_data = kb.max(64) * 1024 * 3 / 2;
-    }
-    if let Some(n) = std::env::var("OPENHYDRA_TEST_QUIC_STREAMS").ok().and_then(|v| v.parse::<u32>().ok()) {
-        quic_config.max_concurrent_stream_limit = n.max(8);
-    }
     let quic_transport = libp2p::quic::tokio::Transport::new(quic_config)
     .map(|(peer_id, muxer), _| (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)))
     .boxed();

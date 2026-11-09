@@ -744,8 +744,6 @@ fn rep_model_key<'a>(_canonical_model_id: &'a str, model_id: &'a str) -> &'a str
 const LOAD_REPORT_FRESH_MS: u64 = 60_000;
 /// At most this many providers' load reports are kept.
 const MAX_LOAD_REPORTS: usize = 4_096;
-/// How many of the leading, equally eligible candidates [`spread_load`] chooses among.
-const SPREAD_AMONG: usize = 4;
 /// How far below the first candidate's earned reputation (0–100), or below the neutral 50 when the
 /// first has earned more, another may be and still share its load. A failed serve multiplies
 /// reputation by 0.6 (20 points from the neutral 50), so a provider that just failed us isn't
@@ -849,13 +847,14 @@ impl Drop for OpenServe<'_> {
     }
 }
 
-/// Spread requests across equally good providers: of the first `eligible` candidates (at most
-/// [`SPREAD_AMONG`]), take two at random and move the less busy one to the front ("the power of two
-/// choices"). The order behind it is kept for failover. Picking between two random candidates rather
+/// Spread requests across equally good providers: of the first `eligible` candidates, take two at
+/// random and move the less busy one to the front ("the power of two choices", which keeps the
+/// busiest close to the mean however many there are). Every eligible candidate is in the draw: a
+/// fixed few at the top would get all the work, and, gaining reputation from it, keep it. The order behind it is kept for failover. Picking between two random candidates rather
 /// than always the least busy avoids every consumer piling onto the same provider at once.
 /// `pick(n)` returns a random index below `n`.
 fn spread_load<T>(candidates: &mut [T], eligible: usize, busy: &dyn Fn(&T) -> f64, pick: &mut dyn FnMut(usize) -> usize) {
-    let n = eligible.min(candidates.len()).min(SPREAD_AMONG);
+    let n = eligible.min(candidates.len());
     if n < 2 {
         return;
     }
@@ -1032,6 +1031,7 @@ pub fn request_completion(
                     streamed: false,
                     claimed_tokens: None,
                     recount_pending: false,
+                    provider: String::new(),
                 })
             }
         }
@@ -1554,6 +1554,7 @@ fn dispatch_stream_slice(
                     streamed: false,
                     claimed_tokens: None,
                     recount_pending: false,
+                    provider: String::new(),
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
@@ -3652,6 +3653,7 @@ impl ConsumerNode {
                     summary.discover_ns = discover_ns;
                     summary.proxy_roundtrip_ns = proxy_roundtrip_ns;
                     summary.streamed = streamed;
+                    summary.provider = provider_libp2p.clone();
                     // The tier the routing decision saw for this provider, for the client to see.
                     if !self.is_self_serve(&provider_libp2p) {
                         summary.authenticity = Some(self.authenticity_of(&provider.state_id, model_key_now, now));
@@ -8121,32 +8123,54 @@ mod tests {
         assert_eq!(busy_estimate(0, l(1, 0)), 1.0, "a zero capacity reads as one slot");
     }
 
-    #[test]
-    fn the_power_of_two_choices_spreads_requests_evenly() {
-        // 4 equally eligible providers share 16 open requests that arrive and finish at random. The
-        // busiest one, averaged over time, stays within 1.5x the mean (4); always taking the
-        // top-ranked provider would put all 16 on one.
+    /// Simulate `providers` equally eligible providers sharing `4 * providers` open requests that
+    /// arrive and finish at random. Returns (the highest of the providers' time-averaged loads, the
+    /// busiest provider's load at each moment averaged over time, the fewest requests any provider
+    /// received).
+    fn simulate_spread(providers: usize, seed: u64) -> (f64, f64, u64) {
         use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
-        let mut load = [0u32; 4];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut load = vec![0u32; providers];
+        let mut load_sum = vec![0u64; providers];
+        let mut served = vec![0u64; providers];
         let mut open: Vec<usize> = Vec::new();
         let (mut busiest_sum, mut samples) = (0u64, 0u64);
-        for step in 0..20_000 {
-            let mut order: Vec<usize> = (0..4).collect();
-            spread_load(&mut order, 4, &|&p| f64::from(load[p]), &mut |n| rng.gen_range(0..n));
+        for step in 0..5_000 * providers.max(4) {
+            let mut order: Vec<usize> = (0..providers).collect();
+            spread_load(&mut order, providers, &|&p| f64::from(load[p]), &mut |n| rng.gen_range(0..n));
             load[order[0]] += 1;
+            served[order[0]] += 1;
             open.push(order[0]);
-            if open.len() > 16 {
+            if open.len() > 4 * providers {
                 let done = open.swap_remove(rng.gen_range(0..open.len()));
                 load[done] -= 1;
             }
             if step > 1_000 {
                 busiest_sum += u64::from(*load.iter().max().unwrap());
+                for (sum, l) in load_sum.iter_mut().zip(&load) {
+                    *sum += u64::from(*l);
+                }
                 samples += 1;
             }
         }
-        let busiest = busiest_sum as f64 / samples as f64;
-        assert!(busiest <= 6.0, "the busiest provider averaged {busiest:.2} of 4 per provider");
+        let highest_average = *load_sum.iter().max().unwrap() as f64 / samples as f64;
+        (highest_average, busiest_sum as f64 / samples as f64, *served.iter().min().unwrap())
+    }
+
+    #[test]
+    fn the_power_of_two_choices_spreads_requests_evenly() {
+        // 4 to 50 equally eligible providers, 4 open requests each on average (a light load, where
+        // spreading is hardest). Over time no provider carries more than 1.5x the mean (plan 0.4);
+        // at any moment the busiest is within a few requests of it (the power of two choices keeps
+        // it about ln ln n / ln 2 above, where always taking the top-ranked would put everything on
+        // one); and every provider takes work (a draw among the first few would leave the rest idle).
+        for (providers, seed) in [(4, 7), (10, 8), (25, 9), (50, 10)] {
+            let (highest_average, busiest, fewest) = simulate_spread(providers, seed);
+            eprintln!("{providers} providers: highest average {highest_average:.2}, busiest {busiest:.2}, fewest served {fewest} (mean load 4)");
+            assert!(highest_average <= 6.0, "{providers} providers: one averaged {highest_average:.2} against a mean of 4");
+            assert!(busiest <= 7.0, "{providers} providers: the busiest averaged {busiest:.2} against a mean of 4");
+            assert!(fewest > 0, "{providers} providers: one was never chosen");
+        }
     }
 
 }

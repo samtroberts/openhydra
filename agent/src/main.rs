@@ -121,10 +121,17 @@ struct NodeArgs {
     /// Join the private network keyed by this file (a go-libp2p / IPFS `swarm.key`; make one with
     /// `openhydra-agent network-key --out <file>`). Every TCP connection and relay circuit is
     /// encrypted with the key, so a node without it can't connect or relay at all. QUIC is off (it
-    /// can't carry the key), and so are OpenHydra's public bootstraps and relays: give the
+    /// can't carry the key; see `--private-network-quic`), and so are OpenHydra's public bootstraps
+    /// and relays: give the
     /// deployment's own with `--bootstrap`. Every node of the deployment needs the same file.
     #[arg(long = "private-network-key-file")]
     private_network_key_file: Option<std::path::PathBuf>,
+
+    /// Keep QUIC on with `--private-network-key-file`. QUIC can't carry the network key, so its
+    /// connections are guarded by `--allow-peers-file` instead (required): TCP and relay circuits
+    /// need the key, QUIC needs a listed peer id. QUIC punches through NATs better than TCP.
+    #[arg(long = "private-network-quic", requires_all = ["private_network_key_file", "allow_peers_file"])]
+    private_network_quic: bool,
 
     /// Serve a read-only introspection endpoint (peers / DHT / swarm / transfer
     /// counters as JSON) on this address, e.g. `127.0.0.1:9464` or `127.0.0.1:0`
@@ -187,8 +194,16 @@ impl NodeArgs {
             if let Err(e) = openhydra_network::transport::set_private_network_key(key) {
                 fail(e);
             }
+            // The allowlist was set above, so this can check it is there.
+            if self.private_network_quic {
+                if let Err(e) = openhydra_network::transport::allow_quic_on_private_network() {
+                    eprintln!("openhydra-agent: --private-network-quic: {e}");
+                    std::process::exit(2);
+                }
+            }
+            let quic = if self.private_network_quic { "QUIC for allowlisted peers" } else { "no QUIC" };
             eprintln!(
-                "openhydra-agent: private network {} (TCP and relay circuits only; no QUIC, no OpenHydra public bootstraps or relays)",
+                "openhydra-agent: private network {} (TCP and relay circuits keyed; {quic}; no OpenHydra public bootstraps or relays)",
                 openhydra_network::transport::private_network_fingerprint(&key)
             );
         }
@@ -332,6 +347,9 @@ enum SwarmAction {
     List(SwarmDirArg),
     /// (Owner) Revoke a member by its public key.
     Revoke(SwarmRevokeArgs),
+    /// (Member) Leave a swarm: delete this node's credential for it, so it no longer presents one.
+    /// Refused for a swarm you own (see `forget`). The owner can revoke the credential as well.
+    Leave(SwarmLeaveArgs),
     /// Leave or forget a swarm: delete this node's record of it. A member's credential is dropped;
     /// an owner's group key is destroyed (needs `--yes`).
     Forget(SwarmForgetArgs),
@@ -438,6 +456,15 @@ struct SwarmForgetArgs {
     /// or checked for it again and every member's access ends.
     #[arg(long)]
     yes: bool,
+    #[command(flatten)]
+    dir: SwarmDirArg,
+}
+
+#[derive(Args)]
+struct SwarmLeaveArgs {
+    /// The swarm (group public key) to leave.
+    #[arg(long)]
+    swarm: String,
     #[command(flatten)]
     dir: SwarmDirArg,
 }
@@ -1340,6 +1367,22 @@ fn run() -> Result<(), String> {
                         a.member.trim(),
                     )?;
                     println!("revoked {}", a.member.trim());
+                }
+                SwarmAction::Leave(a) => {
+                    let dir = resolve_dir(a.dir.swarms_dir);
+                    let pk = a.swarm.trim();
+                    match openhydra_agent::swarms::read_swarm(&dir, pk)? {
+                        None => return Err(format!("no swarm {pk} in {}", dir.display())),
+                        Some(rec) if rec.role == openhydra_agent::swarms::SwarmRole::Owner => {
+                            return Err(format!(
+                                "you own swarm {pk}, so you can't leave it: `swarm forget --swarm {pk} --yes` deletes \
+                                 it (and ends every member's access)"
+                            ))
+                        }
+                        Some(_) => {}
+                    }
+                    openhydra_agent::swarms::forget_swarm(&dir, pk)?;
+                    println!("left swarm {pk}: this node's credential for it is deleted");
                 }
                 SwarmAction::Forget(a) => {
                     let dir = resolve_dir(a.dir.swarms_dir);

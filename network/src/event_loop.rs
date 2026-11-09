@@ -3000,7 +3000,6 @@ fn request_reservation(
 /// listener of ours on it, once, at its first listed address.
 fn relays_to_reserve(state: &LoopState) -> Vec<(PeerId, Multiaddr)> {
     let mut out: Vec<(PeerId, Multiaddr)> = Vec::new();
-    let allowed = test_reserve_relays(state);
     for relay_multiaddr in &state.relays {
         let Some(relay) = relay_multiaddr.iter().find_map(|p| match p {
             libp2p::multiaddr::Protocol::P2p(id) => Some(id),
@@ -3011,29 +3010,9 @@ fn relays_to_reserve(state: &LoopState) -> Vec<(PeerId, Multiaddr)> {
         if relay_has_listener(state, relay) || out.iter().any(|(r, _)| *r == relay) {
             continue;
         }
-        if allowed.as_ref().is_some_and(|a| !a.contains(&relay)) {
-            continue;
-        }
         out.push((relay, relay_multiaddr.clone().with(libp2p::multiaddr::Protocol::P2pCircuit)));
     }
     out
-}
-
-/// Bootstrap load simulation (plan E9, "policy B"): `OPENHYDRA_TEST_RESERVE_RELAYS=K` reserves on
-/// only K of our relays (0 = none), picked by hashing our peer id with each relay's, so peers spread
-/// evenly across relays. `None` (unset) = every relay, as today.
-fn test_reserve_relays(state: &LoopState) -> Option<Vec<PeerId>> {
-    use std::hash::{Hash, Hasher};
-    let k: usize = std::env::var("OPENHYDRA_TEST_RESERVE_RELAYS").ok()?.parse().ok()?;
-    let mut relays = crate::relay::relay_peer_ids(&state.relays);
-    relays.sort_by_key(|r| {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (state.local_libp2p.as_str(), r.to_bytes()).hash(&mut h);
-        h.finish()
-    });
-    relays.dedup();
-    relays.truncate(k);
-    Some(relays)
 }
 
 /// Reserve once on every relay in `state.relays` that we don't hold or request a reservation on.

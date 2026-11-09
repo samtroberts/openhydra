@@ -29,9 +29,10 @@ const LATENCY_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.
 /// Upper bounds (tokens a second) for the decode-speed histogram: a CPU model to a fast GPU.
 const SPEED_BUCKETS: &[f64] = &[5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0];
 
-/// At most this many models get their own series; the rest are counted under `model="other"`, so a
-/// client naming random models can't grow the registry without bound.
-const MAX_MODEL_SERIES: usize = 64;
+/// At most this many (model, provider) pairs get their own series; the rest are counted under
+/// `model="other",provider="other"`, so a client naming random models can't grow the registry
+/// without bound.
+const MAX_MODEL_SERIES: usize = 256;
 
 /// A Prometheus label value with `\`, `"` and line breaks escaped (model names come from clients).
 fn label_value(v: &str) -> String {
@@ -117,8 +118,8 @@ pub struct Metrics {
     /// Time to a streamed serve's first acknowledgement (a different quantity from a buffered
     /// serve's full round trip, so kept apart).
     stream_first_ack: Histogram,
-    /// Time to first token and decode speed, per model ([`MAX_MODEL_SERIES`] at most).
-    per_model: std::sync::Mutex<std::collections::BTreeMap<String, ModelTimings>>,
+    /// Time to first token and decode speed, per (model, provider) ([`MAX_MODEL_SERIES`] at most).
+    per_model: std::sync::Mutex<std::collections::BTreeMap<(String, String), ModelTimings>>,
 }
 
 impl Default for Metrics {
@@ -172,13 +173,16 @@ impl Metrics {
         }
     }
 
-    /// One completion's per-model timings: its time to first token (when the caller measured one) and
-    /// the engine's decode speed (when the engine reported enough tokens over enough time to mean
-    /// anything: at least 2 tokens over at least 1 ms).
-    pub fn record_model(&self, model: &str, ttft: Option<Duration>, eval_count: u64, eval_duration_ns: u64) {
+    /// One completion's timings, by model and by the provider that served it (its libp2p id; empty
+    /// when unknown): its time to first token (when the caller measured one) and the engine's decode
+    /// speed (when the engine reported enough tokens over enough time to mean anything: at least 2
+    /// tokens over at least 1 ms). Sum the series over `provider` for a model's figures.
+    pub fn record_model(&self, model: &str, provider: &str, ttft: Option<Duration>, eval_count: u64, eval_duration_ns: u64) {
         let mut m = self.per_model.lock().unwrap_or_else(|e| e.into_inner());
-        let key = if m.contains_key(model) || m.len() < MAX_MODEL_SERIES { model } else { "other" };
-        let t = m.entry(key.to_string()).or_insert_with(|| ModelTimings {
+        let provider = if provider.is_empty() { "local" } else { provider };
+        let key = (model.to_string(), provider.to_string());
+        let key = if m.contains_key(&key) || m.len() < MAX_MODEL_SERIES { key } else { ("other".into(), "other".into()) };
+        let t = m.entry(key).or_insert_with(|| ModelTimings {
             ttft: Histogram::new(LATENCY_BUCKETS),
             decode_speed: Histogram::new(SPEED_BUCKETS),
         });
@@ -221,13 +225,13 @@ impl Metrics {
         self.stream_first_ack.render("openhydra_stream_first_ack_seconds", "Time to a streamed serve's first acknowledgement.", &mut out);
         let per_model = self.per_model.lock().unwrap_or_else(|e| e.into_inner());
         for (name, help, pick) in [
-            ("openhydra_time_to_first_token_seconds", "Time from the request to the first token reaching the client, per model.", 0),
-            ("openhydra_decode_tokens_per_second", "The engine's decode speed per completion, per model.", 1),
+            ("openhydra_time_to_first_token_seconds", "Time from the request to the first token reaching the client, per model and provider.", 0),
+            ("openhydra_decode_tokens_per_second", "The engine's decode speed per completion, per model and provider.", 1),
         ] {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
-            for (model, t) in per_model.iter() {
+            for ((model, provider), t) in per_model.iter() {
                 let h = if pick == 0 { &t.ttft } else { &t.decode_speed };
-                h.render_series(name, &format!("model=\"{}\",", label_value(model)), &mut out);
+                h.render_series(name, &format!("model=\"{}\",provider=\"{}\",", label_value(model), label_value(provider)), &mut out);
             }
         }
         out
@@ -287,17 +291,20 @@ mod tests {
     #[test]
     fn per_model_timings_are_labelled_escaped_and_bounded() {
         let m = Metrics::new();
-        m.record_model("qwen2.5:1.5b", Some(Duration::from_millis(300)), 48, 600_000_000);
-        m.record_model("qwen2.5:1.5b", None, 1, 1_000); // too little to be a speed
-        m.record_model("odd\"name\n", Some(Duration::from_millis(80)), 0, 0);
+        m.record_model("qwen2.5:1.5b", "12D3KooWA", Some(Duration::from_millis(300)), 48, 600_000_000);
+        m.record_model("qwen2.5:1.5b", "12D3KooWA", None, 1, 1_000); // too little to be a speed
+        m.record_model("qwen2.5:1.5b", "12D3KooWB", Some(Duration::from_millis(2_000)), 0, 0);
+        m.record_model("odd\"name\n", "", Some(Duration::from_millis(80)), 0, 0);
         for i in 0..MAX_MODEL_SERIES + 5 {
-            m.record_model(&format!("m{i}"), Some(Duration::from_millis(10)), 0, 0);
+            m.record_model(&format!("m{i}"), "12D3KooWA", Some(Duration::from_millis(10)), 0, 0);
         }
         let out = m.render_prometheus();
-        assert!(out.contains("openhydra_time_to_first_token_seconds_bucket{model=\"qwen2.5:1.5b\",le=\"0.5\"} 1"), "{out}");
-        assert!(out.contains("openhydra_decode_tokens_per_second_count{model=\"qwen2.5:1.5b\"} 1"), "{out}");
-        assert!(out.contains("model=\"odd\\\"name\\n\""), "escaped: {out}");
-        assert!(out.contains("model=\"other\""), "overflow goes to other");
+        let a = "model=\"qwen2.5:1.5b\",provider=\"12D3KooWA\"";
+        assert!(out.contains(&format!("openhydra_time_to_first_token_seconds_bucket{{{a},le=\"0.5\"}} 1")), "{out}");
+        assert!(out.contains(&format!("openhydra_decode_tokens_per_second_count{{{a}}} 1")), "{out}");
+        assert!(out.contains("openhydra_time_to_first_token_seconds_bucket{model=\"qwen2.5:1.5b\",provider=\"12D3KooWB\",le=\"2.5\"} 1"), "per provider: {out}");
+        assert!(out.contains("model=\"odd\\\"name\\n\",provider=\"local\""), "escaped: {out}");
+        assert!(out.contains("model=\"other\",provider=\"other\""), "overflow goes to other");
         let series = out.lines().filter(|l| l.starts_with("openhydra_time_to_first_token_seconds_count")).count();
         assert_eq!(series, MAX_MODEL_SERIES + 1, "bounded: {series}");
     }

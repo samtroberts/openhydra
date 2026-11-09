@@ -199,11 +199,7 @@ fn run_peer(
         // comes through the test bootstrap's relay (and hole punching has nothing to work with).
         vec!["/ip4/127.0.0.1/tcp/0".to_string()]
     } else {
-        if std::env::var("OPENHYDRA_TEST_NO_QUIC").is_ok_and(|v| v == "1") {
-            vec!["/ip4/0.0.0.0/tcp/0".to_string()]
-        } else {
-            vec!["/ip4/0.0.0.0/tcp/0".to_string(), "/ip4/0.0.0.0/udp/0/quic-v1".to_string()]
-        }
+        vec!["/ip4/0.0.0.0/tcp/0".to_string(), "/ip4/0.0.0.0/udp/0/quic-v1".to_string()]
     };
     let config = NodeConfig {
         identity_path: dir.join(format!("{role}-{i}.key")),
