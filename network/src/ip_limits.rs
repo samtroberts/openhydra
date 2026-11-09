@@ -27,17 +27,38 @@ use libp2p::{Multiaddr, PeerId};
 pub struct IpLimitsConfig {
     /// Still being set up (handshakes).
     pub max_pending_per_ip: u32,
-    /// Established.
+    /// Established, per IPv4 address.
     pub max_established_per_ip: u32,
+    /// Established, per IPv6 /64 (a /48 may hold [`SITE_SHARE`] times as many). Lower than the IPv4
+    /// limit on a bootstrap: many users share one IPv4 address behind carrier-grade NAT, while a /64
+    /// is one home or host (review 2026-10-29: at 256, one /64 could hold every relay slot).
+    pub max_established_per_v6: u32,
     /// Loopback connections aren't counted.
     pub exempt_loopback: bool,
 }
 
 impl IpLimitsConfig {
     /// A peer node.
-    pub const PEER: Self = Self { max_pending_per_ip: 8, max_established_per_ip: 32, exempt_loopback: true };
+    pub const PEER: Self = Self { max_pending_per_ip: 8, max_established_per_ip: 32, max_established_per_v6: 32, exempt_loopback: true };
     /// A bootstrap: carrier-grade NAT puts many users behind one IPv4 address.
-    pub const BOOTSTRAP: Self = Self { max_pending_per_ip: 32, max_established_per_ip: 256, exempt_loopback: true };
+    pub const BOOTSTRAP: Self =
+        Self { max_pending_per_ip: 32, max_established_per_ip: 256, max_established_per_v6: 32, exempt_loopback: true };
+}
+
+/// The network an IP counts under when what one source may hold is capped (registry entries, DHT
+/// records): an IPv4 address (carrier-grade NAT puts many users behind one), or an IPv6 /48 (one
+/// site; a /64 alone is cheap to multiply, review 2026-10-29).
+pub fn origin_key(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+            }
+        },
+    }
 }
 
 /// How many times one address's limit an IPv6 /48 may hold.
@@ -186,10 +207,14 @@ impl NetworkBehaviour for Behaviour {
         remote: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         self.forget_pending(connection_id);
-        let per_ip = self.config.max_established_per_ip;
+        let (per_ip, per_v6) = (self.config.max_established_per_ip, self.config.max_established_per_v6);
         let nets = nets_of(remote, self.config.exempt_loopback);
-        if let Some(full) = nets.iter().find(|n| self.established_per_net.get(n).copied().unwrap_or(0) >= n.limit(per_ip)) {
-            return Err(ConnectionDenied::new(TooManyFromThisAddress { pending: false, limit: full.limit(per_ip) }));
+        let limit = |n: &Net| match n {
+            Net::V4(_) => per_ip,
+            _ => n.limit(per_v6),
+        };
+        if let Some(full) = nets.iter().find(|n| self.established_per_net.get(n).copied().unwrap_or(0) >= limit(n)) {
+            return Err(ConnectionDenied::new(TooManyFromThisAddress { pending: false, limit: limit(full) }));
         }
         Ok(dummy::ConnectionHandler)
     }
@@ -241,6 +266,35 @@ impl NetworkBehaviour for Behaviour {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bootstrap_holds_fewer_connections_per_ipv6_64_than_per_ipv4_address() {
+        let c = IpLimitsConfig::BOOTSTRAP;
+        let mut b = Behaviour::new(c);
+        let local: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
+        let mut held = |remote: &str, n: u32| -> u32 {
+            let remote: Multiaddr = remote.parse().unwrap();
+            let mut ok = 0;
+            for i in 0..n {
+                let id = ConnectionId::new_unchecked(10_000 + ok as usize + i as usize * 100_000);
+                let peer = PeerId::random();
+                if b.handle_established_inbound_connection(id, peer, &local, &remote).is_ok() {
+                    let endpoint = libp2p::core::ConnectedPoint::Listener { local_addr: local.clone(), send_back_addr: remote.clone() };
+                    b.on_swarm_event(FromSwarm::ConnectionEstablished(libp2p::swarm::behaviour::ConnectionEstablished {
+                        peer_id: peer,
+                        connection_id: id,
+                        endpoint: &endpoint,
+                        failed_addresses: &[],
+                        other_established: 0,
+                    }));
+                    ok += 1;
+                }
+            }
+            ok
+        };
+        assert_eq!(held("/ip6/2001:db8:1:1::1/tcp/5", 100), c.max_established_per_v6);
+        assert_eq!(held("/ip4/203.0.113.9/tcp/5", 300), c.max_established_per_ip);
+    }
     use futures::StreamExt;
     use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
     use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
@@ -268,7 +322,7 @@ mod tests {
     /// QUIC connection being set up (its sender unproven) isn't counted per address.
     #[test]
     fn many_slash_64s_of_one_site_share_its_limit_and_unproven_quic_is_not_counted() {
-        let config = IpLimitsConfig { max_pending_per_ip: 2, max_established_per_ip: 2, exempt_loopback: true };
+        let config = IpLimitsConfig { max_pending_per_ip: 2, max_established_per_ip: 2, max_established_per_v6: 2, exempt_loopback: true };
         let mut b = Behaviour::new(config);
         let local: Multiaddr = "/ip6/::/tcp/4001".parse().unwrap();
         let mut held = 0;
@@ -308,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn one_address_cannot_make_us_hold_more_than_its_share() {
         // Loopback counted here, so the test's connections (all from 127.0.0.1) are one address.
-        let config = IpLimitsConfig { max_pending_per_ip: 64, max_established_per_ip: 6, exempt_loopback: false };
+        let config = IpLimitsConfig { max_pending_per_ip: 64, max_established_per_ip: 6, max_established_per_v6: 6, exempt_loopback: false };
         let mut a = node(config);
         a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
         let addr = loop {
@@ -372,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn silent_sockets_from_one_address_leave_room_for_others() {
-        let config = IpLimitsConfig { max_pending_per_ip: 3, max_established_per_ip: 32, exempt_loopback: false };
+        let config = IpLimitsConfig { max_pending_per_ip: 3, max_established_per_ip: 32, max_established_per_v6: 32, exempt_loopback: false };
         let mut a = node(config);
         a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
         let addr = loop {

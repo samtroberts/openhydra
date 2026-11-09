@@ -19,6 +19,33 @@ use crate::relay::{LeechRateLimiter, LeechTable, PER_CIRCUIT_BUDGET_BYTES};
 /// add per-model topics once the coordinator has logic to subscribe /
 /// unsubscribe as models come and go.
 pub const GOSSIPSUB_TOPIC: &str = "openhydra/swarm/v1/events";
+
+/// Gossipsub as OpenHydra runs it: only [`GOSSIPSUB_TOPIC`] can be subscribed to.
+pub type GossipBehaviour = gossipsub::Behaviour<gossipsub::IdentityTransform, gossipsub::WhitelistSubscriptionFilter>;
+
+/// The only topic a peer's subscriptions are kept for. Upstream keeps every topic a peer names, so
+/// one connection could subscribe to 100,000 topics (305 MB on a bootstrap, review 2026-10-29).
+pub fn gossip_topic_filter() -> gossipsub::WhitelistSubscriptionFilter {
+    gossipsub::WhitelistSubscriptionFilter(
+        [gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC).hash()].into_iter().collect(),
+    )
+}
+
+/// The largest gossip message sent or accepted: upstream's 64 KB, the size every deployed node
+/// uses. Lowering it isn't safe while other nodes don't: one message between the two limits, which
+/// older nodes accept and forward, breaks the stream it reaches a lower-limit node on, and gossip
+/// from that peer stops without an error (review 2026-10-29, reproduced at 32 KB).
+pub const GOSSIP_MAX_TRANSMIT: usize = 64 * 1024;
+
+/// How long a gossip message id is remembered to drop duplicates. Upstream's 60 s let a flood of
+/// distinct messages pile up ids for a minute; every honest copy of a message arrives within a few
+/// heartbeats.
+pub const GOSSIP_DUPLICATE_CACHE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Heartbeats (1 s each) a received gossip message is kept for peers' IWANT requests. Every message
+/// is kept, so a flood costs about this many seconds of its bytes in memory; upstream's 5 made a
+/// 36 MB/s flood hold ~180 MB (review 2026-10-29). Flood-publishing makes IWANT a fallback here.
+pub const GOSSIP_HISTORY: usize = 2;
 use crate::identity::Identity;
 
 /// Configuration for creating a new OpenHydra swarm.
@@ -36,6 +63,14 @@ pub struct SwarmOptions {
     /// A private deployment (`--public-relays off`): never connect to OpenHydra's own bootstraps and
     /// relays, however the node hears of them ([`crate::fence`]).
     pub fence_openhydra: bool,
+    /// The node is on OpenHydra's public network ([`crate::relay::uses_public_network`]): the routing
+    /// table then takes no private address ([`routable_on_public_network`]), so none goes into a DHT
+    /// answer. Off (a private deployment, a local test) takes every address.
+    pub public_network: bool,
+    /// LAN discovery (mDNS); off with `--no-mdns` ([`crate::node::disable_mdns`]).
+    pub enable_mdns: bool,
+    /// Which network this node is on, told to peers in identify ([`crate::relay::network_id`]).
+    pub network_id: String,
 }
 
 impl Default for SwarmOptions {
@@ -53,7 +88,34 @@ impl Default for SwarmOptions {
             protocol_version: "openhydra/0.1.0".to_string(),
             enable_peer_relay: false,
             fence_openhydra: false,
+            public_network: false,
+            enable_mdns: true,
+            network_id: "public".into(),
         }
+    }
+}
+
+/// Whether `addr` may enter the routing table of a node on the public network: not a private,
+/// loopback, link-local or CGNAT/Tailscale (100.64/10) address, which a querier elsewhere can't
+/// reach, or which names a different machine in the querier's own network. A relay circuit
+/// (`/p2p-circuit`) is judged by its relay hop elsewhere, and a DNS name or a non-IP transport
+/// (tests) passes.
+pub fn routable_on_public_network(addr: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    // The first component decides, for a circuit too: its relay hop's address must be one a querier
+    // elsewhere can reach (which relay it names is checked where circuits come in: relay.rs).
+    match addr.iter().next() {
+        Some(Protocol::Ip4(ip)) => !crate::event_loop::is_non_global_ip(ip.into()),
+        Some(Protocol::Ip6(ip)) => !crate::event_loop::is_non_global_ip(ip.into()),
+        Some(Protocol::Dns(n) | Protocol::Dns4(n) | Protocol::Dns6(n) | Protocol::Dnsaddr(n)) => {
+            let n = n.trim_end_matches('.').to_ascii_lowercase();
+            n != "localhost" && !n.ends_with(".localhost") && !n.ends_with(".local")
+        }
+        // A zone-scoped (link-local) IPv6 address only means something on one machine's link.
+        Some(Protocol::Ip6zone(_)) => false,
+        // A relay circuit with no address in front is dialled through the relay's own addresses.
+        Some(Protocol::P2p(_)) => addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)),
+        _ => true,
     }
 }
 
@@ -99,21 +161,16 @@ pub fn build_swarm(
     // Relay first: handles /p2p-circuit multiaddrs.
     // QUIC second: handles /udp/.../quic-v1 addresses (faster, UDP hole punch).
     // TCP last: fallback for /tcp/ addresses.
-    let quic_tcp = libp2p::core::transport::OrTransport::new(quic_transport, tcp_transport)
-        .map(|either, _| match either {
-            futures::future::Either::Left((pid, mux)) => (pid, StreamMuxerBox::new(mux)),
-            futures::future::Either::Right((pid, mux)) => (pid, StreamMuxerBox::new(mux)),
-        });
+    // Errors unwrapped, so a dial error is the transport's own (`transport::addr_failure`).
+    // Load simulation: OPENHYDRA_TEST_NO_QUIC=1 builds the node without QUIC (what a QUIC connection costs).
+    let quic_tcp = if std::env::var("OPENHYDRA_TEST_NO_QUIC").is_ok_and(|v| v == "1") {
+        tcp_transport
+    } else {
+        crate::transport::either_transport(quic_transport, tcp_transport)
+    };
 
-    let combined_transport = libp2p::core::transport::OrTransport::new(
-        relay_upgraded,
-        quic_tcp,
-    )
-    .map(|either_output, _| match either_output {
-        futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-        futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-    })
-    .boxed();
+    let relay_upgraded = relay_upgraded.map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer))).boxed();
+    let combined_transport = crate::transport::either_transport(relay_upgraded, quic_tcp);
 
     // Kademlia configuration.
     //
@@ -186,6 +243,13 @@ pub fn build_swarm(
     // A forged record is dropped instead of replicated.
     kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
 
+    // On the public network, no private address enters the routing table by any path (an mDNS dial
+    // to a LAN peer included), so none is handed out in a DHT answer. The filter lives in the
+    // vendored libp2p-kad, the one place every address passes (review 2026-10-29).
+    if opts.public_network {
+        kad_config.set_address_filter(kad::AddressFilter::new(|_peer, addr| routable_on_public_network(addr)));
+    }
+
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
 
@@ -218,17 +282,22 @@ pub fn build_swarm(
     // Identify (peer metadata exchange).
     let identify = identify::Behaviour::new(
         identify::Config::new(opts.protocol_version.clone(), keypair.public())
-            .with_push_listen_addr_updates(true)
+            // Which network we're on (`net=…`), so a node of another one on the same LAN isn't
+            // joined to ours (review 2026-10-29).
+            .with_agent_version(format!("openhydra-agent/{} net={}", env!("CARGO_PKG_VERSION"), opts.network_id))
+            // Load simulation (plan E7): OPENHYDRA_TEST_IDENTIFY_PUSH=0 stops the pushes.
+            .with_push_listen_addr_updates(std::env::var("OPENHYDRA_TEST_IDENTIFY_PUSH").map_or(true, |v| v != "0"))
             // No address cache: identify would offer every address a peer claims (its loopback, its
             // LAN) to our dials. The admissible ones reach Kademlia, which offers those (L10).
             .with_cache_size(0),
     );
 
-    // mDNS (LAN discovery).
-    let mdns = mdns::tokio::Behaviour::new(
-        mdns::Config::default(),
-        peer_id,
-    )?;
+    // mDNS (LAN discovery), unless turned off (`--no-mdns`).
+    let mdns = if opts.enable_mdns {
+        Toggle::from(Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?))
+    } else {
+        Toggle::from(None)
+    };
 
     // R-DHT-11: AutoNAT v2 client (per-address reachability verification) — the
     // only AutoNAT now that v1 is retired. Default config (OsRng, default probe
@@ -260,7 +329,10 @@ pub fn build_swarm(
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
-        .max_transmit_size(64 * 1024)
+        .max_transmit_size(GOSSIP_MAX_TRANSMIT)
+        .history_length(GOSSIP_HISTORY)
+        .history_gossip(1)
+        .duplicate_cache_time(GOSSIP_DUPLICATE_CACHE)
         .flood_publish(true)
         // Ensure small meshes still exist; libp2p defaults assume large
         // swarms. The invariant the validator enforces is
@@ -273,9 +345,11 @@ pub fn build_swarm(
         .mesh_n_high(6)
         .build()
         .map_err(|e| format!("gossipsub config: {e}"))?;
-    let mut gossipsub = gossipsub::Behaviour::new(
+    let mut gossipsub = GossipBehaviour::new_with_subscription_filter(
         gossipsub::MessageAuthenticity::Signed(keypair.clone()),
         gossipsub_config,
+        None,
+        gossip_topic_filter(),
     )
     .map_err(|e| format!("gossipsub behaviour: {e}"))?;
 
@@ -323,10 +397,22 @@ pub fn build_swarm(
                     max_circuit_duration: Duration::from_secs(3600),
                     ..Default::default()
                 };
+                // The bootstrap's limits, not libp2p's defaults (see `relay::PrefixRateLimiter`).
+                cfg.reservation_rate_limiters.clear();
+                cfg.circuit_src_rate_limiters.clear();
                 cfg.reservation_rate_limiters
                     .push(Box::new(LeechRateLimiter::new(leech_table.clone())));
                 cfg.circuit_src_rate_limiters
                     .push(Box::new(LeechRateLimiter::new(leech_table.clone())));
+                use crate::relay::PrefixRateLimiter as L;
+                // Narrowest first (see the bootstrap's config). No holdings caps here: this relay's
+                // own small totals (64 reservations, 128 circuits) and its owner's choice to run it bound it.
+                for l in [L::reservations_per_peer(), L::reservations_per_v4(), L::reservations_per_64(), L::reservations_per_48()] {
+                    cfg.reservation_rate_limiters.push(Box::new(l));
+                }
+                for l in [L::circuits_per_peer(), L::circuits_per_v4(), L::circuits_per_64(), L::circuits_per_48()] {
+                    cfg.circuit_src_rate_limiters.push(Box::new(l));
+                }
                 cfg
             });
             (Toggle::from(Some(server)), Some(leech_table))
@@ -338,6 +424,7 @@ pub fn build_swarm(
         ip_limits: crate::ip_limits::Behaviour::new(crate::ip_limits::IpLimitsConfig::PEER),
         fence: crate::fence::Behaviour::new(opts.fence_openhydra.then(crate::fence::Fenced::openhydra)),
         connection_limits: libp2p::connection_limits::Behaviour::new(crate::behaviour::peer_connection_limits()),
+        address_book: crate::address_book::Behaviour::new(),
         kademlia,
         relay_client,
         relay_server,
@@ -388,4 +475,18 @@ pub fn build_swarm(
     }
 
     Ok((swarm, peer_relay_leech))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_our_gossip_topic_can_be_subscribed_to() {
+        use libp2p::gossipsub::TopicSubscriptionFilter;
+        let mut f = gossip_topic_filter();
+        assert!(f.can_subscribe(&gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC).hash()));
+        assert!(!f.can_subscribe(&gossipsub::IdentTopic::new("junk-1").hash()));
+        assert!(!f.can_subscribe(&gossipsub::IdentTopic::new("openhydra/swarm/v1/other").hash()));
+    }
 }

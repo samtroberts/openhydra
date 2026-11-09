@@ -233,6 +233,10 @@ struct Settings {
     /// Act as a circuit relay for peers behind strict NATs (`--peer-relay`). Off by default, like
     /// the agent; it only takes effect when this node is publicly reachable.
     peer_relay: bool,
+    /// LAN discovery (mDNS): peers on the same network find each other and connect directly. On by
+    /// default; off passes `--no-mdns` to the agents. Not in the Settings form (an off switch for
+    /// support to point at in `desktop.json`), so `save_settings` keeps the saved value.
+    lan_discovery: bool,
     /// Which local engine the provider serves (`--engine-kind`): `auto` (detect every running
     /// engine) or one of [`ENGINE_KINDS`].
     engine_kind: String,
@@ -292,6 +296,7 @@ impl Default for Settings {
             verbose_logs: false,
             device_name: String::new(),
             peer_relay: false,
+            lan_discovery: true,
             engine_kind: "auto".into(),
             engine_endpoint: String::new(),
             shared_models: Vec::new(), // empty ⇒ share every detected model (the default)
@@ -1129,6 +1134,9 @@ fn spawn_role(
         cmd.arg("--bootstrap").arg(b);
     }
     cmd.arg("--public-relays").arg(public_relays_arg(settings));
+    if !settings.lan_discovery {
+        cmd.arg("--no-mdns");
+    }
     // SL14: the switch is hidden until community relays ship (no other node can find a peer relay
     // yet), so a setting saved by an earlier version, which can't be turned off now, is ignored.
     if settings.peer_relay && PEER_RELAY_SWITCH_SHOWN {
@@ -2005,6 +2013,9 @@ fn swarm_remote_scope(
         cmd.arg("--bootstrap").arg(b);
     }
     cmd.arg("--public-relays").arg(public_relays_arg(&settings));
+    if !settings.lan_discovery {
+        cmd.arg("--no-mdns");
+    }
     cmd.arg("swarm")
         .arg("remote-scope")
         .arg("--swarm")
@@ -2243,6 +2254,17 @@ fn merge_known_providers(base: &mut serde_json::Value, gw_net: serde_json::Value
             }
         }
         net["known_models"] = serde_json::Value::Array(models);
+    }
+    // Models that just left the network, as either role saw it (the UI drops one unless a
+    // provider still lists it in `known_models`).
+    if let Some(gw_gone) = gw_net.get("recently_withdrawn").and_then(|v| v.as_array()) {
+        let mut gone: Vec<serde_json::Value> = net.get("recently_withdrawn").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        for m in gw_gone {
+            if !gone.contains(m) {
+                gone.push(m.clone());
+            }
+        }
+        net["recently_withdrawn"] = serde_json::Value::Array(gone);
     }
     if let Some(gw_provs) = gw_net.get("known_providers").and_then(|v| v.as_array()) {
         let key = |p: &serde_json::Value| {
@@ -3137,6 +3159,7 @@ fn save_settings(app: tauri::AppHandle, state: tauri::State<'_, AppState>, mut s
     settings.schema_version = cur.schema_version;
     settings.share_policy_initialized = cur.share_policy_initialized;
     settings.sharing_confirmed = cur.sharing_confirmed;
+    settings.lan_discovery = cur.lan_discovery;
     // `shared_models` is the policy MIRROR now, owned by the Share view (save_share_policy /
     // reset_share_policy), not the settings form. Preserve it so a stale echoed payload from the
     // form can't clobber the freshly-synced mirror (L4). The form no longer sends it either.
@@ -3933,6 +3956,18 @@ mod tests {
         }));
         assert_eq!(base["network"]["known_models"], serde_json::json!(["a", "b"]));
         assert_eq!(base["network"]["known_providers"].as_array().unwrap().len(), 2);
+    }
+
+    /// 30 Oct: models that just left the network, as either role saw it, reach the UI (which drops
+    /// them at once instead of keeping them on screen for its 180 s sticky timer).
+    #[test]
+    fn recently_withdrawn_unions_both_roles() {
+        let mut base = serde_json::json!({ "network": { "known_models": [], "recently_withdrawn": ["x"] } });
+        merge_known_providers(&mut base, serde_json::json!({ "known_models": [], "recently_withdrawn": ["x", "y"] }));
+        assert_eq!(base["network"]["recently_withdrawn"], serde_json::json!(["x", "y"]));
+        let mut old = serde_json::json!({ "network": { "known_models": [] } });
+        merge_known_providers(&mut old, serde_json::json!({ "known_models": [] }));
+        assert!(old["network"].get("recently_withdrawn").is_none(), "older agents report none");
     }
 
     #[test]

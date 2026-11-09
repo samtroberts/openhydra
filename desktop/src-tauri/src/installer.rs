@@ -1310,33 +1310,71 @@ pub fn installed_on_disk(engine: &str) -> bool {
         // A global `vllm` CLI, the vllm-metal venv (~/.venv-vllm-metal), a source venv of ours, or
         // the official Docker image (the Linux install path).
         "vllm" => {
-            docker_image_present(VLLM_IMAGE)
-                || has_program("vllm")
+            has_program("vllm")
                 || std::env::var("HOME")
                     .map(|h| Path::new(&h).join(".venv-vllm-metal").join("bin").join("vllm").exists())
                     .unwrap_or(false)
                 || install_dir("vllm").join("venv").join("bin").join("vllm").exists()
+                || docker_image_present(VLLM_IMAGE)
         }
         // The official Docker image, or a venv of ours (SGLang has no standalone CLI on PATH).
         "sglang" => {
-            docker_image_present(SGLANG_IMAGE)
-                || install_dir("sglang").join("venv").join("bin").join("python").exists()
+            install_dir("sglang").join("venv").join("bin").join("python").exists()
+                || docker_image_present(SGLANG_IMAGE)
         }
         _ => false,
     }
 }
 
-/// Has Docker already pulled `image`? False when Docker is missing or the image isn't local.
+/// Has Docker already pulled `image`? False when Docker is missing, the image isn't local, or
+/// Docker doesn't answer within a few seconds. The engines screen polls every 10 s: a "yes" and a
+/// timeout are kept for a minute (a hung daemon, Docker Desktop starting, can't pile up blocked
+/// calls), a plain "no" isn't, so an image that just finished pulling shows as installed at once.
 fn docker_image_present(image: &str) -> bool {
-    resolve_program("docker").is_some_and(|docker| {
-        Command::new(docker)
-            .args(["image", "inspect", "--format", "{{.Id}}", image])
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static SEEN: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(&(at, present)) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(image) {
+        if at.elapsed() < Duration::from_secs(60) {
+            return present;
+        }
+    }
+    let mut timed_out = false;
+    let present = resolve_program("docker").is_some_and(|docker| {
+        let mut cmd = Command::new(docker);
+        cmd.args(["image", "inspect", "--format", "{{.Id}}", image])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    })
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash on each poll
+        }
+        let Ok(mut child) = cmd.spawn() else { return false };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    return false;
+                }
+            }
+        }
+    });
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if present || timed_out {
+        seen.insert(image.to_string(), (Instant::now(), present));
+    } else {
+        seen.remove(image);
+    }
+    present
 }
 
 /// Is a macOS app bundle `/Applications/<name>.app` installed? Always false off macOS.

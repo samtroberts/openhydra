@@ -18,6 +18,15 @@ license = "Apache-2.0"
 # the patched libp2p-quic (initial_mtu) that openhydra-network requires.
 [patch.crates-io]
 libp2p-quic = { path = "../../network/patched-deps/libp2p-quic" }
+# LAN discovery between peers with many addresses (see its CHANGELOG.md). This process runs no
+# swarm today, but anything that does must get the same mDNS as the agent.
+libp2p-mdns = { path = "../../network/patched-deps/libp2p-mdns" }
+# Private addresses kept out of DHT answers (see its CHANGELOG.md); same reason as mDNS above.
+libp2p-kad = { path = "../../network/patched-deps/libp2p-kad" }
+# Hole-punch addresses from a network we've left are forgotten (see its CHANGELOG.md); same reason.
+libp2p-dcutr = { path = "../../network/patched-deps/libp2p-dcutr" }
+# A bounded gossip send queue (see its CHANGELOG.md); same reason.
+libp2p-gossipsub = { path = "../../network/patched-deps/libp2p-gossipsub" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

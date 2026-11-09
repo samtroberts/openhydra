@@ -6690,6 +6690,8 @@ mod tests {
     #[test]
     fn a_failed_audit_holds_the_provider_at_the_floor_for_a_day() {
         let dir = tempfile::tempdir().unwrap();
+        // A test node stays off the developer's LAN (mDNS dials what it finds).
+        openhydra_network::node::disable_mdns();
         let net = openhydra_network::handle::NetworkHandle::start(openhydra_network::node::NodeConfig {
             identity_path: dir.path().join("id.key"),
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],
@@ -6809,6 +6811,8 @@ mod tests {
 
     fn test_node() -> (tempfile::TempDir, ConsumerNode) {
         let dir = tempfile::tempdir().unwrap();
+        // A test node stays off the developer's LAN (mDNS dials what it finds).
+        openhydra_network::node::disable_mdns();
         let net = openhydra_network::handle::NetworkHandle::start(openhydra_network::node::NodeConfig {
             identity_path: dir.path().join("id.key"),
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],

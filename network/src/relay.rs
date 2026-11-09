@@ -190,6 +190,143 @@ pub fn bootstrap_relay_peer_ids() -> Vec<PeerId> {
         .collect()
 }
 
+/// Which network a node is on, as it tells its peers in identify (`net=…` in its agent version):
+/// `public` for OpenHydra's public network; for a private deployment, `private-` and a hash of its
+/// bootstraps' peer ids, so two deployments, or a deployment and the public network, on one LAN can
+/// tell each other apart (review 2026-10-29: a LAN dial joined them, and their gossip with them).
+pub fn network_id(bootstraps: &[(PeerId, Multiaddr)], public_network: bool) -> String {
+    network_id_named(bootstraps, public_network, NETWORK_NAME.get().map(String::as_str))
+}
+
+/// [`network_id`], with the deployment's own name for its network if it gave one.
+fn network_id_named(bootstraps: &[(PeerId, Multiaddr)], public_network: bool, name: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    if public_network {
+        return "public".into();
+    }
+    if let Some(name) = name {
+        // Its own prefix, so a name can't equal another deployment's hash id.
+        return format!("private-name-{name}");
+    }
+    let mut ids: Vec<String> = bootstraps.iter().map(|(p, _)| p.to_base58()).collect();
+    ids.sort();
+    ids.dedup();
+    let digest = Sha256::digest(ids.join(",").as_bytes());
+    format!("private-{}", &hex::encode(digest)[..16])
+}
+
+/// A private deployment's own name for its network (see [`set_network_name`]).
+static NETWORK_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name this process's private network, instead of identifying it by its bootstraps (the default,
+/// [`network_id`]): nodes of one deployment given different subsets of its bootstraps otherwise
+/// count as different networks and won't join up on a LAN. Process-wide and set once, before any
+/// node starts; has no effect on OpenHydra's public network. A name is 1–64 letters, digits, `.`,
+/// `_` or `-`.
+pub fn set_network_name(name: &str) -> Result<(), String> {
+    if !valid_network_name(name) {
+        return Err(format!("network name {name:?}: use 1–64 letters, digits, '.', '_' or '-'"));
+    }
+    match NETWORK_NAME.set(name.to_string()) {
+        Ok(()) => Ok(()),
+        Err(_) if NETWORK_NAME.get().map(String::as_str) == Some(name) => Ok(()),
+        Err(_) => Err("the network name is already set".into()),
+    }
+}
+
+fn valid_network_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The network id in a peer's identify agent version (see [`network_id`]); a node that doesn't say
+/// (older versions) is on the public network as far as we can tell.
+pub fn remote_network_id(agent_version: &str) -> &str {
+    agent_version.split_whitespace().find_map(|w| w.strip_prefix("net=")).unwrap_or("public")
+}
+
+/// The relays this node trusts as a circuit's relay hop, each with the transport addresses it is
+/// known at (review 2026-10-29: trusting the relay's peer id alone let anyone advertise
+/// `/ip4/<victim>/tcp/<port>/p2p/<trusted relay>/p2p-circuit`, so every querier dialled the victim).
+/// Known addresses come from the configured bootstraps and relays, and from the relay's own
+/// identify (its claims about itself are trusted, as the relay is; global ones only on the public
+/// network, as identify also sends loopback and private ones).
+#[derive(Debug, Clone, Default)]
+pub struct TrustedRelays {
+    addrs: std::collections::HashMap<PeerId, std::collections::HashSet<Multiaddr>>,
+}
+
+/// An address's host (an IP, or a DNS name compared as written) and its TCP or UDP port.
+fn host_port(addr: &Multiaddr) -> Option<(String, u16)> {
+    use libp2p::multiaddr::Protocol;
+    let mut it = addr.iter();
+    let host = match it.next()? {
+        Protocol::Ip4(ip) => ip.to_string(),
+        Protocol::Ip6(ip) => ip.to_string(),
+        Protocol::Dns(n) | Protocol::Dns4(n) | Protocol::Dns6(n) => n.trim_end_matches('.').to_ascii_lowercase(),
+        _ => return None,
+    };
+    let port = match it.next()? {
+        Protocol::Tcp(p) | Protocol::Udp(p) => p,
+        _ => return None,
+    };
+    Some((host, port))
+}
+
+/// `addr` split at its first `/p2p/<id>`: the transport part before it, and the id.
+fn split_at_peer_id(addr: &Multiaddr) -> Option<(Multiaddr, PeerId)> {
+    use libp2p::multiaddr::Protocol;
+    let mut transport = Multiaddr::empty();
+    for p in addr.iter() {
+        match p {
+            Protocol::P2p(pid) => return Some((transport, pid)),
+            Protocol::P2pCircuit => return None,
+            other => transport.push(other),
+        }
+    }
+    None
+}
+
+impl TrustedRelays {
+    /// Trust the relay named by `addr`'s `/p2p/<id>`, at the address before it.
+    pub fn add(&mut self, addr: &Multiaddr) {
+        if let Some((transport, pid)) = split_at_peer_id(addr) {
+            self.add_for(pid, transport);
+        }
+    }
+
+    /// Trust relay `pid`, at `transport` (an address without `/p2p`; a trailing one is dropped).
+    pub fn add_for(&mut self, pid: PeerId, transport: Multiaddr) {
+        let transport = match split_at_peer_id(&transport) {
+            Some((t, p)) if p == pid => t,
+            Some(_) => return,
+            None => transport,
+        };
+        let known = self.addrs.entry(pid).or_default();
+        if !transport.is_empty() {
+            known.insert(transport);
+        }
+    }
+
+    /// Whether `pid` is a trusted relay at all.
+    pub fn contains_peer(&self, pid: &PeerId) -> bool {
+        self.addrs.contains_key(pid)
+    }
+
+    /// Whether relay `pid` is known at `transport`: that address exactly, or the same host and port
+    /// over another transport (a relay known at `/ip4/X/tcp/4001` is the same machine at
+    /// `/ip4/X/udp/4001/quic-v1`; pointing a querier there points it at the relay itself).
+    fn knows(&self, pid: &PeerId, transport: &Multiaddr) -> bool {
+        let Some(known) = self.addrs.get(pid) else { return false };
+        known.contains(transport)
+            || host_port(transport).is_some_and(|hp| known.iter().any(|k| host_port(k).as_ref() == Some(&hp)))
+    }
+
+    /// The trusted relays' peer ids.
+    pub fn peer_ids(&self) -> impl Iterator<Item = &PeerId> {
+        self.addrs.keys()
+    }
+}
+
 /// D-S5: decide whether a record's self-declared `relay_address` is safe to
 /// inject into the Kademlia routing table for `expected_pid`.
 ///
@@ -206,10 +343,15 @@ pub fn bootstrap_relay_peer_ids() -> Vec<PeerId> {
 /// `--bootstrap` but not the hardcoded IPs) while still rejecting a circuit whose
 /// hop is an unknown/attacker relay. A legitimate NAT'd provider always
 /// advertises exactly this (it reserved on a relay we also use).
+///
+/// And the address in front of the relay hop must be one that relay is known at
+/// ([`TrustedRelays`]): a trusted relay's peer id in front of someone else's address would have
+/// every querier connect to that address (review 2026-10-29). A circuit with no address in front
+/// (`/p2p/<relay>/p2p-circuit`) is dialled through the relay's own known addresses, so it's fine.
 pub fn safe_injectable_circuit_addr(
     relay_address: &str,
     expected_pid: &PeerId,
-    trusted_relay_pids: &std::collections::HashSet<PeerId>,
+    trusted: &TrustedRelays,
 ) -> Option<Multiaddr> {
     use libp2p::multiaddr::Protocol;
     let ma: Multiaddr = relay_address.parse().ok()?;
@@ -228,12 +370,18 @@ pub fn safe_injectable_circuit_addr(
         }
     }
 
-    // Must be circuit-scoped through a relay whose peer id we trust at runtime.
+    // Must be circuit-scoped through a relay whose peer id we trust at runtime, at an address that
+    // relay is known at.
     if !seen_circuit {
         return None;
     }
     match relay_hop_pid {
-        Some(pid) if trusted_relay_pids.contains(&pid) => {}
+        Some(pid) if trusted.contains_peer(&pid) => {
+            let (transport, _) = split_at_peer_id(&ma)?;
+            if !transport.is_empty() && !trusted.knows(&pid, &transport) {
+                return None;
+            }
+        }
         _ => return None,
     }
     // If the circuit names a target, it must be this peer — no seeding an
@@ -460,6 +608,256 @@ impl libp2p::relay::RateLimiter for LeechRateLimiter {
             // Poisoned lock: fail OPEN — never block legitimate peers because a
             // panic poisoned the mutex; abuse is still bounded by the built-in caps.
             Err(_) => true,
+        }
+    }
+}
+
+/// A relay [`RateLimiter`](libp2p::relay::RateLimiter): a token bucket per [`Scope`] — `burst`
+/// requests at once, then one per `every`. At most [`MAX_BUCKETS`] keys are tracked; past that,
+/// full buckets are dropped first, so the map stays bounded.
+///
+/// Why our own and not libp2p's: its per-IP limiter keys on the whole address, so one host rotating
+/// addresses inside its /64 (or its site's /48) passed it (review 2026-10-29); and its defaults —
+/// which a `relay::Config { ..Default::default() }` silently keeps — add ONE token every 2 minutes
+/// per peer for circuits (30 at most) and one a minute per IP. A gateway uses up its 30 circuits per
+/// relay in a busy hour, and from then on the relays refused nearly all of its circuits (GPU test
+/// 2026-10-29/30: a restarted provider was unreachable for 65 s; 2 circuits accepted in 4 min), and
+/// every node behind one carrier-NAT IPv4 address shared one bucket.
+pub struct PrefixRateLimiter {
+    scope: Scope,
+    burst: u32,
+    every: std::time::Duration,
+    buckets: std::collections::HashMap<u128, (f64, web_time::Instant)>,
+}
+
+/// The network a relay request comes from, for counting holdings: its IPv4 address, or its IPv6
+/// /64 (one host's or home's). `None` for an address with neither.
+pub fn holding_network(addr: &Multiaddr) -> Option<u128> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(u128::from(ip.to_ipv6_mapped())),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(match ip.to_ipv4_mapped() {
+            Some(v4) => u128::from(v4.to_ipv6_mapped()),
+            None => u128::from(ip) & (u128::MAX << 64),
+        }),
+        _ => None,
+    })
+}
+
+/// Reservations and circuits held right now, per network ([`holding_network`]). The rate limiters
+/// only say how fast requests may come; this says how much one network may hold at once (review
+/// 2026-10-30: with rates that refill in seconds, one VPS address with a few hundred free
+/// identities could fill a relay's 256 reservations or 512 circuits and keep them). Kept up to date
+/// by the relay's owner from its own ledger ([`NetHoldings::recompute`]); read by [`HoldingsLimiter`].
+#[derive(Debug, Default)]
+pub struct NetHoldings {
+    /// The network each peer last made a relay request from.
+    peer_network: std::collections::HashMap<PeerId, u128>,
+    reservations: std::collections::HashMap<u128, usize>,
+    circuits: std::collections::HashMap<u128, usize>,
+    /// Peers holding a reservation now (a renewal must not count against its own slot).
+    holders: std::collections::HashSet<PeerId>,
+}
+
+/// Peers whose request network is remembered at most (past it, those holding nothing go).
+pub const MAX_HOLDING_PEERS: usize = 16_384;
+
+impl NetHoldings {
+    fn note_request(&mut self, peer: PeerId, network: u128) {
+        if self.peer_network.len() >= MAX_HOLDING_PEERS && !self.peer_network.contains_key(&peer) {
+            let holders = &self.holders;
+            self.peer_network.retain(|p, _| holders.contains(p));
+            if self.peer_network.len() >= MAX_HOLDING_PEERS {
+                return; // full of holders: the new one is counted from its next request
+            }
+        }
+        self.peer_network.insert(peer, network);
+    }
+
+    /// Recount from the relay's ledger: reservations held per peer, circuits per source peer.
+    pub fn recompute(
+        &mut self,
+        reservations: impl Iterator<Item = (PeerId, usize)>,
+        circuits_by_source: impl Iterator<Item = (PeerId, usize)>,
+    ) {
+        self.reservations.clear();
+        self.circuits.clear();
+        self.holders.clear();
+        for (peer, n) in reservations {
+            if n > 0 {
+                self.holders.insert(peer);
+                if let Some(net) = self.peer_network.get(&peer) {
+                    *self.reservations.entry(*net).or_default() += n;
+                }
+            }
+        }
+        for (peer, n) in circuits_by_source {
+            if let Some(net) = self.peer_network.get(&peer) {
+                *self.circuits.entry(*net).or_default() += n;
+            }
+        }
+    }
+}
+
+/// What a [`HoldingsLimiter`] caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    Reservations,
+    Circuits,
+}
+
+/// A relay "rate limiter" that is really a cap: refuses a request while the requester's network
+/// ([`holding_network`]) already holds `max` reservations (or circuits). It takes no tokens, so it
+/// can sit anywhere in the chain; a peer renewing its own reservation is never refused.
+pub struct HoldingsLimiter {
+    table: Arc<Mutex<NetHoldings>>,
+    kind: Held,
+    max: usize,
+}
+
+impl HoldingsLimiter {
+    pub fn new(table: Arc<Mutex<NetHoldings>>, kind: Held, max: usize) -> Self {
+        Self { table, kind, max }
+    }
+}
+
+impl libp2p::relay::RateLimiter for HoldingsLimiter {
+    fn try_next(&mut self, peer: PeerId, addr: &Multiaddr, _now: web_time::Instant) -> bool {
+        let Some(net) = holding_network(addr) else { return true };
+        let Ok(mut t) = self.table.lock() else { return true }; // fail open, like the leech table
+        t.note_request(peer, net);
+        match self.kind {
+            Held::Reservations => t.holders.contains(&peer) || t.reservations.get(&net).copied().unwrap_or(0) < self.max,
+            Held::Circuits => t.circuits.get(&net).copied().unwrap_or(0) < self.max,
+        }
+    }
+}
+
+/// Reservations one network may hold on a relay at once.
+pub const MAX_RESERVATIONS_PER_NETWORK: usize = 32;
+/// Circuits one network may have open through a relay at once (as source).
+pub const MAX_CIRCUITS_PER_NETWORK: usize = 64;
+
+/// What a [`PrefixRateLimiter`] counts by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// An IPv6 network of this prefix length (IPv4 and IPv4-mapped addresses aren't counted).
+    V6Prefix(u8),
+    /// An IPv4 address (IPv6 addresses aren't counted).
+    V4Addr,
+    /// The requesting peer.
+    Peer,
+}
+
+/// The most prefixes a [`PrefixRateLimiter`] tracks.
+pub const MAX_BUCKETS: usize = 16_384;
+
+impl PrefixRateLimiter {
+    pub fn new(prefix_len: u8, burst: u32, every: std::time::Duration) -> Self {
+        Self::scoped(Scope::V6Prefix(prefix_len.min(128)), burst, every)
+    }
+
+    pub fn scoped(scope: Scope, burst: u32, every: std::time::Duration) -> Self {
+        Self { scope, burst: burst.max(1), every, buckets: Default::default() }
+    }
+
+    /// Reservation requests per peer: a node re-reserves when it restarts or its network changes
+    /// (and renews hourly). Replaces libp2p's default (30, then one per 2 minutes).
+    pub fn reservations_per_peer() -> Self {
+        Self::scoped(Scope::Peer, 30, std::time::Duration::from_secs(60))
+    }
+
+    /// Reservation requests per IPv4 address: behind a carrier NAT, many homes share one.
+    /// Replaces libp2p's default (60, then one a minute). The relay's reservation cap still holds.
+    pub fn reservations_per_v4() -> Self {
+        Self::scoped(Scope::V4Addr, 120, std::time::Duration::from_secs(5))
+    }
+
+    /// Circuit requests per source peer: a gateway opens one for each provider it reaches through
+    /// a relay, and again after every drop, restart or retry. The concurrent cap
+    /// (`max_circuits_per_peer`) and the per-circuit byte budget bound the load; this only stops a
+    /// setup flood.
+    pub fn circuits_per_peer() -> Self {
+        Self::scoped(Scope::Peer, 60, std::time::Duration::from_secs(2))
+    }
+
+    /// Circuit requests per source IPv4 address (a carrier NAT's many users share one).
+    pub fn circuits_per_v4() -> Self {
+        Self::scoped(Scope::V4Addr, 240, std::time::Duration::from_millis(500))
+    }
+
+    /// Circuit requests per source IPv6 /64.
+    pub fn circuits_per_64() -> Self {
+        Self::new(64, 120, std::time::Duration::from_secs(1))
+    }
+
+    /// Circuit requests per source IPv6 /48.
+    pub fn circuits_per_48() -> Self {
+        Self::new(48, 480, std::time::Duration::from_millis(250))
+    }
+
+    /// Reservation requests per IPv6 /64: a home's or a host's few nodes, renewing hourly and
+    /// re-reserving after a network change.
+    pub fn reservations_per_64() -> Self {
+        Self::new(64, 16, std::time::Duration::from_secs(120))
+    }
+
+    /// Reservation requests per IPv6 /48 (one site's many /64s).
+    pub fn reservations_per_48() -> Self {
+        Self::new(48, 64, std::time::Duration::from_secs(30))
+    }
+
+    fn key(&self, peer: &PeerId, addr: &Multiaddr) -> Option<u128> {
+        match self.scope {
+            Scope::V6Prefix(len) => {
+                let ip = addr.iter().find_map(|p| match p {
+                    libp2p::multiaddr::Protocol::Ip6(ip) if ip.to_ipv4_mapped().is_none() => Some(ip),
+                    _ => None,
+                })?;
+                let bits = u128::from(ip);
+                Some(if len == 0 { 0 } else { bits & (u128::MAX << (128 - len as u32)) })
+            }
+            Scope::V4Addr => addr.iter().find_map(|p| match p {
+                libp2p::multiaddr::Protocol::Ip4(ip) => Some(u128::from(ip.to_ipv6_mapped())),
+                libp2p::multiaddr::Protocol::Ip6(ip) => ip.to_ipv4_mapped().map(|v4| u128::from(v4.to_ipv6_mapped())),
+                _ => None,
+            }),
+            // The id's last 16 bytes: for an Ed25519 id, part of its public key (a peer can't pick
+            // another's, and sharing one only limits itself).
+            Scope::Peer => {
+                let b = peer.to_bytes();
+                let tail: [u8; 16] = b[b.len().saturating_sub(16)..].try_into().ok()?;
+                Some(u128::from_be_bytes(tail))
+            }
+        }
+    }
+}
+
+impl libp2p::relay::RateLimiter for PrefixRateLimiter {
+    fn try_next(&mut self, peer: PeerId, addr: &Multiaddr, now: web_time::Instant) -> bool {
+        let Some(key) = self.key(&peer, addr) else { return true };
+        let (burst, every) = (self.burst as f64, self.every.as_secs_f64().max(1e-3));
+        if self.buckets.len() >= MAX_BUCKETS && !self.buckets.contains_key(&key) {
+            // Full and idle buckets carry nothing worth keeping.
+            self.buckets.retain(|_, (tokens, at)| {
+                let t = (*tokens + now.saturating_duration_since(*at).as_secs_f64() / every).min(burst);
+                t < burst
+            });
+            if self.buckets.len() >= MAX_BUCKETS {
+                // Still full of buckets in use: drop the least recently used rather than deny every
+                // new network (which a host rotating /64s could otherwise keep up).
+                if let Some(oldest) = self.buckets.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) {
+                    self.buckets.remove(&oldest);
+                }
+            }
+        }
+        let (tokens, at) = self.buckets.entry(key).or_insert((burst, now));
+        *tokens = (*tokens + now.saturating_duration_since(*at).as_secs_f64() / every).min(burst);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 }
@@ -734,6 +1132,120 @@ mod tests {
         assert!(!should_offer_peer_relay(true, true, true));    // bootstrap (always-on, not opt-in)
     }
 
+    #[test]
+    fn one_ipv6_network_gets_its_burst_then_one_request_per_interval() {
+        use libp2p::relay::RateLimiter;
+        let mut l = PrefixRateLimiter::new(64, 3, std::time::Duration::from_secs(60));
+        let t0 = web_time::Instant::now();
+        let p = PeerId::random();
+        let a = |s: &str| -> Multiaddr { format!("/ip6/{s}/tcp/4001").parse().unwrap() };
+        // Addresses rotated inside one /64 share its bucket.
+        assert!(l.try_next(p, &a("2001:db8:1:1::1"), t0));
+        assert!(l.try_next(PeerId::random(), &a("2001:db8:1:1::2"), t0));
+        assert!(l.try_next(PeerId::random(), &a("2001:db8:1:1:ffff::9"), t0));
+        assert!(!l.try_next(PeerId::random(), &a("2001:db8:1:1::4"), t0), "burst used up");
+        // Another /64 has its own.
+        assert!(l.try_next(p, &a("2001:db8:1:2::1"), t0));
+        // One more per interval.
+        assert!(l.try_next(p, &a("2001:db8:1:1::5"), t0 + std::time::Duration::from_secs(61)));
+        assert!(!l.try_next(p, &a("2001:db8:1:1::5"), t0 + std::time::Duration::from_secs(62)));
+        // IPv4 and IPv4-mapped addresses are left to libp2p's per-IP limiter.
+        for _ in 0..10 {
+            assert!(l.try_next(p, &"/ip4/203.0.113.9/tcp/4001".parse().unwrap(), t0));
+            assert!(l.try_next(p, &a("::ffff:203.0.113.9"), t0));
+        }
+        // The /48 one counts a whole site together.
+        let mut site = PrefixRateLimiter::new(48, 2, std::time::Duration::from_secs(60));
+        assert!(site.try_next(p, &a("2001:db8:1:1::1"), t0));
+        assert!(site.try_next(p, &a("2001:db8:1:ffff::1"), t0));
+        assert!(!site.try_next(p, &a("2001:db8:1:7::1"), t0));
+    }
+
+    /// GPU test 2026-10-29/30: libp2p's default circuit limiter (one token per 2 min after 30) left a
+    /// busy gateway with almost no circuits. Ours refill in seconds, per peer, per IPv4 address and
+    /// per IPv6 network.
+    #[test]
+    fn circuit_and_reservation_limits_refill_in_seconds_and_count_the_right_thing() {
+        use libp2p::relay::RateLimiter;
+        let t0 = web_time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        let v4: Multiaddr = "/ip4/203.0.113.9/tcp/4001".parse().unwrap();
+        let v6: Multiaddr = "/ip6/2001:db8:1:1::1/udp/4001/quic-v1".parse().unwrap();
+        // Per peer: 60 at once, then one per 2 s — not one per 2 minutes.
+        let mut per_peer = PrefixRateLimiter::circuits_per_peer();
+        let (gw, other) = (PeerId::random(), PeerId::random());
+        for _ in 0..60 {
+            assert!(per_peer.try_next(gw, &v4, t0));
+        }
+        assert!(!per_peer.try_next(gw, &v4, t0), "burst used up");
+        assert!(per_peer.try_next(other, &v4, t0), "another peer (same address) has its own bucket");
+        assert!(per_peer.try_next(gw, &v6, t0 + s(2)), "one more 2 s later, from any address");
+        assert!(!per_peer.try_next(gw, &v6, t0 + s(2)));
+        // Per IPv4 address: counts IPv4 (and mapped) only, many peers together.
+        let mut per_v4 = PrefixRateLimiter::scoped(Scope::V4Addr, 2, s(5));
+        let mapped: Multiaddr = "/ip6/::ffff:203.0.113.9/tcp/4001".parse().unwrap();
+        assert!(per_v4.try_next(PeerId::random(), &v4, t0));
+        assert!(per_v4.try_next(PeerId::random(), &mapped, t0), "the mapped form is the same address");
+        assert!(!per_v4.try_next(PeerId::random(), &v4, t0));
+        for _ in 0..10 {
+            assert!(per_v4.try_next(PeerId::random(), &v6, t0), "IPv6 isn't counted here");
+        }
+        assert!(per_v4.try_next(PeerId::random(), &v4, t0 + s(5)));
+        // The stock limits we replace would have refused the 31st circuit for 2 minutes.
+        let mut res = PrefixRateLimiter::reservations_per_peer();
+        for _ in 0..30 {
+            assert!(res.try_next(gw, &v4, t0));
+        }
+        assert!(!res.try_next(gw, &v4, t0));
+        assert!(res.try_next(gw, &v4, t0 + s(60)));
+    }
+
+    /// Review 2026-10-30: one network's identities can't fill the relay; renewals always pass.
+    #[test]
+    fn one_network_can_hold_only_so_much() {
+        use libp2p::relay::RateLimiter;
+        let t0 = web_time::Instant::now();
+        let table = Arc::new(Mutex::new(NetHoldings::default()));
+        let mut res = HoldingsLimiter::new(table.clone(), Held::Reservations, 2);
+        let mut circ = HoldingsLimiter::new(table.clone(), Held::Circuits, 1);
+        let vps: Multiaddr = "/ip4/198.51.100.7/tcp/4001".parse().unwrap();
+        let home: Multiaddr = "/ip6/2001:db8:5:5::9/udp/4001/quic-v1".parse().unwrap();
+        let home2: Multiaddr = "/ip6/2001:db8:5:5:ffff::1/udp/4001/quic-v1".parse().unwrap();
+        let (a, b, c, d) = (PeerId::random(), PeerId::random(), PeerId::random(), PeerId::random());
+        assert!(res.try_next(a, &vps, t0) && res.try_next(b, &vps, t0));
+        table.lock().unwrap().recompute([(a, 1), (b, 1)].into_iter(), std::iter::empty());
+        assert!(!res.try_next(c, &vps, t0), "the address holds its 2");
+        assert!(res.try_next(a, &vps, t0), "a renewal passes");
+        assert!(res.try_next(d, &home, t0), "another network has its own");
+        // One /64 is one network, whatever the address.
+        table.lock().unwrap().recompute([(a, 1), (b, 1), (d, 1)].into_iter(), std::iter::empty());
+        assert!(res.try_next(c, &home2, t0));
+        table.lock().unwrap().recompute([(a, 1), (b, 1), (d, 1), (c, 1)].into_iter(), std::iter::empty());
+        assert!(!res.try_next(PeerId::random(), &home2, t0));
+        // Circuits count by source network; closing them frees the cap.
+        assert!(circ.try_next(a, &vps, t0));
+        table.lock().unwrap().recompute(std::iter::empty(), [(a, 1)].into_iter());
+        assert!(!circ.try_next(b, &vps, t0));
+        table.lock().unwrap().recompute(std::iter::empty(), std::iter::empty());
+        assert!(circ.try_next(b, &vps, t0));
+    }
+
+    #[test]
+    fn the_prefix_limiter_stays_bounded() {
+        use libp2p::relay::RateLimiter;
+        let mut l = PrefixRateLimiter::new(64, 1, std::time::Duration::from_secs(3600));
+        let t0 = web_time::Instant::now();
+        let p = PeerId::random();
+        for i in 0..(MAX_BUCKETS as u64 + 100) {
+            let ip = std::net::Ipv6Addr::from(((0x2001_0db8u128) << 96) | ((i as u128) << 64));
+            l.try_next(p, &format!("/ip6/{ip}/tcp/1").parse().unwrap(), t0);
+        }
+        assert!(l.buckets.len() <= MAX_BUCKETS);
+        // Full of buckets in use, a new network is still served (the least recently used goes).
+        let ip = std::net::Ipv6Addr::from((0x2001_0db9u128) << 96);
+        assert!(l.try_next(p, &format!("/ip6/{ip}/tcp/1").parse().unwrap(), t0));
+    }
+
     // ── WS-F F-6 leech-lockout END-TO-END through the libp2p RateLimiter ──────
     // The unit tests above cover the LeechTable state machine in isolation.
     // These drive the *production integration point* — `LeechRateLimiter`'s impl
@@ -845,7 +1357,8 @@ mod tests {
     fn ds5_accepts_circuit_through_a_trusted_relay_for_matching_target() {
         let relay = PeerId::random();
         let target = PeerId::random();
-        let trusted: std::collections::HashSet<PeerId> = [relay].into_iter().collect();
+        let mut trusted = TrustedRelays::default();
+        trusted.add(&format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}").parse().unwrap());
         let good = format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}");
         assert!(safe_injectable_circuit_addr(&good, &target, &trusted).is_some());
         // Reservation-form (no explicit target) through a trusted relay is fine too.
@@ -861,7 +1374,8 @@ mod tests {
         // it's now in BOOTSTRAP_RELAYS, so use a documentation IP that never is.)
         let runtime_relay = PeerId::random();
         let target = PeerId::random();
-        let trusted: std::collections::HashSet<PeerId> = [runtime_relay].into_iter().collect();
+        let mut trusted = TrustedRelays::default();
+        trusted.add(&format!("/ip4/203.0.113.7/tcp/4001/p2p/{runtime_relay}").parse().unwrap());
         let addr =
             format!("/ip4/203.0.113.7/tcp/4001/p2p/{runtime_relay}/p2p-circuit/p2p/{target}");
         assert!(safe_injectable_circuit_addr(&addr, &target, &trusted).is_some());
@@ -872,10 +1386,59 @@ mod tests {
         // The reflection vector: a circuit whose relay hop is a relay we don't use.
         let unknown_relay = PeerId::random();
         let target = PeerId::random();
-        let trusted: std::collections::HashSet<PeerId> = [PeerId::random()].into_iter().collect();
+        let mut trusted = TrustedRelays::default();
+        trusted.add(&format!("/ip4/45.79.190.172/tcp/4001/p2p/{}", PeerId::random()).parse().unwrap());
         let addr =
             format!("/ip4/45.79.190.172/tcp/4001/p2p/{unknown_relay}/p2p-circuit/p2p/{target}");
         assert!(safe_injectable_circuit_addr(&addr, &target, &trusted).is_none());
+    }
+
+    #[test]
+    fn ds5_rejects_a_trusted_relay_id_in_front_of_another_address() {
+        // The reflection vector of review 2026-10-29: the relay's real peer id, someone else's IP.
+        let relay = PeerId::random();
+        let target = PeerId::random();
+        let mut trusted = TrustedRelays::default();
+        trusted.add(&format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}").parse().unwrap());
+        trusted.add_for(relay, "/ip6/2600:3c03::1/udp/4001/quic-v1".parse().unwrap());
+        for victim in [
+            format!("/ip4/198.51.100.9/tcp/80/p2p/{relay}/p2p-circuit/p2p/{target}"),
+            format!("/ip4/45.79.190.172/tcp/22/p2p/{relay}/p2p-circuit"),
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit"),
+            format!("/ip4/45.79.190.172/udp/4002/quic-v1/p2p/{relay}/p2p-circuit"),
+        ] {
+            assert!(safe_injectable_circuit_addr(&victim, &target, &trusted).is_none(), "{victim}");
+        }
+        for ok in [
+            format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}"),
+            format!("/ip6/2600:3c03::1/udp/4001/quic-v1/p2p/{relay}/p2p-circuit"),
+            format!("/p2p/{relay}/p2p-circuit/p2p/{target}"),
+            // The relay's own host and port over QUIC, known only by its TCP form: the same machine.
+            format!("/ip4/45.79.190.172/udp/4001/quic-v1/p2p/{relay}/p2p-circuit"),
+        ] {
+            assert!(safe_injectable_circuit_addr(&ok, &target, &trusted).is_some(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn network_ids_tell_deployments_apart() {
+        let a = PeerId::random();
+        let b = PeerId::random();
+        let ma: Multiaddr = "/ip4/10.0.0.1/tcp/4001".parse().unwrap();
+        assert_eq!(network_id(&[(a, ma.clone())], true), "public");
+        let one = network_id(&[(a, ma.clone()), (b, ma.clone())], false);
+        assert!(one.starts_with("private-"));
+        assert_eq!(one, network_id(&[(b, ma.clone()), (a, ma.clone())], false), "order doesn't matter");
+        assert_ne!(one, network_id(&[(a, ma.clone())], false), "another deployment");
+        // A named network: the name, whatever bootstraps a node was given; never the public one.
+        // (The process-wide name itself isn't set here: other tests in this process build networks.)
+        assert!(!valid_network_name("acme lab") && !valid_network_name("") && !valid_network_name(&"x".repeat(65)));
+        assert!(valid_network_name("acme-lab.1") && valid_network_name("A_b"));
+        assert_eq!(network_id_named(&[(a, ma.clone())], false, Some("acme-lab.1")), "private-name-acme-lab.1");
+        assert_eq!(network_id_named(&[(b, ma.clone())], false, Some("acme-lab.1")), "private-name-acme-lab.1");
+        assert_eq!(network_id_named(&[(a, ma)], true, Some("acme-lab.1")), "public");
+        assert_eq!(remote_network_id("openhydra-agent/0.3.25 net=private-0123456789abcdef"), "private-0123456789abcdef");
+        assert_eq!(remote_network_id("rust-libp2p/0.45.0"), "public", "an older node: the public network");
     }
 
     #[test]
@@ -883,7 +1446,8 @@ mod tests {
         let relay = PeerId::random();
         let target = PeerId::random();
         let other = PeerId::random();
-        let trusted: std::collections::HashSet<PeerId> = [relay].into_iter().collect();
+        let mut trusted = TrustedRelays::default();
+        trusted.add(&format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}").parse().unwrap());
         let addr = format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}");
         // A record for `other` must not seed an address that dials `target`.
         assert!(safe_injectable_circuit_addr(&addr, &other, &trusted).is_none());
@@ -895,7 +1459,8 @@ mod tests {
         // dropped — this is exactly the DHT-amplification vector D-S5 closes.
         let relay = PeerId::random();
         let target = PeerId::random();
-        let trusted: std::collections::HashSet<PeerId> = [relay].into_iter().collect();
+        let mut trusted = TrustedRelays::default();
+        trusted.add(&format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}").parse().unwrap());
         let direct = format!("/ip4/9.9.9.9/udp/443/quic-v1/p2p/{target}");
         assert!(safe_injectable_circuit_addr(&direct, &target, &trusted).is_none());
         assert!(safe_injectable_circuit_addr("not-a-multiaddr", &target, &trusted).is_none());

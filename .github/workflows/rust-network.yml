@@ -4,10 +4,19 @@ on:
   push:
     paths:
       - 'network/**'
+      # network depends on protocol.
+      - 'protocol/**'
+      # The workspace manifest holds the [patch] that swaps in the vendored crates, and the lock
+      # pins every dependency: a change to either changes what's built and tested here.
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/rust-network.yml'
   pull_request:
     paths:
       - 'network/**'
+      - 'protocol/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 # Least privilege: the token only reads the repository (review round 4, R4-5).
 permissions:
@@ -33,6 +42,14 @@ jobs:
         with:
           workspaces: network
       - run: cargo test
+      # The patched mDNS crate is outside the workspace (it's used through [patch]), so its own
+      # tests, which cover the patch, don't run above.
+      - name: Patched libp2p-mdns tests
+        run: cargo test --locked --manifest-path patched-deps/libp2p-mdns/Cargo.toml
+      # Its library tests cover the patch; upstream's integration tests need a dev-dependency
+      # (libp2p-swarm-test) that isn't published, so they can't build from the crate.
+      - name: Patched libp2p-dcutr tests
+        run: cargo test --locked --lib --manifest-path patched-deps/libp2p-dcutr/Cargo.toml
 
   build-bootstrap:
     name: Build Bootstrap Binary (Linux x86_64)

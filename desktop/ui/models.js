@@ -1,12 +1,14 @@
 // Sticky network-routable model list — smooths DHT/gossip flicker. DHT provider records expire
 // (~300s TTL) and re-propagate on their own schedule, so the raw known_models snapshot blinks.
-// Keep a model "sticky" for STICKY_MS after last seen; IDLE_MS..STICKY_MS shows it dimmed ("idle").
+// Keep a model "sticky" for STICKY_MS after last seen; IDLE_MS..STICKY_MS shows it dimmed ("idle") —
+// except one the network reports as just left (`recently_withdrawn`), which goes at once (sticky.js).
 // Never exceeds the network's ~300s TTL, so the UI never claims a provider is alive longer than the
 // network does; the real liveness gate stays request-time discovery. seenModels is module-local;
 // seenCount is read by the Providers view.
 import { $ } from "./dom";
 import { state, snap, engines } from "./state";
 import { AUTO_MODEL, pickerSelection, pickerLabel, looksLikeAuto } from "./picker.js";
+import { noteSnapshot } from "./sticky.js";
 
 const STICKY_MS = 180000;
 const IDLE_MS = 130000;  // seen within this = "live"; IDLE_MS..STICKY_MS = "idle" (dimmed).
@@ -14,7 +16,8 @@ const seenModels = {};   // model -> last-seen ms
 export const seenCount = {};    // model -> last-known provider count
 export function noteSeen() {
   const now = Date.now();
-  (snap?.network?.known_models || []).forEach((m) => seenModels[m] = now);
+  // Seen now; and a model the network says just left goes at once, not after the sticky timer.
+  for (const m of noteSnapshot(seenModels, snap?.network?.known_models, snap?.network?.recently_withdrawn, now)) delete seenCount[m];
   // Other machines only: our own provider's advert can come back in the list, and the views add
   // "your machine" themselves (it was counted twice).
   const own = state?.provider?.status?.peer_id;

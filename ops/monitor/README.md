@@ -16,11 +16,40 @@ Watches OpenHydra's public network from outside and emails a person when it need
   counted completely.
 
 It runs on **two hosts**, which watch each other: the netcup bootstrap host, and
-`openhydra-monitor-use1`, an AWS t4g.micro spot instance in us-east-1 (interruption behaviour
-*stop*, so it resumes with its disk when capacity returns; SSH only from the operator). Each probe
-checks every bootstrap, so a dead netcup shows in the AWS probe's email; a stopped AWS probe shows
-as a missing weekly email. No outside service is involved: mail goes out through Google Workspace
-with an app password.
+`openhydra-monitor-aps2`, an AWS spot instance in ap-south-2 (Hyderabad). Each probe checks every
+bootstrap, so a dead netcup shows in the AWS probe's email. Mail goes out through Google Workspace
+with an app password. (netcup's network blocks outgoing mail ports, so in practice the alerts come
+from the AWS probe.)
+
+The AWS probe is a one-instance spot **Auto Scaling group**, set up by
+[`aws-asg.sh`](aws-asg.sh):
+- It keeps one t4g.nano or t4g.micro instance, picked by AWS's price-capacity-optimized strategy:
+  among the cheapest pools, the one least likely to be taken away (the lowest-price pool was taken
+  away twice in 20 minutes on 28 Oct). When AWS takes the instance away anyway, the group starts
+  another (measured: in service 23 s after a termination), and Capacity Rebalancing starts one as
+  soon as AWS warns.
+- Every instance boots from an image of a set-up probe box, so a replacement needs nothing by hand.
+- AWS (SNS) emails `ALERT_TO` when the group can't launch an instance, and when it has had none in
+  service for 15 minutes. Confirm the subscription once, from the email AWS sends.
+- What a replacement doesn't keep: the alert state and `daily.jsonl` start again from the image's
+  copy (the netcup host keeps its own daily counts).
+
+To change the image after updating the probe box: make an image of a running instance
+(`aws ec2 create-image`), then run `SOURCE_IMAGE=<new id> SOURCE_REGION=ap-south-2 ./aws-asg.sh`.
+To move regions: run `./aws-asg.sh --region <new>`, check its instance, then
+`./aws-asg.sh --region <old> --delete`.
+
+What's left behind, and how to remove it:
+- **Older images.** A new `SOURCE_IMAGE` leaves the previous image and its snapshot (cents a
+  month). `aws-asg.sh` lists the images the group no longer boots (not in the launch template's
+  latest version; never `SOURCE_IMAGE`), with the command to remove each; it never removes them
+  itself.
+- **After `--delete`:** the group, its alarm, the alert topic (with its email subscription) and the
+  launch template go; the images and the security group stay (an image is the recovery point).
+  `--delete --images` removes this group's image copies (those tagged
+  `openhydra-managed-by=aws-asg`) and their snapshots too, but never `SOURCE_IMAGE`; older
+  untagged copies named `openhydra-monitor` are only listed, with the command to remove them; the security group then goes with
+  `aws ec2 delete-security-group --region <r> --group-name openhydra-monitor`.
 
 The last report is kept in `/var/lib/openhydra-monitor/last.json`.
 

@@ -736,6 +736,8 @@ mod tests {
     #[test]
     fn serves_status_over_http_with_token_gate() {
         let dir = tempfile::tempdir().unwrap();
+        // A test node stays off the developer's LAN (mDNS dials what it finds).
+        openhydra_network::node::disable_mdns();
         let config = openhydra_network::node::NodeConfig {
             identity_path: dir.path().join("id.key"),
             listen_addrs: vec![

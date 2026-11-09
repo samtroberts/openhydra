@@ -92,10 +92,16 @@ privately.
 
 The following are **intentional design decisions**, not vulnerabilities:
 
-- The consumer gateway binds loopback (`127.0.0.1:8080`) by default and leaves
-  `/v1/*` open. For any non-loopback or internet-facing deployment, require a key
-  with `--api-key` (or the `OPENHYDRA_API_KEY` env var) and terminate TLS at a
-  reverse proxy.
+- The CLI gateway (`openhydra-agent serve`) binds loopback (`127.0.0.1:16527`) by
+  default and leaves `/v1/*` open unless a key is set. For any non-loopback or
+  internet-facing deployment, require a key with `--api-key` (or the
+  `OPENHYDRA_API_KEY` env var) and terminate TLS at a reverse proxy. The desktop
+  app's gateway (since v0.3.21) always requires its own key, stored in
+  `~/.openhydra/gateway.key`.
+- Providers read the prompts they serve in plain text; nothing seals a prompt to
+  the engine. The CLI gateway's audit replay (on by default, `--audit-replay off`
+  to disable) can resend a temperature-0 request for a public model to up to three
+  other providers.
 - Provider operators are responsible for what their local engine exposes; OpenHydra
   routes by model id and does not sandbox the engine.
 

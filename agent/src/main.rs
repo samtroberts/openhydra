@@ -99,6 +99,18 @@ struct NodeArgs {
     #[arg(long = "pcp-gateway")]
     pcp_gateway: Option<std::net::IpAddr>,
 
+    /// Turn LAN discovery (mDNS) off. On by default: peers on the same network find each other and
+    /// connect directly, with or without internet. An off switch in case it misbehaves somewhere.
+    #[arg(long = "no-mdns")]
+    no_mdns: bool,
+
+    /// Name of this private network (letters, digits, `.`, `_`, `-`). By default a private
+    /// deployment is told apart by its bootstraps' ids, so nodes given different subsets of them
+    /// count as different networks (and don't join up on a LAN); give every node the same name
+    /// instead. Ignored on OpenHydra's public network.
+    #[arg(long = "network-id")]
+    network_id: Option<String>,
+
     /// Serve a read-only introspection endpoint (peers / DHT / swarm / transfer
     /// counters as JSON) on this address, e.g. `127.0.0.1:9464` or `127.0.0.1:0`
     /// (ephemeral). Off unless set; bind loopback unless you mean to expose it. If
@@ -110,6 +122,17 @@ struct NodeArgs {
 impl NodeArgs {
     /// Build a [`NodeConfig`], overriding defaults only where a flag was given.
     fn into_config(self) -> NodeConfig {
+        if self.no_mdns {
+            // A process-wide setting (see `disable_mdns`), applied before any node starts.
+            openhydra_network::node::disable_mdns();
+        }
+        if let Some(name) = &self.network_id {
+            // Process-wide too (see `set_network_name`).
+            if let Err(e) = openhydra_network::relay::set_network_name(name) {
+                eprintln!("openhydra-agent: --network-id: {e}");
+                std::process::exit(2);
+            }
+        }
         let mut config = NodeConfig {
             enable_peer_relay: self.peer_relay,
             public_relays: openhydra_network::relay::PublicRelays::parse(&self.public_relays).unwrap_or_default(),
@@ -652,6 +675,13 @@ struct ProvideArgs {
     /// TTL (300s) or the node periodically falls out of discovery.
     #[arg(long, default_value_t = 120)]
     reannounce_secs: u64,
+
+    /// Before the first announce, send each shared text model on a local engine one 1-token
+    /// request and wait up to this many seconds for the engine to answer, so the first request
+    /// from the network doesn't meet a cold engine (a fresh GPU machine's first generation can take
+    /// minutes). 0 turns it off. The node announces when the time is up, warm or not.
+    #[arg(long = "warm-up-secs", default_value_t = 180)]
+    warm_up_secs: u64,
 
     /// Maximum concurrent serves. The poll loop hands each request to a worker pool of this
     /// size instead of serving inline, so one long generation can't head-of-line-block the
@@ -1660,6 +1690,28 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
             .with_swarm_authorizer(openhydra_agent::swarms::SwarmAuthorizer::new(dir));
     }
 
+    let provider = std::sync::Arc::new(provider);
+    if args.warm_up_secs > 0 {
+        // On its own thread so the wait is bounded: a cold engine can't be interrupted mid-request.
+        let warm = std::sync::Arc::clone(&provider);
+        let deadline = std::time::Instant::now() + Duration::from_secs(args.warm_up_secs);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(warm.warm_up_engine(deadline));
+        });
+        match done_rx.recv_timeout(Duration::from_secs(args.warm_up_secs)) {
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+                "openhydra-agent: engine still warming up after {}s — announcing anyway",
+                args.warm_up_secs
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("openhydra-agent: engine warm-up stopped unexpectedly — announcing anyway")
+            }
+        }
+        // The policy may have changed while we waited (the watcher starts with the serve loop).
+        provider.reload_share_policy();
+    }
     let announced = provider
         .announce_models()
         .map_err(|e| format!("announce models from {engine_url}: {e}"))?;
@@ -1683,7 +1735,6 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     // Blocks forever (returns `!`); poll in short slices to stay responsive and
     // re-announce within the relays' provider-record TTL. Serves concurrently via a bounded
     // worker pool so one slow generation can't block the others.
-    let provider = std::sync::Arc::new(provider);
     // Publish the take-side credit view (per-consumer balance + serve-rate cap) to the status
     // endpoint every 2s.
     let pub_provider = std::sync::Arc::clone(&provider);

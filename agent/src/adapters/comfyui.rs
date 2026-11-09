@@ -231,6 +231,50 @@ fn parse_history_media(json: &str, prompt_id: &str) -> Option<(String, String, S
     None
 }
 
+/// Why a finished graph produced nothing, from a `/history/{id}` response: ComfyUI's own error
+/// (`status_str` "error", with the failing node's exception message) or a run that completed
+/// with no output; `None` while it's still running or when it produced media. Without this a
+/// failed generation was polled until [`POLL_MAX_SECS`] (GPU test 2026-10-29: a cuDNN error at
+/// 1.5 s kept the consumer waiting 240 s). Pure.
+fn parse_history_failure(json: &str, prompt_id: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let status = &v[prompt_id]["status"];
+    if status.is_null() {
+        return None;
+    }
+    if status["status_str"].as_str() == Some("error") {
+        let detail = status["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m[0].as_str() == Some("execution_error"))
+            .map(|m| {
+                let e = &m[1];
+                format!(
+                    "{} in node {} ({}): {}",
+                    e["exception_type"].as_str().unwrap_or("error"),
+                    e["node_id"].as_str().unwrap_or("?"),
+                    e["node_type"].as_str().unwrap_or("?"),
+                    e["exception_message"].as_str().unwrap_or("").trim(),
+                )
+            })
+            .or_else(|| {
+                // A run cancelled on the engine (ComfyUI's "interrupt") ends as an error too.
+                status["messages"].as_array().into_iter().flatten()
+                    .any(|m| m[0].as_str() == Some("execution_interrupted"))
+                    .then(|| "interrupted on the engine".to_string())
+            })
+            .unwrap_or_else(|| "no detail".into());
+        let mut detail: String = detail.chars().take(300).collect();
+        detail.insert_str(0, "comfyui generation failed: ");
+        return Some(detail);
+    }
+    if status["completed"].as_bool() == Some(true) && parse_history_media(json, prompt_id).is_none() {
+        return Some("comfyui generation finished without any image, video or audio output".into());
+    }
+    None
+}
+
 /// MIME type from a ComfyUI output filename's extension, for the returned data-URL. Pure.
 fn mime_for(name: &str) -> &'static str {
     match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
@@ -370,6 +414,11 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
             match self.http.get(&format!("{}/history/{prompt_id}", self.base_url)) {
                 Ok(hist) => {
                     consecutive_errs = 0;
+                    // Failure first: a graph that fails after an early save/preview node has some
+                    // output, and that partial result isn't the answer (review 2026-10-30).
+                    if let Some(why) = parse_history_failure(&hist, &prompt_id) {
+                        return Err(AdapterError::Http(format!("{why} (prompt {prompt_id})")));
+                    }
                     if let Some(m) = parse_history_media(&hist, &prompt_id) {
                         break m;
                     }
@@ -587,6 +636,7 @@ mod tests {
     fn parse_media_finds_audio_and_video_not_just_images() {
         let audio = r#"{"p":{"outputs":{"9":{"audio":[{"filename":"song.flac","subfolder":"","type":"output"}]}}}}"#;
         assert_eq!(parse_history_media(audio, "p").unwrap().0, "song.flac");
+        assert_eq!(parse_history_failure(audio, "p"), None, "it produced audio");
         let video = r#"{"p":{"outputs":{"9":{"gifs":[{"filename":"clip.mp4","subfolder":"vid","type":"output"}]}}}}"#;
         let (f, sf, _) = parse_history_media(video, "p").unwrap();
         assert_eq!((f.as_str(), sf.as_str()), ("clip.mp4", "vid"));
@@ -600,4 +650,21 @@ mod tests {
         assert_eq!(mime_for("x.webm"), "video/webm");
         assert_eq!(mime_for("noext"), "application/octet-stream");
     }
+
+    /// GPU test 2026-10-29: ComfyUI failed in 1.5 s (cuDNN) and the adapter polled for 300 s.
+    #[test]
+    fn a_failed_graph_is_reported_at_once() {
+        let failed = r#"{"p":{"outputs":{},"status":{"status_str":"error","completed":false,"messages":[["execution_start",{}],["execution_error",{"node_id":"3","node_type":"KSampler","exception_type":"RuntimeError","exception_message":"CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED\n"}]]}}}"#;
+        let why = parse_history_failure(failed, "p").unwrap();
+        assert!(why.contains("RuntimeError in node 3 (KSampler): CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED"), "{why}");
+        let empty = r#"{"p":{"outputs":{},"status":{"status_str":"success","completed":true,"messages":[]}}}"#;
+        assert!(parse_history_failure(empty, "p").unwrap().contains("without any"));
+        assert_eq!(parse_history_failure("{}", "p"), None, "still running: not in the history yet");
+        let partial = r#"{"p":{"outputs":{"7":{"images":[{"filename":"preview.png","subfolder":"","type":"temp"}]}},"status":{"status_str":"error","completed":false,"messages":[["execution_error",{"node_id":"9","node_type":"SaveImage","exception_type":"OSError","exception_message":"disk full"}]]}}}"#;
+        assert!(parse_history_failure(partial, "p").unwrap().contains("disk full"), "an error after a preview is still an error");
+        let interrupted = r#"{"p":{"outputs":{},"status":{"status_str":"error","completed":false,"messages":[["execution_interrupted",{"node_id":"3"}]]}}}"#;
+        assert!(parse_history_failure(interrupted, "p").unwrap().contains("interrupted"));
+        assert_eq!(parse_history_failure(&history_done("test-prompt-id"), "test-prompt-id"), None, "done with an image");
+    }
+
 }

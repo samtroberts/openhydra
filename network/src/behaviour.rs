@@ -6,7 +6,7 @@
 use libp2p::request_response;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay};
+use libp2p::{autonat, dcutr, identify, kad, mdns, ping, relay};
 
 use crate::proxy::GrpcProxyCodec;
 
@@ -19,9 +19,12 @@ pub const PEER_MAX_PENDING_INCOMING: u32 = 128;
 pub const PEER_MAX_ESTABLISHED_INCOMING: u32 = 1024;
 /// A peer node: all established connections, both directions.
 pub const PEER_MAX_ESTABLISHED_TOTAL: u32 = 2048;
-/// A bootstrap: every node of the network may connect to it.
+/// A bootstrap: every node of the network may connect to it. The established cap fits the 1 GB
+/// servers the bootstraps run on: an idle connection costs some 67 KB of the process's memory before
+/// any traffic (measured 2026-10-29), so 8,192 would have been ~550 MB; 2,048 is ~140 MB, and well
+/// above what the network uses (each node holds two or three connections to a bootstrap).
 pub const BOOTSTRAP_MAX_PENDING_INCOMING: u32 = 512;
-pub const BOOTSTRAP_MAX_ESTABLISHED_INCOMING: u32 = 8192;
+pub const BOOTSTRAP_MAX_ESTABLISHED_INCOMING: u32 = 2048;
 
 /// Bounds on how many connections other nodes can make a peer node hold (pending handshakes, and
 /// established connections in all and per peer). Without them, connections under fresh identities
@@ -52,6 +55,8 @@ pub struct OpenHydraBehaviour {
     pub fence: crate::fence::Behaviour,
     /// Bounds on the connections other nodes can make us hold ([`peer_connection_limits`]).
     pub connection_limits: libp2p::connection_limits::Behaviour,
+    /// Addresses kept for our own dials to a peer, never handed out ([`crate::address_book`]).
+    pub address_book: crate::address_book::Behaviour,
     /// Kademlia DHT for peer discovery.
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     /// Circuit Relay v2 client — connects through relays when behind NAT.
@@ -75,8 +80,8 @@ pub struct OpenHydraBehaviour {
     pub autonat_v2_client: autonat::v2::client::Behaviour,
     /// Identify — exchange peer metadata on connect.
     pub identify: identify::Behaviour,
-    /// mDNS — zero-config LAN peer discovery.
-    pub mdns: mdns::tokio::Behaviour,
+    /// mDNS — zero-config LAN peer discovery (absent with `--no-mdns`).
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     /// gRPC proxy — tunnels gRPC through libp2p for cross-ISP inference.
     pub grpc_proxy: request_response::Behaviour<GrpcProxyCodec>,
     /// C7: `/openhydra/registry/1.0.0` — consumer→bootstrap "who serves model X?" query. This
@@ -91,7 +96,7 @@ pub struct OpenHydraBehaviour {
     /// * ``REQUEST_HOLE_PUNCH`` — pairs with A3's DCUtR fix: a peer asks
     ///   a specific counterpart to dial back *now*, giving both sides a
     ///   coordinated simultaneous-dial window even behind symmetric NAT.
-    pub gossipsub: gossipsub::Behaviour,
+    pub gossipsub: crate::swarm::GossipBehaviour,
     /// Ping keepalive — sends periodic pings on ALL connections (including
     /// relay circuits) to prevent NAT mapping eviction.  Without this,
     /// mobile hotspot NAT drops TCP mappings during the 1-3 s inference

@@ -13,6 +13,7 @@ on:
       - '**/Cargo.lock'
       - '.cargo/audit.toml'
       - '.github/workflows/security.yml'
+      - 'ops/ci/audit-vendored.sh'
   pull_request:
     paths:
       - '**/Cargo.toml'
@@ -46,3 +47,7 @@ jobs:
       # The desktop app's own dependency tree ships too (round 8 R8-6).
       - name: Audit desktop app dependencies
         run: cargo audit --file desktop/src-tauri/Cargo.lock
+      # The crates we vendor (network/patched-deps) are path dependencies, which cargo audit skips:
+      # check their upstream versions against the same database.
+      - name: Audit vendored crates
+        run: ./ops/ci/audit-vendored.sh

@@ -10,11 +10,14 @@ User=openhydra
 Group=openhydra
 WorkingDirectory=/opt/openhydra
 
-# Each server's ExecStart is customized during deploy to include the
-# other two bootstrap peers. The deploy script writes a drop-in override.
+# The node's other bootstraps (--peer) are in a drop-in, peers.conf, which repeats this ExecStart
+# with them (ops/bootstrap/deploy_libp2p.sh --apply-unit / --reconfigure-peers writes it).
 ExecStart=/opt/openhydra/bin/openhydra-bootstrap \
     --identity /opt/openhydra/.libp2p_identity.key \
-    --listen /ip4/0.0.0.0/tcp/4001
+    --listen /ip4/0.0.0.0/tcp/4001 \
+    --listen /ip4/0.0.0.0/udp/4001/quic-v1 \
+    --listen /ip6/::/tcp/4001 \
+    --listen /ip6/::/udp/4001/quic-v1
 
 # Log level via RUST_LOG env var (default: info)
 Environment=RUST_LOG=info
@@ -22,22 +25,43 @@ Environment=RUST_LOG=info
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
+# The servers have 1 GB: past this the process restarts, rather than the box running out of memory
+# and taking SSH down with it (review 2026-10-29: no cap at all).
+MemoryHigh=384M
+MemoryMax=512M
+# No swapping instead of the restart (the Linodes have 2.5 GB of swap).
+MemorySwapMax=0
 
-# Systemd hardening
+# Systemd hardening. The service only reads its key and binary (both root-owned except the key,
+# which the service user owns, 0600); it writes nothing on disk.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/opt/openhydra
-# Audit 4.5: defense-in-depth for a public, internet-facing relay.
 ProtectHome=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectClock=true
+ProtectHostname=true
+# AF_NETLINK: the listeners learn the interface addresses through netlink (if-watch).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# Port 4001 needs no privilege: no capabilities at all, ordinary service system calls only.
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+DevicePolicy=closed
+RemoveIPC=true
+UMask=0077
 
 StandardOutput=journal
 StandardError=journal

@@ -75,6 +75,11 @@ Cargo.lock
 # releases must be reproducible and auditable (see .github/workflows/security.yml). Mirrors
 # the desktop lock negation further down this file.
 !/Cargo.lock
+# ...and the patched libp2p-mdns crate's own lock, which CI's `cargo test --locked` for that crate
+# needs (it's outside the workspace).
+!/network/patched-deps/libp2p-mdns/Cargo.lock
+# ...and the patched libp2p-dcutr crate's, for the same reason.
+!/network/patched-deps/libp2p-dcutr/Cargo.lock
 
 # ── Terraform ─────────────────────────────────────────────────────────────────
 .terraform/
@@ -168,3 +173,8 @@ desktop/src-tauri/WixTools/
 # openhydra-scorer build work dir (scorer/build.sh)
 scorer/.build/
 scorer/mistralrs/.build/
+# The vendored crates keep upstream's published manifest beside the patched one (their CHANGELOGs say so).
+!/network/patched-deps/libp2p-kad/Cargo.toml.orig
+!/network/patched-deps/libp2p-mdns/Cargo.toml.orig
+!/network/patched-deps/libp2p-dcutr/Cargo.toml.orig
+!/network/patched-deps/libp2p-gossipsub/Cargo.toml.orig

@@ -30,6 +30,121 @@ pub fn encode_record(record: &PeerRecord) -> Result<Vec<u8>, String> {
 }
 
 /// Decode a PeerRecord from a Kademlia record value (CBOR).
+/// Whether a record a peer asked us to store (Kademlia `PUT_RECORD`) may be stored: a provider
+/// record that decodes, verifies, and sits under the key its own (model, peer id) give. A valid
+/// signature alone isn't enough: one identity could replay its record under thousands of keys to
+/// fill the store, or a peer could overwrite another's key with junk (review 2026-10-29: the
+/// bootstraps stored anything).
+pub fn check_put_record(record: &kad::Record, now_ms: u64) -> Result<PeerRecord, String> {
+    let peer_record = decode_record(&record.value).map_err(|e| format!("undecodable: {e}"))?;
+    // The key first: it costs a hash, the signature a verification.
+    if record.key != peer_record_key(&peer_record.model_id, &peer_record.libp2p_peer_id) {
+        return Err("key not bound to its (model_id, libp2p_peer_id)".into());
+    }
+    check_record_age(&peer_record, now_ms)?;
+    verify_peer_record(&peer_record).map_err(|e| format!("failed verification: {e}"))?;
+    Ok(peer_record)
+}
+
+/// The oldest a provider record may be to be stored or relayed (providers re-announce every two
+/// minutes): an older one, replayed, would roll a provider back to a past address or keep a
+/// withdrawn model listed (review 2026-10-29).
+pub const MAX_RECORD_AGE_MS: u64 = 3_600_000;
+/// How far ahead of our clock a record's time may be: a few minutes, for home machines whose
+/// clock runs fast.
+pub const MAX_RECORD_FUTURE_MS: u64 = 300_000;
+
+/// Whether `record`'s signed time is within [`MAX_RECORD_AGE_MS`] before and
+/// [`MAX_RECORD_FUTURE_MS`] after `now_ms`. A time of 0 is a record from a node older than
+/// 2026-10-29, which never set one: accepted (with no replay protection) until those are gone,
+/// or no provider on them could be found (GPU test 2026-10-29).
+pub fn check_record_age(record: &PeerRecord, now_ms: u64) -> Result<(), String> {
+    if record.updated_unix_ms == 0 {
+        return Ok(());
+    }
+    if record.updated_unix_ms.saturating_add(MAX_RECORD_AGE_MS) < now_ms {
+        return Err("record older than an hour".into());
+    }
+    if record.updated_unix_ms > now_ms.saturating_add(MAX_RECORD_FUTURE_MS) {
+        return Err("record dated in the future".into());
+    }
+    Ok(())
+}
+
+/// Whether `incoming` may replace what the store holds under its key: only a record at least as
+/// new (a replayed older one would roll the provider back).
+pub fn newer_than_stored(stored: Option<&kad::Record>, incoming: &PeerRecord) -> bool {
+    match stored.and_then(|r| decode_record(&r.value).ok()) {
+        Some(old) => incoming.updated_unix_ms >= old.updated_unix_ms,
+        None => true,
+    }
+}
+
+/// Records one publisher may keep in our record store via PUT_RECORD: the key binding makes each
+/// one a distinct (model, publisher), and model names are free, so one identity could otherwise
+/// fill the whole store (1,024 records) and every honest PUT would fail (review 2026-10-29).
+pub const MAX_PUT_RECORDS_PER_PUBLISHER: usize = 64;
+/// Records the peers of one network (see `ip_limits::origin_key`) may keep there.
+pub const MAX_PUT_RECORDS_PER_ORIGIN: usize = 256;
+/// How long a stored record counts against its publisher (the record TTL).
+const PUT_QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Who holds how much of a node's record store, by publisher and by the network the PUT came from.
+#[derive(Debug, Default)]
+pub struct PutQuota {
+    entries: std::collections::HashMap<kad::RecordKey, (String, String, std::time::Instant)>,
+    per_publisher: std::collections::HashMap<String, usize>,
+    per_origin: std::collections::HashMap<String, usize>,
+}
+
+impl PutQuota {
+    /// Whether a PUT of `key` by `publisher` (its libp2p id) from network `origin` may be stored
+    /// at `now`; counts it if so. A key already held is a refresh and always allowed.
+    pub fn admit(&mut self, key: &kad::RecordKey, publisher: &str, origin: &str, now: std::time::Instant) -> bool {
+        self.expire(now);
+        if let Some(e) = self.entries.get_mut(key) {
+            e.2 = now;
+            return true;
+        }
+        if self.per_publisher.get(publisher).copied().unwrap_or(0) >= MAX_PUT_RECORDS_PER_PUBLISHER
+            || self.per_origin.get(origin).copied().unwrap_or(0) >= MAX_PUT_RECORDS_PER_ORIGIN
+        {
+            return false;
+        }
+        *self.per_publisher.entry(publisher.to_string()).or_default() += 1;
+        *self.per_origin.entry(origin.to_string()).or_default() += 1;
+        self.entries.insert(key.clone(), (publisher.to_string(), origin.to_string(), now));
+        true
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        let (pp, po) = (&mut self.per_publisher, &mut self.per_origin);
+        self.entries.retain(|_, (p, o, t)| {
+            let keep = now.duration_since(*t) < PUT_QUOTA_TTL;
+            if !keep {
+                for (m, k) in [(&mut *pp, p.as_str()), (&mut *po, o.as_str())] {
+                    if let Some(n) = m.get_mut(k) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            m.remove(k);
+                        }
+                    }
+                }
+            }
+            keep
+        });
+    }
+
+    /// Records counted now.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 pub fn decode_record(data: &[u8]) -> Result<PeerRecord, String> {
     PeerRecord::from_cbor(data).map_err(|e| format!("cbor decode: {e}"))
 }
@@ -542,5 +657,49 @@ mod tests {
         // Even if the (empty) libp2p_peer_id matched the source, the missing
         // signature must still fail the verify step.
         assert!(pex_record_is_authentic(&unsigned, "").is_err());
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn one_publisher_or_one_network_gets_only_its_share_of_the_record_store() {
+        let mut q = PutQuota::default();
+        let t0 = std::time::Instant::now();
+        let key = |i: usize| peer_record_key(&format!("junk-{i}"), "12D3KooWAttacker");
+        let held = (0..2_000).filter(|i| q.admit(&key(*i), "12D3KooWAttacker", "203.0.113.9", t0)).count();
+        assert_eq!(held, MAX_PUT_RECORDS_PER_PUBLISHER, "one identity, free model names");
+        // A refresh of what it holds is still fine; an honest publisher elsewhere still gets in.
+        assert!(q.admit(&key(0), "12D3KooWAttacker", "203.0.113.9", t0));
+        assert!(q.admit(&peer_record_key("m", "12D3KooWHonest"), "12D3KooWHonest", "198.51.100.7", t0));
+        // Many identities from one network: the network's share.
+        let mut q = PutQuota::default();
+        let held = (0..2_000)
+            .filter(|i| q.admit(&peer_record_key("m", &format!("id{i}")), &format!("id{i}"), "2001:db8:1::/48", t0))
+            .count();
+        assert_eq!(held, MAX_PUT_RECORDS_PER_ORIGIN);
+        // Shares come back once the records have expired.
+        assert!(q.admit(&peer_record_key("m", "late"), "late", "2001:db8:1::/48", t0 + std::time::Duration::from_secs(301)));
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn an_old_or_future_record_is_refused_and_a_replay_never_replaces_a_newer_one() {
+        let now = 10 * MAX_RECORD_AGE_MS;
+        let rec = |ms: u64| PeerRecord { updated_unix_ms: ms, ..Default::default() };
+        assert!(check_record_age(&rec(now - 1_000), now).is_ok());
+        assert!(check_record_age(&rec(0), now).is_ok(), "a node that never dates its records");
+        assert!(check_record_age(&rec(now - MAX_RECORD_AGE_MS - 1), now).is_err(), "over an hour old");
+        assert!(check_record_age(&rec(now + MAX_RECORD_FUTURE_MS + 1), now).is_err(), "from the future");
+        let stored = |ms: u64| {
+            let r = PeerRecord { updated_unix_ms: ms, model_id: "m".into(), libp2p_peer_id: "p".into(), ..Default::default() };
+            kad::Record::new(peer_record_key("m", "p"), encode_record(&r).unwrap())
+        };
+        assert!(newer_than_stored(None, &rec(5)));
+        assert!(newer_than_stored(Some(&stored(5)), &rec(5)), "the same record again");
+        assert!(newer_than_stored(Some(&stored(5)), &rec(6)));
+        assert!(!newer_than_stored(Some(&stored(6)), &rec(5)), "an older one replayed");
     }
 }

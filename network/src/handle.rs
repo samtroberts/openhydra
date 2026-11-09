@@ -158,6 +158,12 @@ impl NetworkHandle {
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::Announce { record, reply })?
     }
 
+    /// Publish raw bytes on the gossip topic, as they are (load and abuse tests: the bytes needn't
+    /// be a valid OpenHydra message).
+    pub fn publish_raw(&self, payload: Vec<u8>) -> Result<(), String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::PublishEvent { payload, reply })?
+    }
+
     /// M6: publish a `MODEL_WITHDRAWN` tombstone so consumers evict this node's `model_id`
     /// entry immediately (the operator un-shared it) instead of waiting out the discover-record
     /// TTL. Best-effort — a no-mesh publish is reported as `Ok` (the model still expires on the
@@ -270,6 +276,20 @@ impl NetworkHandle {
         self.proxy_queue.pop(timeout)
     }
 
+    /// Tell the network a serve request from `source_peer` passed every gate (shared model, scope,
+    /// nonce, payment) and is being served: it then dials the peer's IPv6 addresses back, which
+    /// opens this node's own router's firewall to it (A4). Never blocks; a malformed peer id or a
+    /// full command queue just skips the dial. Call it only for an accepted serve: it's the trigger
+    /// for packets to addresses the peer chose.
+    pub fn serve_accepted(&self, source_peer: &str) {
+        if source_peer == self.libp2p_peer_id() {
+            return;
+        }
+        if let Ok(peer_id) = source_peer.parse() {
+            let _ = self.cmd_tx.try_send(SwarmCommand::ServeAccepted { peer_id });
+        }
+    }
+
     /// Send the one-shot response for an inbound request (used as an ACK; the streamed
     /// body is delivered separately via [`push`](Self::push)).
     pub fn respond(&self, request_id: String, data: Vec<u8>) -> Result<(), String> {
@@ -319,6 +339,9 @@ mod tests {
     use super::*;
 
     fn loopback_config(dir: &std::path::Path) -> NodeConfig {
+        // No LAN discovery either: mDNS runs on the real interfaces and now dials what it finds, so
+        // an "isolated" test node would connect to any OpenHydra node on the developer's LAN.
+        crate::node::disable_mdns();
         NodeConfig {
             identity_path: dir.join("id.key"),
             // Ephemeral loopback ports: no fixed ports, no LAN exposure.

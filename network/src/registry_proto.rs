@@ -30,6 +30,9 @@ pub const REGISTRY_PROTOCOL: StreamProtocol = StreamProtocol::new("/openhydra/re
 /// 100 MB: a registry peer never moves bulk data, so any larger declared length is junk and is
 /// rejected before we read a body.
 const MAX_MSG_SIZE: usize = 1024 * 1024;
+/// A query is a model id: a request frame above this is junk. Read at the 1 MB reply cap, 100
+/// streams a connection could make a bootstrap buffer 100 MB each (review 2026-10-29).
+const MAX_REQUEST_SIZE: usize = 4 * 1024;
 
 /// A consumer's "who serves this model?" query.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -49,10 +52,18 @@ async fn read_framed<T>(io: &mut T) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
+    read_framed_max(io, MAX_MSG_SIZE).await
+}
+
+/// [`read_framed`] with a cap of `max` bytes.
+async fn read_framed_max<T>(io: &mut T, max: usize) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
     let mut len_buf = [0u8; 4];
     io.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_MSG_SIZE {
+    if len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "registry message exceeds MAX_MSG_SIZE",
@@ -85,7 +96,7 @@ impl Codec for RegistryCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let bytes = read_framed(io).await?;
+        let bytes = read_framed_max(io, MAX_REQUEST_SIZE).await?;
         serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -175,6 +186,18 @@ mod tests {
         let got = codec.read_response(&proto, &mut io).await.unwrap();
         assert_eq!(got.records.len(), 1);
         assert_eq!(got.records[0].peer_id, "p1");
+    }
+
+    #[tokio::test]
+    async fn a_request_frame_bigger_than_a_query_is_refused_before_its_body_is_read() {
+        let mut wire = ((MAX_REQUEST_SIZE + 1) as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&[0u8; 8]);
+        let mut io: &[u8] = &wire;
+        let proto = StreamProtocol::new("/openhydra/registry/1.0.0");
+        let err = RegistryCodec.read_request(&proto, &mut io).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // A real query (a model id) still fits with plenty of room.
+        assert!(serde_json::to_vec(&RegistryQuery { model_id: "x".repeat(512) }).unwrap().len() < MAX_REQUEST_SIZE);
     }
 
     #[tokio::test]

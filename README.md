@@ -1,104 +1,212 @@
 <p align="center">
   <h1 align="center">OpenHydra</h1>
   <p align="center"><strong>Run AI in a herd, not a data center.</strong></p>
-  <p align="center"><em>A peer-to-peer protocol for free, distributed AI inference.</em></p>
+  <p align="center"><em>An open, peer-to-peer network for AI inference — bring the engine you already run.</em></p>
 </p>
 
 <p align="center">
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust"></a>
+  <a href="https://github.com/samtroberts/openhydra/releases/latest"><img src="https://img.shields.io/github/v/release/samtroberts/openhydra" alt="Latest release"></a>
+  <a href="https://github.com/samtroberts/openhydra/actions/workflows/rust-network.yml"><img src="https://github.com/samtroberts/openhydra/actions/workflows/rust-network.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/platforms-macOS%20(Apple%20Silicon)%20%7C%20Linux%20x86--64%20%7C%20Windows%20x64-lightgrey" alt="Platforms">
 </p>
 
----
+- **Bring your own engine.** Ollama, LM Studio, llama.cpp, vLLM, Exo or ComfyUI. OpenHydra
+  doesn't run models itself; it shares the ones your engine already serves.
+- **One local endpoint.** OpenAI and Anthropic APIs on `http://127.0.0.1:16527`, wired into
+  Claude Code, OpenCode, Hermes and Pi by one command.
+- **Checked, not trusted.** Co-signed receipts, audits, token recounts and optional log-prob
+  checks, and private to your own machines when you want. [What is and isn't checked](#trust-and-its-limits).
 
-OpenHydra is a peer-to-peer **protocol** for distributed AI inference. It does not
-run a model itself. Instead it sits in front of whatever inference engine you
-already run — **Ollama, vLLM, LM Studio, llama.cpp, or any OpenAI-compatible
-server** — and joins a global swarm that routes each request to a peer that has
-the requested model, streams the completion back, and settles a co-signed
-receipt. No central server. No API keys. No subscription. Think BitTorrent, for
-AI inference.
+## Quick start
 
-The whole thing is a single Rust binary, `openhydra-agent`. There is no Python
-in any role.
+**The app.** Download it from [openhydra.co/downloads](https://openhydra.co/downloads) or the
+[latest release](https://github.com/samtroberts/openhydra/releases/latest): `.dmg` (macOS,
+Apple Silicon), `-setup.exe` / `.msi` (Windows x64), `.AppImage` / `.deb` / `.rpm` (Linux x86-64).
 
-**Why OpenHydra?**
-
-- **Bring your own engine.** Already running Ollama, vLLM, LM Studio, or
-  llama.cpp? Join with a thin adapter and keep your stack — any Mac, NVIDIA, or
-  AMD GPU, any platform. Requests run on the provider at native local speed.
-- **No central server.** Peers discover each other over a Kademlia DHT + mDNS,
-  with AutoNAT, UPnP, DCUtR hole-punching, and Circuit Relay v2 fallback for
-  NAT'd nodes. The network is the computer.
-- **Free, by reciprocity.** Give-to-get: serve inference to build standing when
-  you consume. No tokens, no crypto, no monthly bill.
-- **OpenAI-compatible.** The consumer gateway speaks the OpenAI Chat Completions
-  API (streaming and non-streaming), so existing SDKs and tools point at it
-  unchanged.
-- **Keys stay put.** Each node's ed25519 identity key never leaves the Rust
-  daemon — receipts are co-signed in-process; only signatures cross the wire.
-
----
-
-## How it works
-
-Two roles, one binary:
-
-- **`provide`** — joins the swarm, detects the models your local engine serves,
-  advertises their canonical ids on the DHT, and serves inbound inference by
-  proxying to that engine. It never runs a model itself.
-- **`serve`** — the consumer front door: an OpenAI-compatible HTTP/SSE gateway.
-  For each request it discovers a provider for the requested model, streams the
-  completion back over libp2p, and settles a co-signed receipt at EOS.
-
-A request never touches a coordinator: the gateway talks to the provider
-directly (or through a relay when both sides are NAT'd). Throughput is your
-engine's native speed plus the routing/transport overhead.
-
----
-
-## Quick Start
-
-To **share** an engine you need an inference engine running locally (Ollama,
-vLLM, LM Studio, or llama.cpp). To only **consume** from the network, no engine
-is required.
-
-### Install
-
-#### Prebuilt binary (recommended)
-
-One line, no toolchain — installs the latest `openhydra-agent` for your platform:
+**The command line** (macOS Apple Silicon and Linux x86-64):
 
 ```bash
 curl -fsSL https://openhydra.co/install.sh | sh
 ```
 
-It drops the binary in `/usr/local/bin` (or `~/.local/bin` if that isn't
-writable). Prefer to grab it yourself? Download the right asset from the
-[latest release](https://github.com/samtroberts/openhydra/releases/latest),
-`chmod +x`, and put it on your `PATH`:
+```bash
+openhydra provide          # share the models your local engine serves
+openhydra serve            # local gateway on http://127.0.0.1:16527
+openhydra launch claude    # run Claude Code against that gateway (start `serve` first)
+```
 
-| Platform              | Asset                                        |
-|-----------------------|----------------------------------------------|
-| macOS (Apple Silicon) | `openhydra-agent-aarch64-apple-darwin`       |
-| Linux (x86-64)        | `openhydra-agent-x86_64-unknown-linux-gnu`   |
-| Windows (x86-64)      | `openhydra-agent-x86_64-pc-windows-msvc.exe` |
+> **Until 0.3.23, the CLI has no built-in bootstrap list** (the desktop app has one). On a LAN,
+> nodes find each other by mDNS. To reach peers elsewhere, give a known peer before the
+> subcommand: `openhydra --bootstrap <multiaddr> serve`.
 
-The binaries are not yet code-signed. On macOS, if Gatekeeper blocks the binary,
-clear the quarantine flag: `xattr -d com.apple.quarantine ./openhydra-agent`.
-(Intel Macs and Linux arm64 have no prebuilt binary yet — build from source.)
+---
 
-#### Desktop app
+## How it works
 
-Prefer a GUI? Grab the installer for your OS from the
-[latest release](https://github.com/samtroberts/openhydra/releases/latest) —
-`.dmg` (macOS), `-setup.exe` / `.msi` (Windows), `.AppImage` / `.deb` (Linux) —
-or use the one-click links at [openhydra.co](https://openhydra.co).
+One binary, `openhydra-agent` (installed as `openhydra`), plays two roles, alone or together:
 
-### Build from source
+- **`provide`** finds the engines running on this machine (`--engine-kind auto`, the default,
+  probes every supported engine on its standard port), announces the models you choose to
+  share on a Kademlia DHT, and answers requests by passing them to your engine.
+- **`serve`** is the local gateway your tools talk to. For each request it finds providers of
+  the requested model, streams the answer back over libp2p, and both sides sign a receipt.
 
-Needs a stable [Rust toolchain](https://rustup.rs). The whole workspace is pure
-Rust — no Python toolchain is required.
+Peers find each other through the DHT, mDNS and a few bootstrap nodes; libp2p handles NAT
+(AutoNAT, UPnP, DCUtR hole-punching) and falls back to Circuit Relay v2 when no direct path
+works. Connections are encrypted in transit (Noise over TCP, TLS 1.3 over QUIC). A relay
+forwards encrypted bytes; **the provider that serves a request reads it in plain text**,
+because its engine has to.
+
+The network is free today: there is no token, and payments aren't live. Serving gives your
+requests priority on other providers (give-to-get: a short delay for heavy consumers who
+don't serve, never a refusal). The repo also contains draft settlement contracts in
+[`onchain/`](onchain/); they are not audited, not deployed, and not used by the app.
+
+## Gateway endpoints
+
+| Route | |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions, streaming and non-streaming |
+| `POST /v1/messages` | Anthropic Messages API (what Claude Code speaks) |
+| `POST /v1/embeddings` | OpenAI embeddings |
+| `GET /v1/models` | models found on the network, plus `openhydra/auto` |
+| `GET /health` | liveness, no key needed |
+| `GET /metrics` | Prometheus metrics, no key needed |
+
+`model: "openhydra/auto"` lets the gateway pick a live model. The gateway binds
+`127.0.0.1:16527` by default.
+
+**Keys.** `openhydra serve` is open on loopback unless you set `--api-key` (or
+`OPENHYDRA_API_KEY`). Since v0.3.21 the desktop app's gateway requires its own key, created on
+first run at `~/.openhydra/gateway.key`; Connect and `openhydra launch` write it into your
+tools for you. Send it as `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+```bash
+curl http://127.0.0.1:16527/v1/chat/completions \
+  -H "Authorization: Bearer $(cat ~/.openhydra/gateway.key)" \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "openhydra/auto", "messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
+```
+
+## Connect your tool
+
+```bash
+openhydra launch claude      # Claude Code, through the gateway's own Anthropic API
+openhydra launch opencode    # also: hermes, pi
+openhydra connect <tool>     # only write the config;  openhydra disconnect <tool> restores it
+```
+
+`launch` writes the tool's config (keeping a `.openhydra.bak` backup) and starts the tool. It
+doesn't start a gateway; run `openhydra serve` or the app first. In the app, the same thing is
+**Connectors → Connect**.
+
+| Tool | Config written | What it points at |
+|---|---|---|
+| Claude Code | `~/.claude/settings.json` (`env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`) | `http://127.0.0.1:16527` |
+| OpenCode | `~/.config/opencode/opencode.json` (provider `openhydra`) | `http://127.0.0.1:16527/v1` |
+| Hermes | `~/.hermes/config.yaml` (`model:` block, `provider: custom`) | `http://127.0.0.1:16527/v1` |
+| Pi | `~/.pi/agent/models.json` (provider `openhydra`) | `http://127.0.0.1:16527/v1` |
+| Continue (`connect` only, no `launch`) | `~/.continue/config.yaml` | `http://127.0.0.1:16527/v1` |
+
+Any other OpenAI-compatible tool works with base URL `http://127.0.0.1:16527/v1`, your gateway
+key, and model `openhydra/auto`.
+
+## Share your machine
+
+```bash
+openhydra provide                                   # auto: every engine it finds
+openhydra provide --engine-kind ollama              # or one engine
+openhydra provide --engine-kind exo --engine http://127.0.0.1:52415
+openhydra provide --share-models llama3.2,qwen3     # only these models
+```
+
+Useful flags: `--max-concurrency` (parallel requests, default 8), `--share-models` /
+`--share-policy-file` (what to share), `--db <path>` (keep the receipt ledger across restarts),
+`--aup-*` (optional request limits, off by default). In the app, sharing is per model, from the
+Share screen; the app has no contribution cap yet.
+
+Sharing runs whenever the agent runs. It doesn't detect whether you're using the machine.
+
+## Private groups and private deployments
+
+- **Swarms** (private groups). Create one, admit members by exchanging a copy-paste request and
+  a signed credential, and mark models "Only my swarms". Your provider serves those models only
+  to members and never announces them on the public DHT. *Limit:* a member's gateway may also
+  route a request to public providers of a model with the same name.
+- **`.openhydra` cards.** A signed, secret-free description of one provider and one model.
+  `openhydra card export` / `card verify` on the CLI; the app opens card files and
+  `openhydra:` links. A card for a private model is useless without a swarm credential.
+- **Private deployments.** `--public-relays off` (app: Settings → Network → "Use OpenHydra's
+  public network" off) uses only bootstrap peers you list, and refuses OpenHydra's own servers.
+
+## Trust and its limits
+
+What the gateway checks:
+
+- **Receipts.** Every request to another provider ends in a receipt both sides sign (model,
+  token count, keys, nonce, time).
+- **Token recount.** The gateway recounts the delivered answer with the model's own tokenizer
+  and signs for the lower count, so a provider can't over-bill on the text it sent.
+- **Audits.** A sample of providers (2–50%, by reputation) is checked by sending the same
+  greedy request to other providers and comparing answers. Reputation is kept per gateway.
+- **Log-prob checks** (opt-in) compare a provider's token probabilities on reference texts with
+  the claimed model's.
+
+What it doesn't check: that a provider doesn't read or log your prompt; that it runs exactly the
+weights or quantization it claims (except through the opt-in log-prob check, on challenge
+requests); and whether answers are good. A low-reputation provider is ranked lower, not banned.
+
+## Privacy
+
+- **The provider that serves your request reads it in plain text.** Don't send what you
+  wouldn't show a stranger, or keep it on your own machines (private deployments above).
+- **Audit replay.** In `openhydra serve` it is **on by default**: a request with
+  `temperature: 0` to a public model may be sent again, as is, to up to three other providers
+  of that model (usually one) so their answers can be compared. Private-swarm requests are never
+  replayed. Turn it off with `--audit-replay off`. **The desktop app has it off** (Settings →
+  Network → "Check providers with my own requests").
+- **Token counts.** The gateway downloads the tokenizer index from `dl.openhydra.co` once a day
+  (the whole list, so it says nothing about your models) and, the first time you use a listed
+  model, that model's tokenizer from huggingface.co, which tells Hugging Face that this gateway
+  uses that model. `--no-tokenizer-downloads` (app: "Check billed token counts") turns that off.
+- **Network metadata.** Bootstrap nodes and relays see your peer id and IP address; providers
+  announce their model names on the DHT.
+- **No accounts and no telemetry.** Your identity is an ed25519 key in `~/.openhydra/` that
+  never leaves the agent; receipts are signed in-process. The app keeps chat history in
+  `~/.openhydra/sessions.json` (not encrypted) and checks `dl.openhydra.co` for updates.
+
+Full policy: [openhydra.co/privacy](https://openhydra.co/privacy).
+
+## Supported engines
+
+| `--engine-kind` | Engine | Default port | Detection |
+|---|---|---|---|
+| `auto` (default) | every engine below that answers | — | probes each standard port, re-probes on re-announce |
+| `ollama` | Ollama (native `/api/*`) | 11434 | `/api/tags` |
+| `lm-studio` | LM Studio | 1234 | `/v1/models` |
+| `llama-cpp` | `llama-server` | 8080 | `/props` → GGUF model id |
+| `vllm` | vLLM | 8000 | `/v1/models` |
+| `exo` | Exo cluster | 52415 | `/state` (placed, ready models only) |
+| `comfyui` | ComfyUI (image / audio / video) | 8188 | `/object_info/CheckpointLoaderSimple`; `--comfyui-workflow-dir` for your own workflows |
+| `openai` | any OpenAI-compatible server | 8000 | `/v1/models` |
+
+## Downloads and signing
+
+- **Desktop app:** macOS (Apple Silicon) `.dmg`, Windows x64 `-setup.exe` and `.msi`, Linux
+  x86-64 `.AppImage`, `.deb` and `.rpm`. The macOS app is signed and notarized by Apple. The
+  Windows build isn't code-signed yet, so SmartScreen may warn on first run. The app updates
+  itself from `dl.openhydra.co`.
+- **CLI:** `openhydra-agent-<target>` for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and
+  `x86_64-pc-windows-msvc`. The binaries themselves aren't code-signed; since 0.3.22 each
+  platform's `SHA256SUMS` file is signed with minisign. `install.sh` always checks the SHA-256
+  and also checks the signature when `minisign` is installed. Public key:
+  `RWT1WCE7c96xPsN2V6HZHspfB29Ucvh6rePhj+Y6bmCSzl54zcIGVMn0`.
+- No Intel Mac or Linux arm64 builds yet; build from source.
+
+## Build from source
+
+Needs a stable [Rust toolchain](https://rustup.rs). No Python.
 
 ```bash
 git clone https://github.com/samtroberts/openhydra && cd openhydra
@@ -106,126 +214,20 @@ cargo build --release -p openhydra-agent
 # → ./target/release/openhydra-agent
 ```
 
-### Share your engine (provider)
+## Repository map
 
-Start your engine, then point a provider at it. Ollama is the default:
+- `agent/` — the `openhydra-agent` binary: engine adapters, provider, gateway, connectors.
+- `network/` — libp2p swarm (Kademlia, mDNS, relay, DCUtR, AutoNAT, UPnP) and the
+  `openhydra-bootstrap` binary.
+- `protocol/` — model ids, routing, receipts, verification, the redb ledger.
+- `desktop/` — the Tauri desktop app.
+- `scorer/` — the log-prob scorer builds (patched llama.cpp and mistral.rs).
+- `ops/` — bootstrap deploy scripts. `onchain/` — draft contracts, not used.
+- `benchmarks/` — historical numbers from before the bring-your-own-engine design.
 
-```bash
-# Ollama on its standard port (11434)
-./target/release/openhydra-agent provide --engine-kind ollama
+## Security
 
-# vLLM / LM Studio / llama.cpp / any OpenAI-compatible server
-./target/release/openhydra-agent provide --engine-kind vllm       --engine http://127.0.0.1:8000
-./target/release/openhydra-agent provide --engine-kind lm-studio  --engine http://127.0.0.1:1234
-./target/release/openhydra-agent provide --engine-kind llama-cpp  --engine http://127.0.0.1:8080
-./target/release/openhydra-agent provide --engine-kind openai     --engine http://127.0.0.1:8000
-
-# Exo MLX cluster (port 52415)
-./target/release/openhydra-agent provide --engine-kind exo        --engine http://127.0.0.1:52415
-
-# ComfyUI for image / audio / video (port 8188); add --comfyui-workflow-dir <dir> for BYO workflows
-./target/release/openhydra-agent provide --engine-kind comfyui    --engine http://127.0.0.1:8188
-```
-
-Useful flags: `--db <path>` persists the receipt ledger (redb) across restarts;
-`--bootstrap <multiaddr>` dials a known peer/relay when mDNS can't reach the
-swarm; `--reannounce-secs` tunes the DHT re-announce interval (default 120s).
-
-### Consume (gateway)
-
-Run the OpenAI-compatible gateway on another machine (or the same one, second
-process):
-
-```bash
-./target/release/openhydra-agent serve            # binds 127.0.0.1:16527
-# optional: require a key on /v1/* —
-#   --api-key <key>   or   OPENHYDRA_API_KEY=<key>
-```
-
-Then point any OpenAI client at it:
-
-```bash
-curl http://127.0.0.1:16527/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "llama3.2",
-    "messages": [{"role": "user", "content": "Write a haiku about peer-to-peer AI."}],
-    "stream": true
-  }'
-```
-
-The gateway also serves `GET /v1/models` (model ids discovered on the swarm) and
-`GET /health`.
-
-The gateway checks each provider's billed token count against the model's own
-tokenizer. Which tokenizer that is comes from a signed index (built in, refreshed
-daily from `dl.openhydra.co`); the tokenizer file itself is downloaded from
-huggingface.co the first time a listed model is used, hash-checked, and cached in
-`~/.openhydra/tokenizers`. `--no-tokenizer-downloads` (desktop: Settings → Network →
-"Check billed token counts") turns the download off.
-
----
-
-## Supported engines
-
-| `--engine-kind` | Engine                         | Default port | Detection |
-|-----------------|--------------------------------|--------------|-----------|
-| `ollama`        | Ollama (native `/api/*`)       | 11434        | `/api/tags` — full canonical ids |
-| `vllm`          | vLLM (OpenAI `/v1/*`)          | 8000         | `/v1/models` |
-| `lm-studio`     | LM Studio (OpenAI `/v1/*`)     | 1234         | `/v1/models` |
-| `llama-cpp`     | `llama-server` (`/props`)      | 8080         | `/props` → GGUF canonical id |
-| `exo`           | Exo MLX cluster                | 52415        | `/state` — only placed-and-ready models (not the full catalog) |
-| `openai`        | Any OpenAI-compatible (LocalAI, …) | 8000     | `/v1/models` |
-| `comfyui`       | ComfyUI (image / audio / video) | 8188        | `/object_info/CheckpointLoaderSimple` — SD checkpoints |
-
----
-
-## Architecture
-
-A three-crate Rust workspace:
-
-- **`network/`** — the libp2p swarm: Kademlia DHT, mDNS, Circuit Relay v2,
-  DCUtR, AutoNAT v2, UPnP, and the request/response proxy. Exposes a synchronous
-  `NetworkHandle` to the agent and the `openhydra-bootstrap` binary.
-- **`protocol/`** — pure protocol logic: canonical model-id resolution, capability
-  records, the router (resolve → rank → route), co-signed receipts, and the redb
-  receipt ledger.
-- **`agent/`** — the runnable host (`openhydra-agent`): engine adapters, the
-  provider loop, and the OpenAI-compatible consumer gateway.
-
-Public **bootstrap nodes** (a small Rust `openhydra-bootstrap` binary on a few
-VPS instances, dual-stack IPv4+IPv6 on :4001) seed DHT discovery and act as
-relays for NAT'd peers. Deploy scripts live in [`ops/bootstrap/`](ops/bootstrap/).
-
----
-
-## Benchmarks
-
-Historical throughput data from earlier builds lives in
-[`benchmarks/`](benchmarks/). Because OpenHydra now proxies to an external
-engine, end-to-end throughput is the engine's own tokens/sec plus the transport
-overhead (LAN direct ≈ a few ms; relayed cross-NAT paths add a hop).
-
----
-
-## Security & Privacy
-
-- Each node's **ed25519 identity key never leaves the Rust daemon**. Receipts are
-  co-signed in-process; only the resulting signatures and public keys cross the
-  wire.
-- Transport is authenticated and encrypted by libp2p (Noise + TLS over QUIC/TCP).
-- Provider operators choose what their engine exposes; the protocol routes by
-  model id and does not require sharing prompts with any third party beyond the
-  serving provider.
-- Token-count checks fetch the whole tokenizer index (it says nothing about which
-  models you use), but downloading a model's tokenizer from Hugging Face tells
-  Hugging Face that this gateway uses that model. Prompts and answers are never
-  sent there; `serve --no-tokenizer-downloads` (or the desktop's "Check billed token
-  counts" switch) turns the download off.
-
-See [SECURITY.md](SECURITY.md) to report vulnerabilities.
-
----
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 

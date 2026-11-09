@@ -1,42 +1,109 @@
 #!/bin/bash
 # OpenHydra seed provider (@SEED_NAME@): Qwen3.8-27B on HyperQwen, first-boot setup.
-# Rendered by ops/seeds/render.sh, which fills in the seed's identity; the rendered file is
-# private (it holds the key) and stays in ~/.openhydra-seeds, never in the repo.
+# Rendered by ops/seeds/render.sh. The seed's identity either comes from SSM Parameter Store at
+# first boot (--ssm-param: the user-data holds only the parameter's name, and the instance's role may
+# read only that parameter) or is written into this file (--embed-key: then the rendered file is
+# private and stays in ~/.openhydra-seeds, never in the repo).
 # Expects the AWS Deep Learning Base GPU AMI (Ubuntu 24.04: NVIDIA driver + Docker) on an A10G
 # (g5). Logs: /var/log/openhydra-seed.log. On a fresh instance (a spot relaunch) the model is
 # downloaded and prepared again: about 15-40 minutes before the seed answers.
+# Launch with IMDSv2 required and a hop limit of 1
+# (--metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpProtocolIpv6=disabled). The
+# instance metadata service serves this user-data and, with --ssm-param, the role's credentials:
+# HyperQwen's containers can't reach it at all (their slice, below, whatever their network mode or
+# user), and the imds-guard unit keeps non-root processes on the host away from it. Root keeps it
+# (cloud-init, the SSM agent). EC2 Instance Connect (it looks keys up as a non-root user) doesn't
+# work on a seed: use the key pair or SSM.
 set -euo pipefail
 exec >>/var/log/openhydra-seed.log 2>&1
 echo "== seed setup start $(date -u +%FT%TZ)"
+# A setup that fails leaves a GPU instance with nothing on it, billing (review 2026-10-29). It's
+# launched to terminate on shutdown, so shut down: in 30 minutes, which leaves time to look (SSH in
+# and run `shutdown -c` to keep it).
+trap 'rc=$?; if [ "$rc" != 0 ]; then echo "== seed setup FAILED ($rc) $(date -u +%FT%TZ): shutting down in 30 minutes (cancel: shutdown -c)"; shutdown -h +30 "OpenHydra seed setup failed"; fi' EXIT
 export DEBIAN_FRONTEND=noninteractive
 export HOME=/root
 
 id openhydra >/dev/null 2>&1 || useradd --system --home-dir /var/lib/openhydra --shell /usr/sbin/nologin openhydra
 install -d -m 700 -o openhydra -g openhydra /etc/openhydra /var/lib/openhydra
-echo "@IDENTITY_B64@" | base64 -d > /etc/openhydra/identity.json
-chown openhydra:openhydra /etc/openhydra/identity.json && chmod 600 /etc/openhydra/identity.json
+@IDENTITY_SETUP@
+chown openhydra:openhydra /etc/openhydra/identity.json
+chmod 600 /etc/openhydra/identity.json
+
+# Only root may reach the instance metadata service (it serves this script, key included): non-root
+# processes on the host (OUTPUT) and containers (DOCKER-USER). A unit, so it's restored every boot.
+cat > /etc/systemd/system/openhydra-imds-guard.service <<'UNIT'
+[Unit]
+Description=Keep the instance metadata service (it holds the seed key) to root
+After=docker.service
+Wants=docker.service
+Before=hyperqwen.service openhydra-provider.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP 2>/dev/null || iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP'
+ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null || iptables -I DOCKER-USER -d 169.254.169.254 -j DROP'
+ExecStart=/bin/sh -c 'ip6tables -C OUTPUT -d fd00:ec2::254 -m owner ! --uid-owner 0 -j DROP 2>/dev/null || ip6tables -I OUTPUT -d fd00:ec2::254 -m owner ! --uid-owner 0 -j DROP'
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now openhydra-imds-guard
+
+# The block below only holds if Docker puts containers under systemd's cgroups: with the cgroupfs
+# driver, `cgroup_parent: hyperqwen.slice` is a plain directory and systemd's filter never applies.
+# Refuse to go on without it (the shutdown above then ends the instance).
+DRIVER=$(docker info -f '{{.CgroupDriver}}' 2>/dev/null || true)
+[ "$DRIVER" = systemd ] || { echo "Docker's cgroup driver is '${DRIVER:-unknown}', not systemd: the containers couldn't be kept from the metadata service"; exit 1; }
+
+# HyperQwen's containers run in this slice, and nothing in it may reach the metadata service. A
+# static unit: systemd applies the filter to the slice's cgroup every time it creates it, so it holds
+# whenever and however often the containers start, host networking or not (review 2026-10-29: an
+# iptables cgroup match is resolved once, when the rule is added, and the slice comes and goes).
+cat > /etc/systemd/system/hyperqwen.slice <<'UNIT'
+[Unit]
+Description=HyperQwen containers (no instance metadata service)
+[Slice]
+IPAddressDeny=169.254.169.254 fd00:ec2::254
+UNIT
+systemctl daemon-reload
 
 # HyperQwen, pinned: the commit and image the 24-26 Oct tests measured.
 HQ_COMMIT=ce9615c
 HQ_IMAGE=ghcr.io/syv-ai/hyperqwen:sha-ce9615c
 if [ ! -d /opt/hyperqwen/.git ]; then git clone -q https://github.com/syv-ai/HyperQwen /opt/hyperqwen; fi
-cd /opt/hyperqwen && git fetch -q origin && git checkout -q "$HQ_COMMIT"
+cd /opt/hyperqwen
+git fetch -q origin
+git checkout -q "$HQ_COMMIT"
 # Single-user mode (DFlash2). KV_MEM is HyperQwen's 24 GiB-card constant: an A10G has about
 # 1.5 GB less, so size the pool from GPU_UTIL instead, and 64k context doesn't fit: 32k.
 cp .env.example .env
 printf 'KV_MEM=\nMAX_LEN=32768\n' >> .env
-docker pull -q "$HQ_IMAGE" && docker tag "$HQ_IMAGE" ghcr.io/syv-ai/hyperqwen:latest
+# Every HyperQwen service into the slice above. The override is passed by name (-f) in the unit
+# below, so it doesn't depend on compose's file-naming rules.
+for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+  [ -f "$f" ] && { HQ_COMPOSE=$f; break; }
+done
+[ -n "${HQ_COMPOSE:-}" ] || { echo "no compose file in /opt/hyperqwen"; exit 1; }
+{ echo "services:"
+  docker compose -f "$HQ_COMPOSE" --profile single config --services | while read -r svc; do
+    printf '  %s:\n    cgroup_parent: hyperqwen.slice\n' "$svc"
+  done; } > openhydra.override.yaml
+grep -q cgroup_parent openhydra.override.yaml || { echo "no services found in $HQ_COMPOSE"; exit 1; }
+# Separate lines: a failed pull must stop the script, not leave compose to fetch whatever `latest` is.
+docker pull -q "$HQ_IMAGE"
+docker tag "$HQ_IMAGE" ghcr.io/syv-ai/hyperqwen:latest
 
-cat > /etc/systemd/system/hyperqwen.service <<'UNIT'
+cat > /etc/systemd/system/hyperqwen.service <<UNIT
 [Unit]
 Description=HyperQwen (Qwen3.8-27B) for the OpenHydra seed
-After=docker.service network-online.target
-Requires=docker.service
+After=docker.service network-online.target openhydra-imds-guard.service
+Requires=docker.service openhydra-imds-guard.service
 Wants=network-online.target
 [Service]
 WorkingDirectory=/opt/hyperqwen
-ExecStart=/usr/bin/docker compose --profile single up
-ExecStop=/usr/bin/docker compose --profile single down
+ExecStart=/usr/bin/docker compose -f $HQ_COMPOSE -f openhydra.override.yaml --profile single up
+ExecStop=/usr/bin/docker compose -f $HQ_COMPOSE -f openhydra.override.yaml --profile single down
 Restart=always
 RestartSec=15
 TimeoutStartSec=0
@@ -44,29 +111,79 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 UNIT
 
-curl -fsSL https://openhydra.co/install.sh | OPENHYDRA_BIN_DIR=/usr/local/bin sh
+# The agent release is pinned like HyperQwen, installer included (from the release's tag, not the
+# website's current copy), so a spot relaunch doesn't change it: bump on purpose.
+OH_VERSION=v0.3.24
+curl -fsSL "https://raw.githubusercontent.com/samtroberts/openhydra/$OH_VERSION/install.sh" \
+  | OPENHYDRA_VERSION="$OH_VERSION" OPENHYDRA_BIN_DIR=/usr/local/bin sh
 
 # The agent starts once HyperQwen answers (the first boot downloads ~21 GB and prepares the model).
 # No --bootstrap: the agent joins through OpenHydra's public bootstraps by default.
 cat > /etc/systemd/system/openhydra-provider.service <<'UNIT'
 [Unit]
 Description=OpenHydra seed provider (@SEED_NAME@)
-After=network-online.target hyperqwen.service
+After=network-online.target hyperqwen.service openhydra-imds-guard.service
 Wants=network-online.target hyperqwen.service
+Requires=openhydra-imds-guard.service
 [Service]
 User=openhydra
 Group=openhydra
 Environment=HOME=/var/lib/openhydra
-ExecStartPre=/bin/sh -c 'until curl -sf http://127.0.0.1:18020/v1/models >/dev/null; do sleep 15; done'
-ExecStart=/usr/local/bin/openhydra --identity /etc/openhydra/identity.json --listen /ip4/0.0.0.0/tcp/4001 --listen /ip4/0.0.0.0/udp/4001/quic-v1 --listen /ip6/::/tcp/4001 --listen /ip6/::/udp/4001/quic-v1 provide --engine-kind openai --engine http://127.0.0.1:18020 --share-models qwen3.8-27b --declare-quant int4 --db /var/lib/openhydra/provider.redb @PROMPT_SCORING@
+# Wait for HyperQwen inside the main process (not ExecStartPre), so the unit counts as started at
+# once and a slow or broken HyperQwen never holds up the rest of the boot.
+ExecStart=/bin/sh -c 'until curl -sf http://127.0.0.1:18020/v1/models >/dev/null; do sleep 15; done; exec /usr/local/bin/openhydra --identity /etc/openhydra/identity.json --listen /ip4/0.0.0.0/tcp/4001 --listen /ip4/0.0.0.0/udp/4001/quic-v1 --listen /ip6/::/tcp/4001 --listen /ip6/::/udp/4001/quic-v1 provide --engine-kind openai --engine http://127.0.0.1:18020 --share-models qwen3.8-27b --declare-quant int4 --db /var/lib/openhydra/provider.redb @PROMPT_SCORING@'
 Restart=always
 RestartSec=5
 TimeoutStartSec=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/openhydra /etc/openhydra
+ProtectHome=yes
+PrivateTmp=yes
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# A seed that set up but doesn't serve (the engine crash-looping, out of memory, a failed guard) would
+# bill the GPU with nothing on it: the setup trap above only covers this script failing. This watchdog
+# runs on every boot and powers off (the instance terminates on shutdown) when the seed hasn't served
+# within 120 minutes of boot (a first model download can be slow), or has stopped serving for 30
+# minutes. Keep it up for debugging with `touch /etc/openhydra/keep-running`.
+cat > /usr/local/sbin/openhydra-serve-watchdog <<'WATCHDOG'
+#!/bin/bash
+first=$((120 * 60)) later=$((30 * 60))
+up() { cut -d. -f1 /proc/uptime; }
+healthy() {
+  systemctl is-active --quiet openhydra-imds-guard \
+    && systemctl is-active --quiet openhydra-provider \
+    && curl -sf -m 10 http://127.0.0.1:18020/v1/models >/dev/null
+}
+last_ok=0 limit=$first
+while :; do
+  if healthy; then last_ok=$(up) limit=$later; fi
+  if [ ! -e /etc/openhydra/keep-running ] && [ $(( $(up) - last_ok )) -ge "$limit" ]; then
+    echo "seed not serving for $(( ($(up) - last_ok) / 60 )) min: powering off"
+    shutdown -h now "OpenHydra seed isn't serving"
+    exit 0
+  fi
+  sleep 60
+done
+WATCHDOG
+chmod 755 /usr/local/sbin/openhydra-serve-watchdog
+cat > /etc/systemd/system/openhydra-serve-watchdog.service <<'UNIT'
+[Unit]
+Description=Power off a seed that isn't serving (it bills the GPU otherwise)
+After=network-online.target
+[Service]
+ExecStart=/usr/local/sbin/openhydra-serve-watchdog
+Restart=always
+RestartSec=30
 [Install]
 WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
+systemctl enable --now openhydra-serve-watchdog
 systemctl enable --now hyperqwen
 systemctl enable --now openhydra-provider
 echo "== seed setup done $(date -u +%FT%TZ) (the provider starts once HyperQwen is ready)"

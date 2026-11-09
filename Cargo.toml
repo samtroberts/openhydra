@@ -9,9 +9,15 @@
 [workspace]
 resolver = "2"
 members = ["network", "protocol", "agent"]
-# The patched libp2p-quic lives inside the `network` tree and is consumed via the
-# [patch] below, not as a workspace member.
-exclude = ["network/patched-deps/libp2p-quic"]
+# The patched libp2p-quic, libp2p-mdns, libp2p-kad, libp2p-dcutr and libp2p-gossipsub live inside the `network` tree and are consumed via
+# the [patch] below, not as workspace members.
+exclude = [
+    "network/patched-deps/libp2p-quic",
+    "network/patched-deps/libp2p-mdns",
+    "network/patched-deps/libp2p-kad",
+    "network/patched-deps/libp2p-dcutr",
+    "network/patched-deps/libp2p-gossipsub",
+]
 
 # `[profile.*]` and `[patch.*]` are honored only in the workspace root manifest, so
 # they move here from network/Cargo.toml. The patch path is relative to this file.
@@ -22,3 +28,11 @@ lto = true
 
 [patch.crates-io]
 libp2p-quic = { path = "network/patched-deps/libp2p-quic" }
+# LAN discovery between peers with many addresses (see its CHANGELOG.md).
+libp2p-mdns = { path = "network/patched-deps/libp2p-mdns" }
+# Keeps private addresses out of DHT answers on the public network (see its CHANGELOG.md).
+libp2p-kad = { path = "network/patched-deps/libp2p-kad" }
+# Stops offering hole-punch addresses from a network we've left (see its CHANGELOG.md).
+libp2p-dcutr = { path = "network/patched-deps/libp2p-dcutr" }
+# Bounds each connection's gossip send queue (see its CHANGELOG.md).
+libp2p-gossipsub = { path = "network/patched-deps/libp2p-gossipsub" }

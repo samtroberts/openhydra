@@ -182,6 +182,40 @@ fn sweep_relay_forwards(
 /// The error a queued forward fails with when its peer's last dial failed (callers match on it to
 /// retry after a short wait: a provider that just joined becomes reachable within seconds).
 pub const DIAL_FAILED_UNREACHABLE: &str = "dial failed (peer unreachable)";
+/// A dial that failed only because the relays refused it for their limits
+/// ([`crate::transport::dial_refused_by_relay_limits`]). Deliberately not [`DIAL_FAILED_UNREACHABLE`],
+/// so the consumer doesn't retry it within seconds and spend more of the relays' budget.
+pub const DIAL_FAILED_RELAY_LIMIT: &str =
+    "dial failed (the relays are refusing this gateway's dials for now: too many recent attempts)";
+
+/// How long relayed dials to a peer wait after one ended unreachable: doubling from 2 s to 16 s, and
+/// at least 20 s after the relays refused one for their limits. GPU test 2026-10-29: a consumer
+/// retried a dead provider ~10 times in 30 s, each time through all 4 relays, and so used up its
+/// circuit allowance there (30 per 2 min per source peer, libp2p's default) — the provider was
+/// unreachable for another minute after it came back. A forward to a peer in its back-off fails at
+/// once with the same error, so the caller's retry schedule is unchanged but costs no relay budget.
+fn next_relay_dial_backoff(prev: Option<std::time::Duration>, relay_limit: bool) -> std::time::Duration {
+    use std::time::Duration;
+    let next = prev.map_or(Duration::from_secs(2), |d| (d * 2).min(Duration::from_secs(16)));
+    if relay_limit { next.max(Duration::from_secs(20)) } else { next }
+}
+
+/// A peer's relayed-dial back-off: no relayed dial before `until`; `step` is the last wait;
+/// `set_unix_ms` is when it was set (a record the peer signed later means it's back); `why` is the
+/// error forwards get meanwhile.
+#[derive(Debug, Clone, Copy)]
+struct RelayDialBackoff {
+    until: std::time::Instant,
+    step: std::time::Duration,
+    set_unix_ms: u64,
+    why: &'static str,
+}
+
+/// How often a bootstrap may be re-dialled from a new port after an address-in-use refusal.
+const IN_USE_REDIAL_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Peers in relayed-dial back-off at most (a back-off is dropped when it expires, on the reaper tick).
+const MAX_RELAY_DIAL_BACKOFFS: usize = 4096;
 
 /// Dials in flight per peer: see [`LoopState::dials_in_flight`].
 type DialsInFlight = HashMap<PeerId, std::collections::HashSet<libp2p::swarm::ConnectionId>>;
@@ -298,9 +332,16 @@ fn quic_dup_action(is_listener: bool) -> QuicDupAction {
 /// Counted together: two duplicates of one peer due in the same sweep, after its original closed,
 /// would each still see two connections, and both would be closed, leaving none (review 2026-10-14,
 /// L11): each one closed here counts as gone for the next.
+///
+/// When both ends dial each other at once (a hole punch from each side), each has its own outbound
+/// connection and the other's inbound one, and each would close the inbound one after the grace,
+/// so both go. Of such a pair the one the lower peer id dialled stays: the side with the higher id
+/// (`local` above the peer) leaves its inbound duplicate alone when it's one of just two, and the
+/// other side, closing its own inbound duplicate, closes ours (A4 review 2026-10-29).
 fn quic_dups_due(
     due: &[(libp2p::swarm::ConnectionId, PeerId, bool)],
     peers: &HashMap<PeerId, PeerConnectionInfo>,
+    local: &PeerId,
 ) -> (Vec<libp2p::swarm::ConnectionId>, Vec<(libp2p::swarm::ConnectionId, PeerId, bool)>) {
     let mut closing: HashMap<(PeerId, bool), u32> = HashMap::new();
     let (mut close, mut stay) = (Vec::new(), Vec::new());
@@ -308,7 +349,8 @@ fn quic_dups_due(
         let Some(info) = peers.get(&pid) else { continue };
         let open = if v6 { info.quic_direct_v6 } else { info.quic_direct_v4 };
         let already = closing.entry((pid, v6)).or_default();
-        if open.saturating_sub(*already) >= 2 {
+        let left = open.saturating_sub(*already);
+        if left >= 3 || (left == 2 && *local < pid) {
             *already += 1;
             close.push(cid);
         } else {
@@ -537,6 +579,11 @@ pub enum SwarmCommand {
     TriggerRepunch {
         peer_id: PeerId,
     },
+    /// The agent accepted a serve request from `peer_id` (every gate passed): dial its claimed IPv6
+    /// addresses back (A4), which is what opens our own router's firewall to it.
+    ServeAccepted {
+        peer_id: PeerId,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -620,6 +667,13 @@ struct LoopState {
     known_peers: HashMap<String, PeerRecord>,
     /// Models withdrawn by their last known provider, and when (see `RecentlyWithdrawn`).
     withdrawn_models: HashMap<String, std::time::Instant>,
+    /// `PROVIDER_GONE` reports gathering per provider: the bootstraps that sent one, the newest
+    /// record time they named, and when the first came (unix ms).
+    provider_gone: HashMap<PeerId, (Vec<PeerId>, u64, u64)>,
+    /// Providers a quorum of bootstraps reported gone, by libp2p id: (newest record time they
+    /// held, first report unix ms). For [`GONE_MEMORY_MS`] no older-or-equal record of theirs is
+    /// cached again (a stale copy from a DHT store or a registry would bring the ghost back).
+    gone_providers: HashMap<String, (u64, u64)>,
     /// When each (model, provider peer) was last announced to us, for [`WITHDRAWN_MODEL_MEMORY`]:
     /// a provider's record can lapse here for a while; a withdrawal by another then isn't the model
     /// leaving the network (review 2026-10-14, L8).
@@ -634,6 +688,21 @@ struct LoopState {
     /// `get_providers` round-trip. Invalidated by `DISCOVER_CACHE_TTL_MS` and by a
     /// net-generation change (roam/wake) — so we never serve a stale relay path after moving.
     discover_cache: HashMap<String, (u64, u64)>,
+    /// Models whose discovers wait for `get_providers` instead of answering from `known_peers`,
+    /// with the `discover_seq` of the `InvalidateDiscover` that set it (sent when every known
+    /// candidate just failed and the consumer retries to find one only the DHT knows). Cleared
+    /// when a lookup started after it completes, not by the next discover, which might be someone
+    /// else's (an audit, another request) and use it up.
+    discover_wait_for_lookup: HashMap<String, u64>,
+    /// Each open direct connection's peer and remote address (relayed ones are left out):
+    /// identify's claims are only trusted for the IP a connection really comes from, and a
+    /// rebootstrap skips bootstraps already connected on that transport ([`bootstrap_redials`]).
+    conn_remote_addrs: HashMap<libp2p::swarm::ConnectionId, (PeerId, Multiaddr, std::time::Instant)>,
+    /// When one of our interface addresses last went away (a roam, an interface down): connections
+    /// made before it may run over a network we've left ([`bootstrap_redials`]).
+    last_addr_loss: Option<std::time::Instant>,
+    /// Counter shared by lookups and `InvalidateDiscover`s, ordering one against the other.
+    discover_seq: u64,
     /// Pending Kademlia GET queries: query_id → reply channel.
     pending_discovers: HashMap<kad::QueryId, PendingDiscover>,
     /// Chained `get_record` fetches spawned by a `get_providers` discover, mapping the
@@ -696,6 +765,10 @@ struct LoopState {
     /// established or the dial fails): a failed dial fails the peer's queued forwards only when no
     /// other dial to it is still pending.
     dials_in_flight: DialsInFlight,
+    /// Relayed-dial back-off per peer (see [`next_relay_dial_backoff`]).
+    relay_dial_backoff: HashMap<PeerId, RelayDialBackoff>,
+    /// When each bootstrap was last re-dialled from a new port after an address-in-use refusal.
+    in_use_redials: HashMap<PeerId, std::time::Instant>,
     /// C-N1: peers with both a direct and a relay connection, mapped to the
     /// instant at which the relay may be closed (direct-established-at + grace).
     /// Cleared if the direct path drops inside the window (so we keep the relay).
@@ -730,6 +803,14 @@ struct LoopState {
     /// such a peer's own non-global listen addresses are taken from identify (see
     /// [`identify_addr_admissible`]).
     local_link_peers: HashMap<PeerId, u32>,
+    /// What each trusted relay's identify says its own addresses are ([`relay_self_addrs`]).
+    relay_self_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+    /// The addresses we reached each trusted relay at directly.
+    relay_dialled_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Dials to peers mDNS discovered: which to make, their bounds and back-off ([`crate::mdns::LanDialer`]).
+    lan_dialer: crate::mdns::LanDialer,
+    /// When to re-publish our provider records for a LAN peer that just joined ([`note_lan_subscriber`]).
+    lan_announce: LanAnnounce,
     /// Reply channels for local proxy forwards (Ouroboros: target == self).
     local_proxy_replies: HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>,
     /// Fix 4: debounce tracking for TriggerRepunch.
@@ -751,15 +832,56 @@ struct LoopState {
     /// ``GOSSIP_INBOUND_QUEUE_MAX`` to prevent unbounded memory growth
     /// when Python is slow to poll.
     gossip_inbound_queue: std::collections::VecDeque<(String, Vec<u8>)>,
-    /// F-5: Per-relay-circuit RESERVATION retry state, keyed by the
-    /// ``/p2p-circuit`` listen multiaddr string: (attempt_count,
-    /// next_attempt_at). Retries OUR OWN reservation
-    /// (``listen_on`` a circuit) so we stay reachable when a relay rejects or
-    /// drops the reservation. Without backoff a flapping relay caused either a
-    /// tight re-listen loop or (on a hard listen_on error) a permanent strand
-    /// for the whole session (the EU-relay gap). Cleared on NewListenAddr /
-    /// ReservationReqAccepted for that circuit.
-    relay_reservation_retries: HashMap<String, (u32, tokio::time::Instant)>,
+    /// F-5: RESERVATION retry state per relay: (attempt_count, next_attempt_at, the circuit to
+    /// reserve on). Retries OUR OWN reservation (``listen_on`` a circuit) so we stay reachable
+    /// when a relay rejects or drops it. Without backoff a flapping relay caused either a tight
+    /// re-listen loop or (on a hard listen_on error) a permanent strand for the whole session (the
+    /// EU-relay gap). Keyed by relay, not by circuit address: a reservation reports one circuit
+    /// per relay transport, and retrying each of them reserved on one relay several times at
+    /// once, which libp2p resolves by closing all but one, each close scheduling more (the
+    /// roaming churn, 2026-10-29). Cleared when a circuit through that relay comes up.
+    relay_reservation_retries: HashMap<PeerId, (u32, tokio::time::Instant, Multiaddr)>,
+    /// Our live circuit listeners and the relay each reserves on: at most one per relay. Every
+    /// reservation request goes through [`request_reservation`], which checks this first.
+    relay_listeners: HashMap<libp2p::core::transport::ListenerId, PeerId>,
+    /// LAN peers we've re-announced for since they connected (see `note_lan_subscriber`); cleared on
+    /// full disconnect.
+    lan_announced: std::collections::HashSet<PeerId>,
+    /// Consecutive failed pings per connection to one of our relays (see [`relay_connection_dead`]).
+    relay_ping_failures: HashMap<libp2p::swarm::ConnectionId, u32>,
+    /// Our direct connections to our relays: when each was established and where its relay sees
+    /// us (see [`relay_connection_dead`]).
+    relay_conns: HashMap<libp2p::swarm::ConnectionId, RelayConn>,
+    /// P2: startup bootstrap dials waiting for a TCP listen address to dial from
+    /// ([`startup_dials_ready`]), and until when they wait.
+    startup_dials: Vec<(PeerId, Multiaddr)>,
+    startup_dials_until: Option<tokio::time::Instant>,
+    /// Whether we've announced, and whether the first relay reservation and the first gossip peer
+    /// on our topic have come yet. A provider announces at once on startup, before it holds a
+    /// reservation or has a gossip peer, so its first announce reached nobody (`put_record`
+    /// timeout, gossip `InsufficientPeers`) and it was found only at the next re-announce, up to
+    /// 2 min later (2026-10-29); each of those moments re-announces once.
+    announced: bool,
+    reservation_seen: bool,
+    gossip_peer_seen: bool,
+    /// What peers' PUT_RECORDs hold of our record store (see `dht::PutQuota`).
+    put_quota: dht::PutQuota,
+    /// The same for ADD_PROVIDER.
+    provider_quota: dht::PutQuota,
+    /// Our relayed connections, to whom (see [`relayed_connection_dead`]).
+    relayed_conns: HashMap<libp2p::swarm::ConnectionId, PeerId>,
+    /// Consecutive failed pings per relayed connection.
+    relayed_ping_failures: HashMap<libp2p::swarm::ConnectionId, u32>,
+    /// Responses being written, to whom, since when: from `send_response` to libp2p's
+    /// `ResponseSent` or inbound failure.
+    responses_writing: HashMap<request_response::InboundRequestId, (PeerId, std::time::Instant)>,
+    /// P1: our direct IPv6 QUIC connections to our relays, and the relay each goes to.
+    relay_v6_quic_conns: HashMap<libp2p::swarm::ConnectionId, PeerId>,
+    /// P1: when we last dialled each relay over IPv6 QUIC (see [`relay_v6_quic_dial`]).
+    relay_v6_quic_dialled: HashMap<PeerId, std::time::Instant>,
+    /// Node-wide budget for IPv6 hole-punch rounds: (window start, rounds in it). See
+    /// [`MAX_PUNCH_ROUNDS_PER_MINUTE`].
+    punch_window: (std::time::Instant, u32),
     /// Relays a "couldn't reserve" hint was logged for (once each).
     relay_hints_given: std::collections::HashSet<String>,
     // ── #42: network-change resilience ────────────────────────────────
@@ -834,6 +956,37 @@ pub const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
 /// this type ignores the message and keeps its TTL-expiry behaviour.
 pub const MODEL_WITHDRAWN_TYPE: &str = "MODEL_WITHDRAWN";
 
+/// A bootstrap's notice that a provider it held in its registry has had no connection to it for a
+/// while (a crash, a pulled cable: nothing the provider could announce itself). Fields:
+/// `libp2p_peer_id`, `last_record_ms` (the newest record time the bootstrap held for it; 0 for an
+/// undated one) and `timestamp` (unix seconds). GPU test 2026-10-30: without it, a consumer that
+/// never connected to a dead provider listed it for up to ~10 min (300 s record TTL + 300 s sticky
+/// browse list).
+pub const PROVIDER_GONE_TYPE: &str = "PROVIDER_GONE";
+/// Distinct bootstraps that must report a provider gone before a consumer drops it (fewer if it
+/// knows fewer): one bootstrap losing its own path to a provider is not the provider dying.
+const PROVIDER_GONE_QUORUM: usize = 2;
+/// How old a `PROVIDER_GONE` may be, and how long reports are kept while the quorum gathers.
+pub const PROVIDER_GONE_MAX_AGE_SECS: u64 = 120;
+/// Providers with reports gathering at most (the oldest go first).
+const MAX_PROVIDER_GONE_PENDING: usize = 4096;
+/// How long a provider reported gone stays remembered (see `LoopState::gone_providers`): past the
+/// DHT record TTL and the registry TTL (300 s each), so no stale copy outlives it.
+const GONE_MEMORY_MS: u64 = 600_000;
+
+/// Whether `record` is from a provider reported gone and no newer than what was reported then.
+/// Undated records (older nodes) can't be told apart from a fresh announce, so they're never
+/// refused here — refusing them would hide such a provider for the whole memory after it came
+/// back; they only get the receive-time eviction. Pure.
+fn is_gone_record(gone: &HashMap<String, (u64, u64)>, record: &PeerRecord, now_ms: u64) -> bool {
+    match gone.get(&record.libp2p_peer_id) {
+        Some((last, first)) if now_ms.saturating_sub(*first) < GONE_MEMORY_MS => {
+            record.updated_unix_ms != 0 && record.updated_unix_ms <= *last
+        }
+        _ => false,
+    }
+}
+
 /// M6/F1 (replay hardening): how far a `MODEL_WITHDRAWN` message's `timestamp` may be from the
 /// receiver's clock (either direction) and still be honoured. The timestamp lives inside the
 /// signed gossip payload, so an attacker replaying a captured withdrawal cannot refresh it — once
@@ -852,9 +1005,16 @@ pub const MODEL_WITHDRAWN_MAX_AGE_SECS: u64 = 120;
 /// matching the 300 s DHT record TTL; a provider that stops (re)announcing then
 /// ages out, while a live one is kept refreshed by each gossip.
 const KNOWN_PEER_TTL_MS: u64 = 300_000;
-/// How far in the future a provider record's signed time may be (clock skew) before it is refused:
-/// the reaper ages records by that time, so a far-future one would never expire (round 8 N8-2).
-const MAX_RECORD_SKEW_MS: u64 = 60_000;
+/// Whether the reaper keeps a provider record: while we're connected to the provider, or for
+/// [`KNOWN_PEER_TTL_MS`] after we last received the record.
+fn keep_known_peer(connected: bool, received_at_ms: Option<u64>, now_ms: u64) -> bool {
+    connected || received_at_ms.is_some_and(|at| now_ms.saturating_sub(at) < KNOWN_PEER_TTL_MS)
+}
+
+/// How far in the future a provider record's signed time may be (clock skew) before it is refused,
+/// so a far-future one can't stay "newest" (round 8 N8-2); the same limit as the DHT's
+/// [`dht::MAX_RECORD_FUTURE_MS`]. The reaper ages records by when we received them.
+const MAX_RECORD_SKEW_MS: u64 = dht::MAX_RECORD_FUTURE_MS;
 /// Provider records kept per libp2p id (one per model it serves); past it, its least recently
 /// received goes. Above any one machine's model list, so a big library doesn't churn (C9-3).
 const MAX_KNOWN_RECORDS_PER_PEER: usize = 256;
@@ -862,15 +1022,45 @@ const MAX_KNOWN_RECORDS_PER_PEER: usize = 256;
 const MAX_KNOWN_RECORDS: usize = 16_384;
 
 /// Cache a verified provider record in `state.known_peers`, stamped received now: refused (`None`)
-/// when it is dated too far ahead; else `Some(whether it is new)`. Bounded per peer and overall by
+/// when it is dated too far ahead, over an hour old, or older than the one held; else
+/// `Some(whether it is new)`. Bounded per peer and overall by
 /// receive time (round 9 C9-1: a record's own time is 0 from most nodes), never evicting this
 /// node's own records.
 fn install_known_peer(state: &mut LoopState, record: &PeerRecord, now_ms: u64) -> Option<bool> {
-    let installed = install_known_peer_in(&mut state.known_peers, &mut state.known_received, &state.local_libp2p, record, now_ms);
-    if installed.is_some() {
-        note_model_seen(&mut state.model_seen, &record.model_id, &record.libp2p_peer_id, std::time::Instant::now());
+    if is_gone_record(&state.gone_providers, record, now_ms) {
+        return None;
     }
-    installed
+    let installed = install_known_peer_in(&mut state.known_peers, &mut state.known_received, &state.local_libp2p, record, now_ms);
+    // A duplicate says nothing new about the provider (it may be a replay): no side effects.
+    if matches!(installed, Some(Install::New | Install::Renewed)) {
+        // It signed this after a dial to it failed: it's (back) up, so let the next forward dial.
+        if let Ok(pid) = record.libp2p_peer_id.parse::<PeerId>() {
+            if state.relay_dial_backoff.get(&pid).is_some_and(|b| record.updated_unix_ms > b.set_unix_ms) {
+                state.relay_dial_backoff.remove(&pid);
+            }
+        }
+        note_model_seen(&mut state.model_seen, &record.model_id, &record.libp2p_peer_id, std::time::Instant::now());
+        // A lookup for this model running now learns it too (gossip often brings a just-joined
+        // provider's new address before the DHT does); its waiters are answered on the next
+        // discover tick.
+        if record.libp2p_peer_id != state.local_libp2p {
+            for pending in state.pending_discovers.values_mut().filter(|p| p.model_id == record.model_id) {
+                pending.merge(record.clone(), now_ms);
+            }
+        }
+    }
+    installed.map(|i| i == Install::New)
+}
+
+/// What [`install_known_peer_in`] did with a record it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Install {
+    /// Not cached before.
+    New,
+    /// Replaced a held record with a newer one (or renewed an undated one): the provider is alive.
+    Renewed,
+    /// The same dated record again (a re-forwarded or replayed copy): kept as it was, renews nothing.
+    Duplicate,
 }
 
 fn install_known_peer_in(
@@ -879,16 +1069,29 @@ fn install_known_peer_in(
     local: &str,
     record: &PeerRecord,
     now_ms: u64,
-) -> Option<bool> {
+) -> Option<Install> {
     if record.updated_unix_ms > now_ms.saturating_add(MAX_RECORD_SKEW_MS) {
         return None;
     }
     // Callers verify first (dht::verify_peer_record includes this); kept here too so no path can
     // cache a record with an odd model name.
-    if dht::check_record_content(record).is_err() {
+    if dht::check_record_content(record).is_err() || dht::check_record_age(record, now_ms).is_err() {
         return None;
     }
     let key = known_peer_key(record);
+    // Never older over newer, and only a NEWER record renews the reaper's clock: a re-forwarded or
+    // replayed copy of a provider's last announce (gossip, a DHT store, a registry reply) would
+    // otherwise keep a dead provider listed forever, or put a roamed provider's old address back
+    // (review 2026-10-30). Records from nodes that don't date them (time 0) renew on receipt, as
+    // before, until those nodes are gone.
+    if let Some(held) = known.get(&key) {
+        if record.updated_unix_ms < held.updated_unix_ms {
+            return None;
+        }
+        if record.updated_unix_ms == held.updated_unix_ms && record.updated_unix_ms != 0 {
+            return Some(Install::Duplicate);
+        }
+    }
     let is_new = !known.contains_key(&key);
     if is_new {
         if received.len() > known.len() {
@@ -918,14 +1121,16 @@ fn install_known_peer_in(
     }
     received.insert(key.clone(), now_ms);
     known.insert(key, record.clone());
-    Some(is_new)
+    Some(if is_new { Install::New } else { Install::Renewed })
 }
 
 /// C11: how long a *completed* `discover` for a model stays fresh enough to answer from the
 /// `known_peers` cache without a new `get_providers` round-trip. Coalesces a request burst (a
 /// chat session / an agent loop) so only ~1 request per window pays the DHT lookup — which
 /// cross-NAT is the ~1.2 s `discover` hop (gossip PEX can't populate the cache across separate
-/// networks). Kept low so a moved/departed provider is re-resolved promptly; failover + the
+/// networks). A miss no longer waits on the lookup when providers are already known (see
+/// `handle_discover`), so this sets how often a model in use is re-resolved in the background:
+/// kept short so a provider only the DHT knows (cross-NAT) shows up promptly. Failover + the
 /// reaper cover a stale hit, and a net-generation change invalidates it outright.
 const DISCOVER_CACHE_TTL_MS: u64 = 30_000;
 
@@ -938,17 +1143,102 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// One `get_providers` lookup for a model, and the callers waiting on it. There is at most one per
+/// model at a time: a caller that needs a lookup while one is running joins it (review 2026-10-29:
+/// the consumer invalidates before every retry, so each retry used to start its own).
 struct PendingDiscover {
     model_id: String,
+    /// The model's providers: the known ones it started with, plus what the lookup finds, newest
+    /// signed record per provider ([`merge_record`]).
     records: Vec<PeerRecord>,
-    reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
     /// Set once the `get_providers` query terminates (found-all or timed-out). Until then,
     /// more providers — and thus more chained record fetches — may still arrive.
     providers_done: bool,
     /// In-flight `get_record` fetches for providers whose full `PeerRecord` wasn't held
-    /// locally (cross-relay, the record lives on the bootstrap nodes, not on us). The
-    /// reply is sent only once `providers_done && outstanding == 0`.
+    /// locally (cross-relay, the record lives on the bootstrap nodes, not on us).
     outstanding: usize,
+    /// Bumped whenever `records` gains a provider or a provider's address changes: what a retry
+    /// waits for ([`waiter_settled`]).
+    info_gen: u64,
+    /// The callers still waiting for an answer. None: the lookup runs on as a background refresh.
+    waiters: Vec<DiscoverWaiter>,
+    /// Its place in `LoopState::discover_seq`: only a lookup started after a model's
+    /// `InvalidateDiscover` may clear that model's wait flag or mark it fresh.
+    seq: u64,
+}
+
+impl PendingDiscover {
+    /// Merge `record` into the lookup's providers, noting new reachability information.
+    fn merge(&mut self, record: PeerRecord, now_ms: u64) {
+        match merge_record(&mut self.records, record, now_ms) {
+            Merge::Added | Merge::Replaced { address_changed: true } => self.info_gen += 1,
+            Merge::Replaced { address_changed: false } | Merge::Kept => {}
+        }
+    }
+}
+
+/// A caller waiting on a [`PendingDiscover`].
+struct DiscoverWaiter {
+    reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
+    kind: DiscoverKind,
+    /// The lookup's `info_gen` when this caller joined: a retry is answered once there's newer.
+    info_at_join: u64,
+    /// A retry is answered with what's in hand by then, whatever the DHT is doing.
+    deadline: Option<std::time::Instant>,
+}
+
+/// What a caller of a discover lookup is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverKind {
+    /// Nothing was known: answer with the first providers found.
+    Reply,
+    /// The caller's known providers all just failed: answer once a provider is new or reachable
+    /// at a different address, or at [`RETRY_SETTLE`].
+    Retry,
+}
+
+/// How long a retry's lookup may hold it before it gets what's in hand (review 2026-10-29: it waited
+/// for the whole lookup, up to its 10 s timeout, so the 30 s retry budget had room for 2–3 tries).
+/// The lookup itself runs on and refreshes the cache.
+const RETRY_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// How [`merge_record`] treated a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Merge {
+    /// A provider not in the list.
+    Added,
+    /// A newer record for one already there; `address_changed` says whether it's reachable
+    /// somewhere else now (a republish that only renews the time isn't).
+    Replaced { address_changed: bool },
+    /// Older, as old, or dated too far ahead: the one there stays.
+    Kept,
+}
+
+/// Merge a verified provider record into a lookup's list: one record per provider, the newest
+/// signed one winning (review 2026-10-29: the first one seen won, so a retry kept answering with a
+/// provider's stale address after a fresher record arrived). A record dated more than
+/// [`MAX_RECORD_SKEW_MS`] ahead is never preferred, the same limit `known_peers` applies.
+fn merge_record(records: &mut Vec<PeerRecord>, record: PeerRecord, now_ms: u64) -> Merge {
+    if record.updated_unix_ms > now_ms.saturating_add(MAX_RECORD_SKEW_MS) {
+        return Merge::Kept;
+    }
+    match records.iter_mut().find(|r| r.libp2p_peer_id == record.libp2p_peer_id) {
+        None => {
+            records.push(record);
+            Merge::Added
+        }
+        Some(r) if record.updated_unix_ms > r.updated_unix_ms => {
+            let address_changed = reachability(r) != reachability(&record);
+            *r = record;
+            Merge::Replaced { address_changed }
+        }
+        Some(_) => Merge::Kept,
+    }
+}
+
+/// Where a provider record says it can be reached.
+fn reachability(r: &PeerRecord) -> (&str, &str, u16, &str, bool) {
+    (&r.relay_address, &r.host, r.port, &r.host_ipv6, r.requires_relay)
 }
 
 impl LoopState {
@@ -965,10 +1255,16 @@ impl LoopState {
             ipv6_capable: probe_ipv6_capable(),
             known_peers: HashMap::new(),
             withdrawn_models: HashMap::new(),
+            provider_gone: HashMap::new(),
+            gone_providers: HashMap::new(),
             model_seen: HashMap::new(),
             known_received: HashMap::new(),
             local_libp2p: String::new(),
             discover_cache: HashMap::new(),
+            discover_wait_for_lookup: HashMap::new(),
+            conn_remote_addrs: HashMap::new(),
+            last_addr_loss: None,
+            discover_seq: 0,
             pending_discovers: HashMap::new(),
             pending_record_fetches: HashMap::new(),
             external_addrs: Vec::new(),
@@ -984,6 +1280,8 @@ impl LoopState {
             inbound_proxy_counter: 0,
             pending_relay_forwards: Vec::new(),
             dials_in_flight: HashMap::new(),
+            relay_dial_backoff: HashMap::new(),
+            in_use_redials: HashMap::new(),
             relay_close_deadline: HashMap::new(),
             v4_close_deadline: HashMap::new(),
             quic_dup_close_deadline: HashMap::new(),
@@ -997,6 +1295,10 @@ impl LoopState {
             tier_connect_success: std::collections::HashMap::new(),
             peer_connections: HashMap::new(),
             local_link_peers: HashMap::new(),
+            relay_self_addrs: HashMap::new(),
+            relay_dialled_addrs: HashMap::new(),
+            lan_dialer: crate::mdns::LanDialer::new(),
+            lan_announce: LanAnnounce::default(),
             local_proxy_replies: HashMap::new(),
             last_repunch: HashMap::new(),
             peer_quic_addrs: HashMap::new(),
@@ -1005,6 +1307,23 @@ impl LoopState {
             tunnel_close_queue: VecDeque::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
             relay_reservation_retries: HashMap::new(),
+            relay_listeners: HashMap::new(),
+            relay_ping_failures: HashMap::new(),
+            lan_announced: std::collections::HashSet::new(),
+            relay_conns: HashMap::new(),
+            announced: false,
+            reservation_seen: false,
+            gossip_peer_seen: false,
+            put_quota: dht::PutQuota::default(),
+            provider_quota: dht::PutQuota::default(),
+            relayed_conns: HashMap::new(),
+            relayed_ping_failures: HashMap::new(),
+            responses_writing: HashMap::new(),
+            startup_dials: Vec::new(),
+            startup_dials_until: None,
+            relay_v6_quic_conns: HashMap::new(),
+            relay_v6_quic_dialled: HashMap::new(),
+            punch_window: (std::time::Instant::now(), 0),
             relay_hints_given: std::collections::HashSet::new(),
             // #42: set to the shared handle in run_event_loop; a real interface
             // change or watchdog rebuild bumps it.
@@ -1079,21 +1398,33 @@ pub async fn run_event_loop(
         }
     }
 
-    // Kick off Kademlia bootstrap (populate routing table from bootstrap peers).
-    if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
-        warn!("kademlia bootstrap failed (no peers yet?): {e}");
-    }
+    // The Kademlia bootstrap (populate the routing table from the bootstrap peers) starts once the
+    // startup dials below are out (P2): it dials the bootstraps itself when they aren't connected or
+    // being dialled yet, and its dials, made before the listen addresses come up, would leave from
+    // ephemeral ports (2026-10-29 retest: 3 of 4 bootstraps saw such a second connection).
 
     // Explicitly dial every bootstrap peer to force a direct connection.
     // kademlia.add_address() only populates the routing table — it does
     // NOT guarantee a connection.  Without an explicit dial the swarm
     // may never establish a direct QUIC link and will fall back to relay.
+    // P2: TCP dials wait for a TCP listen address to dial from (see `startup_dials_ready`).
     for (peer_id, addr) in &bootstrap_peers {
+        // (Not a v6 one on a host without working IPv6: it fails at once anyway, and waiting for a v6
+        // listen address that never comes would hold up the Kademlia bootstrap.)
+        if matches!(dial_transport(addr), Some((v6, _, false)) if state.ipv6_capable || v6 != Some(true)) {
+            state.startup_dials.push((*peer_id, addr.clone()));
+            continue;
+        }
         let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
         info!(%peer_id, %dial_addr, "bootstrap_dial: explicitly dialing bootstrap peer");
         if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, dial_addr.clone()) {
             warn!(%peer_id, %dial_addr, %e, "bootstrap_dial: failed");
         }
+    }
+    if state.startup_dials.is_empty() {
+        start_kad_bootstrap(&mut swarm);
+    } else {
+        state.startup_dials_until = Some(tokio::time::Instant::now() + STARTUP_DIAL_WAIT);
     }
 
     // R-DHT-6: warm-start the routing table from the persisted cache so a fresh
@@ -1185,6 +1516,11 @@ pub async fn run_event_loop(
     let mut relay_retry_ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     relay_retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Discover waiters: retry deadlines (RETRY_SETTLE) and records gossip brought to a running
+    // lookup. Does nothing when no caller is waiting.
+    let mut discover_ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    discover_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // #42: network-change heal ticker — drives the connectivity watchdog
     // (rebuild after sustained loss of all peers, i.e. wake/roam) and fires any
     // debounced reactive rebootstrap. 5 s is snappy enough to recover a roam
@@ -1230,6 +1566,23 @@ pub async fn run_event_loop(
                 );
             }
         }
+        // P2: startup bootstrap dials that found no TCP listen address to dial from in time go out
+        // from a new port, which identify then reports with our listen port.
+        if state.startup_dials_until.is_some_and(|t| tokio::time::Instant::now() >= t) {
+            state.startup_dials_until = None;
+            for (peer_id, addr) in std::mem::take(&mut state.startup_dials) {
+                info!(%peer_id, %addr, "bootstrap_dial: no TCP listen address yet, dialing from a new port");
+                let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                    .addresses(vec![addr.clone()])
+                    .condition(libp2p::swarm::dial_opts::PeerCondition::Always)
+                    .allocate_new_port()
+                    .build();
+                if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, opts) {
+                    warn!(%peer_id, %addr, %e, "bootstrap_dial: failed");
+                }
+            }
+            start_kad_bootstrap(&mut swarm);
+        }
         // Delayed relay reservation: wait for Kademlia to connect to
         // bootstrap peers, then request relay reservations via listen_on.
         if relay_reservation_pending && tokio::time::Instant::now() >= relay_reservation_deadline {
@@ -1245,33 +1598,7 @@ pub async fn run_event_loop(
             // reservation and is unreachable via relay. Reserve ONCE per relay
             // (first address wins; v4 is listed first and is universally
             // reachable — and the only option for v6-less peers like cloud T4s).
-            let mut seen_relays = std::collections::HashSet::new();
-            for relay_multiaddr in state.relays.clone() {
-                {
-                    let relay_peer = relay_multiaddr.iter().find_map(|p| match p {
-                        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
-                        _ => None,
-                    });
-                    if let Some(pid) = relay_peer {
-                        if !seen_relays.insert(pid) {
-                            continue; // already reserving on this relay peer
-                        }
-                    }
-                    let listen_addr = relay_multiaddr
-                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                    match swarm.listen_on(listen_addr.clone()) {
-                        Ok(_) => {
-                            info!(addr = %listen_addr, "listening via relay (reservation requested)");
-                        }
-                        Err(e) => {
-                            warn!(addr = %listen_addr, error = %e, "relay listen failed");
-                            // F-5: don't strand a relay whose initial reservation
-                            // listen_on errored — schedule a backed-off retry.
-                            schedule_reservation_retry(&mut state, &listen_addr.to_string());
-                        }
-                    }
-                }
-            }
+            reserve_on_relays(&mut swarm, &mut state, "startup");
         }
 
         tokio::select! {
@@ -1288,9 +1615,16 @@ pub async fn run_event_loop(
                         handle_discover(&mut swarm, &model_id, reply, &mut state);
                     }
                     Some(SwarmCommand::InvalidateDiscover { model_id, reply }) => {
-                        // C11 bypass: forget this model's cached discovery so the next Discover
-                        // re-queries get_providers instead of early-replying from a stale seed.
+                        // C11 bypass: forget this model's cached discovery, and make the next
+                        // Discover wait for get_providers instead of answering from the providers
+                        // already known (every one of them just failed for the caller).
                         state.discover_cache.remove(&model_id);
+                        state.discover_seq += 1;
+                        // Bounded against junk model ids: when full, a new model just isn't flagged
+                        // (its retry answers from known providers) rather than evicting others' flags.
+                        if state.discover_wait_for_lookup.len() < 4096 || state.discover_wait_for_lookup.contains_key(&model_id) {
+                            state.discover_wait_for_lookup.insert(model_id, state.discover_seq);
+                        }
                         let _ = reply.send(());
                     }
                     Some(SwarmCommand::QueryRegistry { model_id, reply }) => {
@@ -1360,7 +1694,19 @@ pub async fn run_event_loop(
                             .kbuckets()
                             .map(|b| b.num_entries())
                             .sum();
+                        let topic = libp2p::gossipsub::IdentTopic::new(crate::swarm::GOSSIPSUB_TOPIC).hash();
+                        let gossip = &swarm.behaviour().gossipsub;
+                        let gossip_topic_peers: Vec<String> = gossip
+                            .all_peers()
+                            .filter(|(_, topics)| topics.contains(&&topic))
+                            .map(|(p, _)| p.to_base58())
+                            .collect();
+                        let gossip_mesh_peers: Vec<String> = gossip.mesh_peers(&topic).map(|p| p.to_base58()).collect();
+                        let recently_withdrawn = recently_withdrawn(&mut state.withdrawn_models, &state.known_peers, std::time::Instant::now());
                         let snapshot = StatusSnapshot {
+                            gossip_topic_peers,
+                            gossip_mesh_peers,
+                            recently_withdrawn,
                             nat: state.nat_info.clone(),
                             autonat_private: state.autonat_private,
                             ipv6_capable: state.ipv6_capable,
@@ -1578,6 +1924,9 @@ pub async fn run_event_loop(
                         } else if let Some((channel, _, peer, rid)) = state.inbound_proxy_channels.remove(&request_id) {
                             match swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
                                 Ok(()) => {
+                                    if state.responses_writing.len() < MAX_PENDING_SENT {
+                                        state.responses_writing.insert(rid, (peer, std::time::Instant::now()));
+                                    }
                                     if let Some(f) = on_sent {
                                         let mine = state.pending_sent.values().filter(|(_, p, _)| *p == peer).count();
                                         if state.pending_sent.len() < MAX_PENDING_SENT && mine < MAX_PENDING_SENT_PER_PEER {
@@ -1660,6 +2009,9 @@ pub async fn run_event_loop(
                         };
                         let _ = reply.send(snapshot);
                     }
+                    Some(SwarmCommand::ServeAccepted { peer_id }) => {
+                        pursue_v6_holepunch_debounced(&mut swarm, &mut state, peer_id, "serve");
+                    }
                     Some(SwarmCommand::TriggerRepunch { peer_id }) => {
                         handle_trigger_repunch(&mut swarm, peer_id, &mut state);
                     }
@@ -1709,7 +2061,8 @@ pub async fn run_event_loop(
             _ = reaper_interval.tick() => {
                 let before = state.known_peers.len();
                 let now_ms = now_unix_ms();
-                state.known_peers.retain(|_openhydra_id, record| {
+                let received = &state.known_received;
+                state.known_peers.retain(|key, record| {
                     if record.libp2p_peer_id.is_empty() {
                         return true; // keep records without libp2p binding
                     }
@@ -1719,16 +2072,21 @@ pub async fn run_event_loop(
                         // is the R-DHT-1 audit fix: a PEX-learned provider we never
                         // connected to must survive on its TTL, or this reaper would
                         // evict it ~60 s after we learned it and break gossip
-                        // discovery for any re-announce interval > 60 s.
-                        Ok(pid) => {
-                            swarm.is_connected(&pid)
-                                || (record.updated_unix_ms != 0
-                                    && now_ms.saturating_sub(record.updated_unix_ms)
-                                        < KNOWN_PEER_TTL_MS)
-                        }
+                        // discovery for any re-announce interval > 60 s. Fresh = received in the
+                        // window (each re-announce renews it): the record's own time was 0 from
+                        // every node before 2026-10-29, so this arm never kept anything and a
+                        // consumer with no connection to a provider lost it a minute after
+                        // hearing of it (GPU test 2026-10-29), and a clock that's off mustn't
+                        // decide it either.
+                        Ok(pid) => keep_known_peer(swarm.is_connected(&pid), received.get(key).copied(), now_ms),
                         Err(_) => false, // unparseable peer_id = stale
                     }
                 });
+                let now_instant = std::time::Instant::now();
+                state.relay_dial_backoff.retain(|_, b| b.until > now_instant);
+                // Entries whose record went elsewhere (disconnect purge, departures, withdrawals).
+                let known = &state.known_peers;
+                state.known_received.retain(|k, _| known.contains_key(k));
                 let removed = before - state.known_peers.len();
                 if removed > 0 {
                     info!(removed, remaining = state.known_peers.len(), "known_peers reaper sweep");
@@ -1749,6 +2107,7 @@ pub async fn run_event_loop(
                 // closes it, so the remote peer fails fast instead of hanging.
                 let pc_before = state.inbound_proxy_channels.len();
                 state.inbound_proxy_channels.retain(|_, (_, t, _, _)| t.elapsed() < PROXY_CHANNEL_TTL);
+                state.responses_writing.retain(|_, (_, t)| t.elapsed() < RESPONSE_WRITING_TTL);
                 // Responses libp2p never reported on: told they didn't arrive (review round 4 S4-12).
                 let stale: Vec<_> =
                     state.pending_sent.iter().filter(|(_, (_, _, t))| t.elapsed() >= PROXY_CHANNEL_TTL).map(|(k, _)| *k).collect();
@@ -1792,7 +2151,7 @@ pub async fn run_event_loop(
                 for (cid, _, _) in &dup_due {
                     state.quic_dup_close_deadline.remove(cid);
                 }
-                let (close, stay) = quic_dups_due(&dup_due, &state.peer_connections);
+                let (close, stay) = quic_dups_due(&dup_due, &state.peer_connections, swarm.local_peer_id());
                 for cid in close {
                     debug!(?cid, "quic_dedup: closing inbound duplicate QUIC connection after grace");
                     let _ = swarm.close_connection(cid);
@@ -1926,9 +2285,14 @@ pub async fn run_event_loop(
             _ = relay_retry_ticker.tick() => {
                 drive_reservation_retries(&mut swarm, &mut state);
             }
+            _ = discover_ticker.tick() => {
+                drive_discover_waiters(&mut state);
+                drive_lan_announce(&mut swarm, &mut state);
+            }
             // #42: connectivity watchdog + debounced reactive rebootstrap.
             _ = heal_ticker.tick() => {
                 drive_heal(&mut swarm, &mut state);
+                drive_lan_dials(&mut swarm, &mut state);
             }
             // #43-W2: a PCP pinhole confirmed an inbound v6 addr — advertise it
             // as an external candidate so AutoNAT probes it and, if reachable,
@@ -1948,6 +2312,17 @@ pub async fn run_event_loop(
     }
 }
 
+/// Whether a one-time readiness step (`seen`) happens now for the first time with an announce
+/// already made before it; marks it seen either way.
+fn first_time(seen: &mut bool, announced: bool) -> bool {
+    !std::mem::replace(seen, true) && announced
+}
+
+/// Tell the provider to re-announce (it re-announces when the generation advances).
+fn bump_net_generation(state: &LoopState) {
+    state.net_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Handle an announce command: sign the peer record, PUT it into Kademlia,
 /// and register as a provider for the model (Tasks 2.1, 6.2).
 fn handle_announce(
@@ -1957,6 +2332,13 @@ fn handle_announce(
     state: &mut LoopState,
     keypair: &libp2p::identity::Keypair,
 ) {
+    state.announced = true;
+    // Signed with the time it was made, so a newer announce replaces an older one everywhere and a
+    // replayed old one is refused (GPU test 2026-10-29: nothing set this, so every record was dated
+    // 1970 and the hour-old limit refused them all).
+    let mut record = record.clone();
+    record.updated_unix_ms = now_unix_ms();
+    let record = &record;
     // Task 6.2: sign the record with our Ed25519 keypair.
     let signed_record = match dht::sign_peer_record(record, keypair) {
         Ok(r) => r,
@@ -2089,14 +2471,14 @@ fn handle_provider_pex(
     state: &mut LoopState,
     parsed: &serde_json::Value,
     source: Option<PeerId>,
-) {
+) -> bool {
     // The verified gossip author. Strict signing guarantees this is present for
     // accepted messages, but guard anyway — no author means no trust anchor.
     let source_str = match source {
         Some(pid) => pid.to_base58(),
         None => {
             debug!("provider_pex: dropping advert with no signed author");
-            return;
+            return false;
         }
     };
     let record: PeerRecord = match parsed.get("record") {
@@ -2104,21 +2486,21 @@ fn handle_provider_pex(
             Ok(r) => r,
             Err(e) => {
                 debug!(%e, "provider_pex: malformed record in advert");
-                return;
+                return false;
             }
         },
         None => {
             debug!("provider_pex: advert missing record field");
-            return;
+            return false;
         }
     };
     if let Err(e) = dht::pex_record_is_authentic(&record, &source_str) {
         warn!(%source_str, %e, "provider_pex: rejected advert (failed authenticity)");
-        return;
+        return false;
     }
     let Some(is_new) = install_known_peer(state, &record, now_unix_ms()) else {
-        debug!(%source_str, "provider_pex: rejected advert dated in the future");
-        return;
+        debug!(%source_str, "provider_pex: rejected advert (dated ahead, over an hour old, or older than the one held)");
+        return false;
     };
     if is_new {
         info!(
@@ -2130,6 +2512,7 @@ fn handle_provider_pex(
     } else {
         debug!(peer_id = %record.peer_id, "provider_pex: refreshed cached provider");
     }
+    true
 }
 
 /// M6/F1: is a `MODEL_WITHDRAWN` timestamp (unix seconds) close enough to `now_secs` to honour?
@@ -2157,6 +2540,69 @@ fn evict_withdrawn_model(
 
 /// How long a withdrawn model is remembered (as long as the gateway's sticky model list keeps one).
 pub const WITHDRAWN_MODEL_MEMORY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Count one bootstrap's `PROVIDER_GONE` for `provider`, sent at `report_ms` (its signed time);
+/// `Some((last_record_ms, first_report_ms))` once `quorum` distinct bootstraps have reported it (the
+/// reports are then forgotten). The first report's own time, not when it arrived, is the cutoff for
+/// undated records: a replayed report (any peer can re-send one within its freshness window) then
+/// can't evict what the provider announced after it (review 2026-10-30). Pure.
+fn note_provider_gone(
+    pending: &mut HashMap<PeerId, (Vec<PeerId>, u64, u64)>,
+    provider: PeerId,
+    reporter: PeerId,
+    last_record_ms: u64,
+    quorum: usize,
+    now_ms: u64,
+    report_ms: u64,
+) -> Option<(u64, u64)> {
+    pending.retain(|_, (_, _, at)| now_ms.saturating_sub(*at) <= PROVIDER_GONE_MAX_AGE_SECS * 1000);
+    if !pending.contains_key(&provider) && pending.len() >= MAX_PROVIDER_GONE_PENDING {
+        if let Some(oldest) = pending.iter().min_by_key(|(_, (_, _, at))| *at).map(|(p, _)| *p) {
+            pending.remove(&oldest);
+        }
+    }
+    let report_ms = report_ms.min(now_ms);
+    let entry = pending.entry(provider).or_insert_with(|| (Vec::new(), 0, report_ms));
+    entry.2 = entry.2.min(report_ms);
+    if !entry.0.contains(&reporter) {
+        entry.0.push(reporter);
+    }
+    entry.1 = entry.1.max(last_record_ms);
+    if entry.0.len() >= quorum.max(1) {
+        let (_, last, first) = pending.remove(&provider)?;
+        return Some((last, first));
+    }
+    None
+}
+
+/// Drop `provider`'s cached records that a quorum of bootstraps reported gone: those no newer than
+/// the newest record the bootstraps held (`last_record_ms`), and undated ones not received since
+/// the first report (`first_at_ms`) — a provider that is in fact alive has announced since, and its
+/// newer record stays. Returns the models dropped. Pure.
+fn evict_gone_provider(
+    known: &mut HashMap<String, PeerRecord>,
+    received: &HashMap<String, u64>,
+    provider: &str,
+    last_record_ms: u64,
+    first_at_ms: u64,
+) -> Vec<String> {
+    let mut models = Vec::new();
+    known.retain(|key, r| {
+        let gone = r.libp2p_peer_id == provider
+            && if r.updated_unix_ms == 0 {
+                received.get(key).map_or(true, |at| *at <= first_at_ms)
+            } else {
+                r.updated_unix_ms <= last_record_ms
+            };
+        if gone {
+            models.push(r.model_id.clone());
+        }
+        !gone
+    });
+    models.sort();
+    models.dedup();
+    models
+}
 
 /// At most this many models remembered as withdrawn, and (model, provider) announcements remembered
 /// for it (review 2026-10-14, L7: the map only shrank when a gateway listed its models).
@@ -2233,6 +2679,25 @@ fn discover_cache_fresh(
     matches!(cache.get(model), Some(&(at_ms, at_gen)) if at_gen == cur_gen && now_ms.saturating_sub(at_ms) < ttl_ms)
 }
 
+/// How [`handle_discover`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverMode {
+    /// A recent lookup is cached: answer from the known providers, no new lookup.
+    CacheHit,
+    /// Answer from the known providers now and run a lookup in the background.
+    AnswerThenRefresh,
+    /// Nothing known, or the caller just found every known provider failing: wait for the lookup.
+    WaitForLookup,
+}
+
+fn discover_mode(providers_known: bool, cache_fresh: bool, wait_for_lookup: bool) -> DiscoverMode {
+    match (providers_known, wait_for_lookup, cache_fresh) {
+        (false, _, _) | (true, true, _) => DiscoverMode::WaitForLookup,
+        (true, false, true) => DiscoverMode::CacheHit,
+        (true, false, false) => DiscoverMode::AnswerThenRefresh,
+    }
+}
+
 /// C11: drop discover-cache entries past `ttl_ms` or from a superseded net-generation, so the
 /// map stays bounded to models discovered in the last TTL under the current generation — it
 /// can't grow unbounded across distinct (client-supplied) model_ids, nor accumulate dead
@@ -2285,28 +2750,65 @@ fn handle_discover(
     // is bounded by the TTL and covered by the consumer's failover + the known_peers reaper.
     let now_ms = now_unix_ms();
     let cur_gen = state.net_generation.load(std::sync::atomic::Ordering::Relaxed);
-    if !seed.is_empty()
-        && discover_cache_fresh(&state.discover_cache, model_id, now_ms, cur_gen, DISCOVER_CACHE_TTL_MS)
-    {
+    let mode = discover_mode(
+        !seed.is_empty(),
+        discover_cache_fresh(&state.discover_cache, model_id, now_ms, cur_gen, DISCOVER_CACHE_TTL_MS),
+        state.discover_wait_for_lookup.contains_key(model_id),
+    );
+    if mode == DiscoverMode::CacheHit {
         let peers = discovered_from_records(state, &seed);
         debug!(model_id, n = peers.len(), "discover: C11 cache hit — skipped get_providers");
         let _ = reply.send(Ok(peers));
         return;
     }
-    if !seed.is_empty() {
-        debug!(model_id, seeded = seed.len(), "discover: pre-seeded from PEX/DHT cache");
-    }
+    // Providers already known (gossip, an earlier lookup): answer with them now and refresh in the
+    // background. Waiting for get_providers here held the request until the query's first result,
+    // up to its 10 s timeout when the DHT held no provider record, though the answer was in hand
+    // (2026-10-27). A stale entry is covered by the consumer's failover, as for a cache hit.
+    let running = state.pending_discovers.iter().find(|(_, p)| p.model_id == model_id).map(|(id, _)| *id);
+    let waiter = if mode == DiscoverMode::AnswerThenRefresh {
+        let peers = discovered_from_records(state, &seed);
+        debug!(model_id, n = peers.len(), "discover: answered from known providers, refreshing in the background");
+        let _ = reply.send(Ok(peers));
+        if running.is_some() {
+            return; // a lookup for this model is already running
+        }
+        None
+    } else {
+        let kind = if seed.is_empty() { DiscoverKind::Reply } else { DiscoverKind::Retry };
+        let deadline = (kind == DiscoverKind::Retry).then(|| std::time::Instant::now() + RETRY_SETTLE);
+        Some(DiscoverWaiter { reply, kind, info_at_join: 0, deadline })
+    };
+
+    // One lookup per model: join the one running (review 2026-10-29).
+    let waiter = match (running, waiter) {
+        (Some(id), Some(mut waiter)) => {
+            let pending = state.pending_discovers.get_mut(&id).expect("present");
+            for record in seed {
+                pending.merge(record, now_ms);
+            }
+            waiter.info_at_join = pending.info_gen;
+            debug!(model_id, "discover: joined the lookup already running");
+            pending.waiters.push(waiter);
+            maybe_reply_discover(state, id);
+            return;
+        }
+        (_, waiter) => waiter,
+    };
 
     let key = dht::model_provider_key(model_id);
     let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
+    state.discover_seq += 1;
     state.pending_discovers.insert(
         query_id,
         PendingDiscover {
             model_id: model_id.to_string(),
             records: seed,
-            reply,
             providers_done: false,
             outstanding: 0,
+            info_gen: 0,
+            waiters: waiter.into_iter().collect(),
+            seq: state.discover_seq,
         },
     );
 }
@@ -2344,28 +2846,60 @@ fn handle_resolve(
 /// vs v0.3.13, which only evicted after a 5-dial retry ladder). `known_peers` has its own liveness
 /// reaper (retain-if-connected-or-fresh, `KNOWN_PEER_TTL_MS`) kept warm by PEX, so a genuinely
 /// departed peer still ages out within the TTL while a transiently-unreachable one survives.
-fn evict_unreachable_peer(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, pid: PeerId) {
+///
+/// The address book (addresses kept for our own reconnects) loses only `failed`, the addresses a dial
+/// just tried and couldn't reach: a ping failure, Kademlia finding no route, or a single-address dial
+/// (a hole-punch, a reversal) failing says nothing about the peer's other addresses, which are what a
+/// reconnect after a drop needs (review 2026-10-29: they were all wiped).
+fn evict_unreachable_peer(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, pid: PeerId, failed: &[Multiaddr]) {
     if swarm.is_connected(&pid) {
         return;
     }
     swarm.behaviour_mut().kademlia.remove_peer(&pid);
+    for addr in failed {
+        swarm.behaviour_mut().address_book.remove(&pid, addr);
+    }
     debug!(%pid, "removed unreachable peer from the routing table (known_peers left to the TTL reaper)");
+}
+
+/// The addresses a failed dial tried, as libp2p reports them (only transport failures name them).
+fn dial_error_addrs(error: &libp2p::swarm::DialError) -> Vec<Multiaddr> {
+    match error {
+        libp2p::swarm::DialError::Transport(errs) => errs.iter().map(|(a, _)| a.clone()).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// F-5: backoff schedule (in ms) for relay-RESERVATION retries.
 ///
 /// ``attempt`` is 1-based (the attempt number we just made / are scheduling
 /// the wait after). Fast initial retries then exponential backoff, capped at
-/// 120 s: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 120s, 120s, … So a flapping or
-/// down relay neither tight-loops the event loop nor strands us permanently —
-/// we keep probing roughly every 2 minutes once backed off, and recover within
-/// a couple seconds of a brief blip. Pure + unit-tested.
+/// 120 s: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 120s × 5, then every 10 minutes from the 13th
+/// attempt. So a flapping or down relay neither tight-loops the event loop nor strands us
+/// permanently — we keep probing, every 2 minutes for a while, then every 10, and recover
+/// within a couple seconds of a brief blip. Pure + unit-tested.
 fn reservation_retry_delay_ms(attempt: u32) -> u64 {
+    // A relay that has refused us this often (about 13 minutes of retries) may never take us — a
+    // private bootstrap that doesn't run a relay, or one at its limit: try it every 10 minutes from
+    // then on, which still finds it once it's back.
+    if attempt > RESERVATION_RETRIES_BEFORE_SLOW {
+        return 600_000;
+    }
     // Cap the shift so ``1 << shift`` can't overflow and the value saturates
     // at the 120 s ceiling well before then.
     let shift = attempt.saturating_sub(1).min(7);
     let ms = 1000u64.saturating_mul(1u64 << shift);
     ms.min(120_000)
+}
+
+/// Reservation retries on one relay after which they slow to every 10 minutes and are logged once
+/// an hour (see [`reservation_retry_delay_ms`]).
+const RESERVATION_RETRIES_BEFORE_SLOW: u32 = 12;
+
+/// Whether retry `attempt` is worth a warning: the first [`RESERVATION_RETRIES_BEFORE_SLOW`], then
+/// one an hour.
+fn reservation_retry_loud(attempt: u32) -> bool {
+    attempt <= RESERVATION_RETRIES_BEFORE_SLOW || attempt % 6 == 0
 }
 
 /// F-5: record that a relay reservation for ``circuit_addr`` is lost and
@@ -2389,25 +2923,176 @@ fn private_relay_hint(relays: &[Multiaddr], circuit: &Multiaddr, reason: &str) -
     ))
 }
 
-fn schedule_reservation_retry(state: &mut LoopState, circuit_addr: &str) {
+/// The relay a circuit address goes through: the peer id just before `/p2p-circuit`.
+fn circuit_relay(addr: &Multiaddr) -> Option<PeerId> {
+    let mut last = None;
+    for p in addr.iter() {
+        match p {
+            libp2p::multiaddr::Protocol::P2p(id) => last = Some(id),
+            libp2p::multiaddr::Protocol::P2pCircuit => return last,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The circuit to reserve on `relay` at: its first address in `relays` (the one startup uses;
+/// v4 is listed first and is universally reachable), else `seen` cut at `/p2p-circuit`.
+fn reservation_circuit(relays: &[Multiaddr], relay: PeerId, seen: Option<&Multiaddr>) -> Option<Multiaddr> {
+    let circuit = libp2p::multiaddr::Protocol::P2pCircuit;
+    relays
+        .iter()
+        .find(|a| a.iter().any(|p| p == libp2p::multiaddr::Protocol::P2p(relay)))
+        .map(|a| a.clone().with(circuit.clone()))
+        .or_else(|| {
+            let seen = seen?;
+            let mut out = Multiaddr::empty();
+            for p in seen.iter() {
+                let done = p == circuit;
+                out.push(p);
+                if done {
+                    return Some(out);
+                }
+            }
+            None
+        })
+}
+
+fn relay_has_listener(state: &LoopState, relay: PeerId) -> bool {
+    state.relay_listeners.values().any(|r| *r == relay)
+}
+
+/// Ask `relay` for a reservation at `circuit`, unless one of our listeners already holds or is
+/// requesting one there: a second would make libp2p close one of them (the F6 hazard). Returns
+/// whether a request went out.
+fn request_reservation(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    relay: PeerId,
+    circuit: Multiaddr,
+    why: &'static str,
+) -> bool {
+    if relay_has_listener(state, relay) {
+        return false;
+    }
+    match swarm.listen_on(circuit.clone()) {
+        Ok(id) => {
+            state.relay_listeners.insert(id, relay);
+            info!(addr = %circuit, why, "listening via relay (reservation requested)");
+            true
+        }
+        Err(e) => {
+            warn!(addr = %circuit, error = %e, why, "relay listen failed");
+            schedule_reservation_retry(state, relay, circuit);
+            false
+        }
+    }
+}
+
+/// The relays to reserve on now and the circuit for each: every relay in `state.relays` with no
+/// listener of ours on it, once, at its first listed address.
+fn relays_to_reserve(state: &LoopState) -> Vec<(PeerId, Multiaddr)> {
+    let mut out: Vec<(PeerId, Multiaddr)> = Vec::new();
+    let allowed = test_reserve_relays(state);
+    for relay_multiaddr in &state.relays {
+        let Some(relay) = relay_multiaddr.iter().find_map(|p| match p {
+            libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if relay_has_listener(state, relay) || out.iter().any(|(r, _)| *r == relay) {
+            continue;
+        }
+        if allowed.as_ref().is_some_and(|a| !a.contains(&relay)) {
+            continue;
+        }
+        out.push((relay, relay_multiaddr.clone().with(libp2p::multiaddr::Protocol::P2pCircuit)));
+    }
+    out
+}
+
+/// Bootstrap load simulation (plan E9, "policy B"): `OPENHYDRA_TEST_RESERVE_RELAYS=K` reserves on
+/// only K of our relays (0 = none), picked by hashing our peer id with each relay's, so peers spread
+/// evenly across relays. `None` (unset) = every relay, as today.
+fn test_reserve_relays(state: &LoopState) -> Option<Vec<PeerId>> {
+    use std::hash::{Hash, Hasher};
+    let k: usize = std::env::var("OPENHYDRA_TEST_RESERVE_RELAYS").ok()?.parse().ok()?;
+    let mut relays = crate::relay::relay_peer_ids(&state.relays);
+    relays.sort_by_key(|r| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (state.local_libp2p.as_str(), r.to_bytes()).hash(&mut h);
+        h.finish()
+    });
+    relays.dedup();
+    relays.truncate(k);
+    Some(relays)
+}
+
+/// Reserve once on every relay in `state.relays` that we don't hold or request a reservation on.
+fn reserve_on_relays(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    why: &'static str,
+) {
+    for (relay, circuit) in relays_to_reserve(state) {
+        request_reservation(swarm, state, relay, circuit, why);
+    }
+}
+
+fn schedule_reservation_retry(state: &mut LoopState, relay: PeerId, circuit: Multiaddr) {
     let now = tokio::time::Instant::now();
     let entry = state
         .relay_reservation_retries
-        .entry(circuit_addr.to_string())
-        .or_insert((0, now));
+        .entry(relay)
+        .or_insert((0, now, circuit));
     entry.0 = entry.0.saturating_add(1);
     let delay = reservation_retry_delay_ms(entry.0);
     entry.1 = now + std::time::Duration::from_millis(delay);
-    warn!(
-        circuit = %circuit_addr, attempt = entry.0, backoff_ms = delay,
-        "relay reservation lost — retry scheduled with backoff (F-5)",
-    );
+    if reservation_retry_loud(entry.0) {
+        warn!(
+            circuit = %entry.2, attempt = entry.0, backoff_ms = delay,
+            "relay reservation lost — retry scheduled with backoff (F-5)",
+        );
+    } else {
+        debug!(circuit = %entry.2, attempt = entry.0, backoff_ms = delay, "relay reservation retry scheduled (F-5)");
+    }
+}
+
+/// A circuit listener closed: which relays now need a reservation (the ones it was on, if no other
+/// listener of ours is on them), with the circuit to reserve at. A listener that closes before
+/// reporting an address (a refused or duplicate request) is known by its id.
+fn relays_to_re_reserve(
+    state: &mut LoopState,
+    listener: libp2p::core::transport::ListenerId,
+    addresses: &[Multiaddr],
+) -> Vec<(PeerId, Multiaddr)> {
+    let mut relays: Vec<(PeerId, Option<Multiaddr>)> = Vec::new();
+    if let Some(relay) = state.relay_listeners.remove(&listener) {
+        relays.push((relay, None));
+    }
+    for addr in addresses {
+        if let Some(relay) = circuit_relay(addr) {
+            match relays.iter_mut().find(|(r, _)| *r == relay) {
+                Some((_, seen)) => {
+                    seen.get_or_insert_with(|| addr.clone());
+                }
+                None => relays.push((relay, Some(addr.clone()))),
+            }
+        }
+    }
+    relays
+        .into_iter()
+        .filter(|(relay, _)| !relay_has_listener(state, *relay))
+        .filter_map(|(relay, seen)| Some((relay, reservation_circuit(&state.relays, relay, seen.as_ref())?)))
+        .collect()
 }
 
 /// F-5: re-issue any due relay-reservation ``listen_on`` requests. Driven by
-/// the existing `relay_retry_ticker` (250 ms). A circuit is retried only once
+/// the existing `relay_retry_ticker` (250 ms). A relay is retried only once
 /// its scheduled deadline passes, so repeated failure events coalesce into a
-/// single spaced attempt instead of a tight loop.
+/// single spaced attempt instead of a tight loop; and not while a listener of
+/// ours is still on it.
 fn drive_reservation_retries(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
@@ -2416,39 +3101,212 @@ fn drive_reservation_retries(
         return;
     }
     let now = tokio::time::Instant::now();
-    // Collect due addrs first to avoid holding a borrow on `state` while we
-    // mutate the swarm and re-schedule.
-    let due: Vec<String> = state
-        .relay_reservation_retries
-        .iter()
-        .filter(|(_, (_, next))| now >= *next)
-        .map(|(addr, _)| addr.clone())
-        .collect();
-    for addr_str in due {
-        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-            match swarm.listen_on(addr.clone()) {
-                Ok(_) => info!(circuit = %addr_str, "relay re-reservation requested (F-5 retry)"),
-                Err(e) => warn!(circuit = %addr_str, %e, "relay re-reservation listen_on failed; will retry"),
+    for (relay, circuit) in due_reservation_retries(state, now) {
+        if request_reservation(swarm, state, relay, circuit, "F-5 retry") {
+            // Wait for the outcome: success clears the entry, a failure closes the listener,
+            // which schedules the next (longer) wait. Until then nothing is due.
+            if let Some(entry) = state.relay_reservation_retries.get_mut(&relay) {
+                entry.1 = now + std::time::Duration::from_millis(reservation_retry_delay_ms(entry.0));
             }
-        } else {
-            warn!(circuit = %addr_str, "relay re-reservation skipped: unparseable circuit addr");
         }
-        // Push the next attempt out per the backoff schedule. Cleared entirely
-        // on success (NewListenAddr / ReservationReqAccepted for this circuit).
-        schedule_reservation_retry(state, &addr_str);
     }
 }
 
-/// F-5: a reservation succeeded for ``addr`` — clear any pending retry so we
-/// stop probing. Matches on the circuit substring so a peer-id-suffixed listen
-/// addr still clears the base circuit retry entry.
-fn clear_reservation_retry(state: &mut LoopState, addr: &str) {
-    if state.relay_reservation_retries.is_empty() {
-        return;
+/// Failed pings, as libp2p reports them, after which a connection to one of our relays counts as
+/// dead. libp2p keeps the first failure on a connection silent (libp2p-ping handler.rs), so 2
+/// reported means 3 failed pings in a row: with 15 s pings and a 20 s timeout, about a minute.
+const RELAY_PING_FAILURES_BEFORE_CLOSE: u32 = 2;
+
+/// One of our direct connections to a relay.
+#[derive(Debug, Clone)]
+struct RelayConn {
+    since: std::time::Instant,
+    /// The IP the relay sees us at on it (identify's observed address), and whether that was one of
+    /// our own interface addresses at the time (no NAT in between).
+    seen_as: Option<(std::net::IpAddr, bool)>,
+}
+
+/// The IPs of our listen addresses (our interface addresses).
+fn our_listen_ips(swarm: &libp2p::Swarm<OpenHydraBehaviour>) -> std::collections::HashSet<std::net::IpAddr> {
+    swarm.listeners().filter_map(multiaddr_ip).collect()
+}
+
+/// Whether relay connection `connection` runs over a network this node has left: the relay saw us
+/// at one of our own addresses and it isn't ours any more (no NAT: IPv6, or a public IPv4 on the
+/// interface), or a newer relay connection sees us from another IPv4 /16 (behind NAT, the public
+/// address changed). A container bridge going down, or an IPv6 temporary address the connection
+/// doesn't use expiring, changes neither, so it never counts (review 2026-10-29).
+fn relay_conn_on_old_network(
+    conns: &HashMap<libp2p::swarm::ConnectionId, RelayConn>,
+    connection: libp2p::swarm::ConnectionId,
+    ours: &std::collections::HashSet<std::net::IpAddr>,
+) -> bool {
+    let Some(RelayConn { since, seen_as: Some((seen, was_ours)) }) = conns.get(&connection) else {
+        return false;
+    };
+    if *was_ours && !ours.contains(seen) {
+        return true;
     }
+    let std::net::IpAddr::V4(seen) = seen else { return false };
+    let slash16 = |ip: &std::net::Ipv4Addr| (ip.octets()[0], ip.octets()[1]);
+    conns.values().any(|c| {
+        c.since > *since
+            && matches!(c.seen_as, Some((std::net::IpAddr::V4(other), _)) if slash16(&other) != slash16(seen))
+    })
+}
+
+/// Count a failed ping on `connection`; true when it should be closed: a direct connection to one of
+/// our relays that has failed [`RELAY_PING_FAILURES_BEFORE_CLOSE`] reported pings in a row (a success
+/// resets the count) and runs over a network we've left ([`relay_conn_on_old_network`]). After a
+/// network change the relay connections made on the old network can sit for many minutes with every
+/// ping failing, holding the reservations' listeners open, so no new reservation is made and nothing
+/// reaches us through the relay. Failed pings alone don't close a connection: a slow uplink carrying a
+/// big relayed result can make pings fail on a connection that still works, and closing it would kill
+/// every circuit through the relay. A peer that doesn't speak ping says nothing.
+fn relay_connection_dead(
+    state: &mut LoopState,
+    peer: PeerId,
+    connection: libp2p::swarm::ConnectionId,
+    failure: &libp2p::ping::Failure,
+    ours: &std::collections::HashSet<std::net::IpAddr>,
+) -> bool {
+    if matches!(failure, libp2p::ping::Failure::Unsupported)
+        || !crate::relay::relay_peer_ids(&state.relays).contains(&peer)
+    {
+        return false;
+    }
+    let n = state.relay_ping_failures.entry(connection).or_insert(0);
+    *n += 1;
+    if *n < RELAY_PING_FAILURES_BEFORE_CLOSE {
+        return false;
+    }
+    let old = relay_conn_on_old_network(&state.relay_conns, connection, ours);
+    if old {
+        state.relay_ping_failures.remove(&connection);
+    }
+    old
+}
+
+/// How long a response being written counts as under way when libp2p never reports on it: longer
+/// than any write (a big result over a slow uplink), so a busy connection isn't taken for idle.
+const RESPONSE_WRITING_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Whether anything is under way with `peer`: a request of ours waiting for its answer
+/// (`pending_outbound` asks libp2p about one of our request ids), a request of its waiting for ours,
+/// a response still being written to it, or a forward queued for it.
+fn peer_busy(state: &LoopState, peer: PeerId, pending_outbound: impl Fn(&request_response::OutboundRequestId) -> bool) -> bool {
+    state.inbound_proxy_channels.values().any(|(_, _, p, _)| *p == peer)
+        || state.responses_writing.values().any(|(p, _)| *p == peer)
+        || state.pending_relay_forwards.iter().any(|(p, ..)| *p == peer)
+        || state.pending_proxy.keys().any(|id| pending_outbound(id))
+}
+
+/// Count a failed ping on `connection`; true when it should be closed: a relayed connection that
+/// has failed [`RELAY_PING_FAILURES_BEFORE_CLOSE`] reported pings in a row while nothing is under
+/// way with its peer (`busy`, see [`peer_busy`]). When a provider moves to another network, the
+/// circuit a consumer had to it ends on the relay's connection to the provider's old network,
+/// which nothing closes for minutes; the consumer's next request rode it and timed out, and it was
+/// replaced only ~2 min later (2026-10-29). A connection carrying a transfer can fail pings and
+/// still work (pings queue behind the data), so a busy one is left to the request's own timeout;
+/// closing an idle one costs nothing, the next request dials a fresh circuit. Connections to our
+/// relays have their own rule ([`relay_connection_dead`]); a peer without ping says nothing.
+fn relayed_connection_dead(
+    state: &mut LoopState,
+    peer: PeerId,
+    connection: libp2p::swarm::ConnectionId,
+    failure: &libp2p::ping::Failure,
+    busy: bool,
+) -> bool {
+    if matches!(failure, libp2p::ping::Failure::Unsupported) || state.relayed_conns.get(&connection) != Some(&peer) {
+        return false;
+    }
+    let n = state.relayed_ping_failures.entry(connection).or_insert(0);
+    *n += 1;
+    if *n < RELAY_PING_FAILURES_BEFORE_CLOSE || busy {
+        return false;
+    }
+    state.relayed_ping_failures.remove(&connection);
+    true
+}
+
+/// The relays whose retry is due at `now` and has no listener of ours on it yet.
+fn due_reservation_retries(state: &LoopState, now: tokio::time::Instant) -> Vec<(PeerId, Multiaddr)> {
     state
         .relay_reservation_retries
-        .retain(|circuit, _| !addr.starts_with(circuit.as_str()) && !circuit.starts_with(addr));
+        .iter()
+        .filter(|(relay, (_, next, _))| now >= *next && !relay_has_listener(state, **relay))
+        .map(|(relay, (_, _, circuit))| (*relay, circuit.clone()))
+        .collect()
+}
+
+/// F-5: a circuit through a relay came up — the reservation on that relay succeeded, so stop
+/// retrying it.
+fn clear_reservation_retry(state: &mut LoopState, addr: &Multiaddr) {
+    if let Some(relay) = circuit_relay(addr) {
+        state.relay_reservation_retries.remove(&relay);
+    }
+}
+
+/// P1: how long after dialling a relay over IPv6 QUIC we wait before trying again (a network that
+/// blocks UDP fails every time; a new reservation after a network change is the usual next try).
+const RELAY_V6_QUIC_REDIAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The relay's own IPv6 QUIC address in one of our circuit addresses:
+/// `/ip6/<global>/udp/<port>/quic-v1/p2p/<relay>/p2p-circuit…` gives `<relay>` and the part before
+/// `/p2p-circuit`. A reservation reports a circuit for each address the relay gives for itself.
+fn circuit_relay_v6_quic(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
+    use libp2p::multiaddr::Protocol;
+    let mut it = addr.iter();
+    let Protocol::Ip6(ip) = it.next()? else { return None };
+    if is_non_global_ip(std::net::IpAddr::V6(ip)) {
+        return None;
+    }
+    let Protocol::Udp(port) = it.next()? else { return None };
+    let Protocol::QuicV1 = it.next()? else { return None };
+    let Protocol::P2p(relay) = it.next()? else { return None };
+    let Protocol::P2pCircuit = it.next()? else { return None };
+    let out = Multiaddr::empty()
+        .with(Protocol::Ip6(ip))
+        .with(Protocol::Udp(port))
+        .with(Protocol::QuicV1)
+        .with(Protocol::P2p(relay));
+    Some((relay, out))
+}
+
+/// P1: the relay to dial over IPv6 QUIC, and where, now that our listener `listener` reported
+/// circuit address `circuit`. DCUtR offers only addresses peers have seen us at (identify), and a
+/// node's bootstrap and relay connections are TCP, so without an IPv6 QUIC connection to some peer
+/// its IPv6 QUIC address is never offered and hole punching over IPv6 — the way through CGNAT —
+/// never starts (diagnosis 2026-10-29: only nodes that happened to reach an inbound-reachable IPv6
+/// peer had one). Dialled after the reservation is held, so the reservation stays on the
+/// connection it was made on. Nothing when IPv6 doesn't work here, the listener isn't one of our
+/// reservations, we already have an IPv6 QUIC connection to that relay, or we tried recently.
+fn relay_v6_quic_dial(
+    state: &LoopState,
+    listener: libp2p::core::transport::ListenerId,
+    circuit: &Multiaddr,
+    now: std::time::Instant,
+) -> Option<(PeerId, Multiaddr)> {
+    if !state.ipv6_capable {
+        return None;
+    }
+    let (relay, addr) = circuit_relay_v6_quic(circuit)?;
+    if state.relay_listeners.get(&listener) != Some(&relay)
+        || state.relay_v6_quic_conns.values().any(|r| *r == relay)
+        || state.relay_v6_quic_dialled.get(&relay).is_some_and(|t| now.duration_since(*t) < RELAY_V6_QUIC_REDIAL)
+    {
+        return None;
+    }
+    Some((relay, addr))
+}
+
+/// Whether a direct connection's remote address is IPv6 QUIC.
+fn is_v6_quic(addr: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    let mut it = addr.iter();
+    matches!(it.next(), Some(Protocol::Ip6(_)))
+        && matches!(it.next(), Some(Protocol::Udp(_)))
+        && matches!(it.next(), Some(Protocol::QuicV1))
 }
 
 // ── #42: network-change resilience ────────────────────────────────────────
@@ -2525,6 +3383,107 @@ fn expire_direct_external_addrs(
     );
 }
 
+/// An address's transport as far as port reuse goes: its IP family (`None` for a DNS name that
+/// can resolve to either), whether that IP is loopback, and whether it's QUIC (else TCP).
+fn dial_transport(addr: &Multiaddr) -> Option<(Option<bool>, bool, bool)> {
+    use libp2p::multiaddr::Protocol;
+    let mut it = addr.iter();
+    let (v6, loopback) = match it.next()? {
+        Protocol::Ip4(ip) => (Some(false), ip.is_loopback()),
+        Protocol::Ip6(ip) => (Some(true), ip.is_loopback()),
+        Protocol::Dns4(_) => (Some(false), false),
+        Protocol::Dns6(_) => (Some(true), false),
+        Protocol::Dns(_) => (None, false),
+        _ => return None,
+    };
+    let quic = match it.next()? {
+        Protocol::Tcp(_) => false,
+        Protocol::Udp(_) => matches!(it.next(), Some(Protocol::QuicV1)),
+        _ => return None,
+    };
+    Some((v6, loopback, quic))
+}
+
+/// IPv4 ranges virtual interfaces use — Docker bridges (172.16.0.0/12), Tailscale and carrier NAT
+/// (100.64.0.0/10), libvirt (192.168.122.0/24), macOS virtualization (192.168.64.0/24) — and
+/// link-local: such an address coming or going says nothing about the network we're on.
+pub(crate) fn is_virtual_v4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_link_local()
+        || (o[0] == 172 && (16..32).contains(&o[1]))
+        || (o[0] == 100 && (64..128).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168 && (o[2] == 122 || o[2] == 64))
+}
+
+/// Whether losing listen address `gone` means we left the network it was on, given the listen
+/// addresses still up: an IPv4 address outside the virtual ranges when no other such IPv4 address
+/// is left, or a global IPv6 address when no other one in its /64 is left. An IPv6 temporary
+/// address rotating (its /64 stays) or a container bridge going down doesn't count (review
+/// 2026-10-29: both made a rebootstrap redial bootstraps still connected, from ephemeral ports).
+fn addr_loss_leaves_network(gone: &Multiaddr, remaining: &[Multiaddr]) -> bool {
+    use std::net::IpAddr;
+    let others = remaining.iter().filter_map(multiaddr_ip);
+    match multiaddr_ip(gone) {
+        Some(IpAddr::V4(ip)) if !ip.is_loopback() && !is_virtual_v4(ip) => {
+            !others.into_iter().any(|r| matches!(r, IpAddr::V4(r) if r != ip && !r.is_loopback() && !is_virtual_v4(r)))
+        }
+        Some(IpAddr::V6(ip)) if !is_non_global_ip(IpAddr::V6(ip)) => {
+            let net = |a: std::net::Ipv6Addr| a.segments()[..4].to_vec();
+            !others.into_iter().any(|r| matches!(r, IpAddr::V6(r) if r != ip && net(r) == net(ip)))
+        }
+        _ => false,
+    }
+}
+
+/// P2: the bootstraps a rebootstrap dials: those with no direct connection of ours on the same
+/// transport and IP family made since we last lost an interface address (an older one may run over
+/// a network we've left and be dead without knowing it yet). libp2p doesn't skip them (a dial from a bare address carries no peer
+/// condition), and a second TCP connection to the same bootstrap from our listen port can't share
+/// the first one's addresses and ports, so libp2p-tcp makes it from an ephemeral port instead
+/// (lib.rs, AddrNotAvailable), whose observed address DCUtR then offers to peers (diagnosis
+/// 2026-10-29).
+fn bootstrap_redials(state: &LoopState) -> Vec<(PeerId, Multiaddr)> {
+    state
+        .bootstrap_peers
+        .iter()
+        .filter(|(peer, addr)| {
+            let Some((v6, _, quic)) = dial_transport(addr) else { return true };
+            !state.conn_remote_addrs.values().any(|(p, remote, since)| {
+                p == peer
+                    && state.last_addr_loss.map_or(true, |lost| *since > lost)
+                    && dial_transport(remote).is_some_and(|(rv6, _, rquic)| rquic == quic && (v6.is_none() || rv6 == v6))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn start_kad_bootstrap(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>) {
+    if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+        warn!("kademlia bootstrap failed (no peers yet?): {e}");
+    }
+}
+
+/// P2: how long startup waits for a TCP listen address to dial the bootstraps from before dialling
+/// from a new port instead. The listen addresses usually come up within milliseconds.
+const STARTUP_DIAL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// P2: the startup bootstrap dials that can go now that TCP listen address `listen` is up: TCP
+/// dials to the same IP family (any family for a DNS name) and the same loopback-ness, which
+/// libp2p-tcp makes from `listen`'s port. libp2p-tcp starts reusing a wildcard listener's port
+/// only once it reports the address, so a TCP dial made before that leaves from an ephemeral port
+/// and the bootstraps see us there: DCUtR then offers peers that address, which nothing listens
+/// on (diagnosis 2026-10-29). QUIC dials bind the listen socket at once and never wait.
+/// Returns the dials that can go; `pending` keeps the rest.
+fn startup_dials_ready(pending: &mut Vec<(PeerId, Multiaddr)>, listen: &Multiaddr) -> Vec<(PeerId, Multiaddr)> {
+    let Some((Some(lv6), lloop, false)) = dial_transport(listen) else { return Vec::new() };
+    let (ready, rest): (Vec<_>, Vec<_>) = pending.drain(..).partition(|(_, addr)| {
+        matches!(dial_transport(addr), Some((v6, loopback, false)) if v6.map_or(true, |v6| v6 == lv6) && loopback == lloop)
+    });
+    *pending = rest;
+    ready
+}
+
 /// Rebuild connectivity under the *same* pinned identity — the network changed
 /// (roam / wake / interface up-down), so the routing table, bootstrap
 /// connections and relay reservations are stale. Idempotent and cheap.
@@ -2554,50 +3513,27 @@ fn rebootstrap(
         debug!(%e, "rebootstrap: kademlia.bootstrap deferred (no peers yet)");
     }
 
-    // Re-dial every bootstrap peer (relays included) to re-establish the direct
-    // links a roam/wake tore down. libp2p dedups if a connection already exists.
-    for (peer_id, addr) in &state.bootstrap_peers {
-        let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
+    // Re-dial the bootstrap peers (relays included) to re-establish the direct links a roam/wake
+    // tore down, skipping those still connected on that transport (P2, see `bootstrap_redials`).
+    for (peer_id, addr) in bootstrap_redials(state) {
+        let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id));
         if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, dial_addr.clone()) {
             debug!(%peer_id, %dial_addr, %e, "rebootstrap: bootstrap re-dial failed");
         }
     }
 
-    // Re-request only the relay reservations we don't currently hold. Reserving
-    // a circuit we already have would leak a duplicate listener (F6), so skip
-    // any circuit still in `reserved_circuits`; the F-5 reactive path owns those
-    // that genuinely dropped.
-    let mut seen_relays = std::collections::HashSet::new();
-    for relay_multiaddr in state.relays.clone() {
-        {
-            let relay_peer = relay_multiaddr.iter().find_map(|p| match p {
-                libp2p::multiaddr::Protocol::P2p(id) => Some(id),
-                _ => None,
-            });
-            if let Some(pid) = relay_peer {
-                if !seen_relays.insert(pid) {
-                    continue;
-                }
-            }
-            let listen_addr = relay_multiaddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
-            let listen_str = listen_addr.to_string();
-            if state.reserved_circuits.contains(&listen_str) {
-                continue; // already reserved — don't leak a duplicate listener
-            }
-            match swarm.listen_on(listen_addr.clone()) {
-                Ok(_) => info!(addr = %listen_addr, "rebootstrap: re-requesting relay reservation"),
-                Err(e) => {
-                    warn!(addr = %listen_addr, %e, "rebootstrap: relay re-reservation failed");
-                    schedule_reservation_retry(state, &listen_str);
-                }
-            }
-        }
-    }
+    // Re-request only the relay reservations we don't hold or request already: reserving on a
+    // relay we have a listener on would leak a duplicate (F6). (This used to compare against the
+    // circuits we hold, which end in our own peer id, so it never matched and re-requested every
+    // relay.)
+    reserve_on_relays(swarm, state, "rebootstrap");
 
     // #43-W1: a new network is a fresh chance to hole-punch — clear the QUIC-v6
     // punch and reversal back-off so shelved peers get re-attempted.
     state.quic_holepunch_attempts.clear();
     state.reversal_attempts.clear();
+    // P1: and to have our new IPv6 QUIC address seen by a relay.
+    state.relay_v6_quic_dialled.clear();
 
     // H (F-9): re-probe IPv6 capability on every rebootstrap (roam/wake). It was previously
     // evaluated only once at startup, so a node that booted on a v4-only link and roamed onto
@@ -2624,14 +3560,15 @@ fn maybe_rebootstrap(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
     reason: &str,
-) {
+) -> bool {
     if let Some(last) = state.last_rebootstrap {
         if last.elapsed() < REBOOTSTRAP_COOLDOWN {
             debug!(reason, "rebootstrap suppressed (cooldown)");
-            return;
+            return false;
         }
     }
     rebootstrap(swarm, state, reason);
+    true
 }
 
 /// The connectivity watchdog tick: rebuild if we've had zero connected peers for
@@ -2643,7 +3580,13 @@ fn drive_heal(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &mut LoopSta
     if let Some(at) = state.pending_rebootstrap_at {
         if now >= at {
             state.pending_rebootstrap_at = None;
-            maybe_rebootstrap(swarm, state, "reactive: interface change");
+            if !maybe_rebootstrap(swarm, state, "reactive: interface change") {
+                // A second change inside the cooldown (A → B → C within 30 s) still needs its
+                // rebuild: run it once the cooldown ends rather than dropping it.
+                if let Some(last) = state.last_rebootstrap {
+                    state.pending_rebootstrap_at = Some(last + REBOOTSTRAP_COOLDOWN);
+                }
+            }
         }
     }
     // Connectivity watchdog: sustained 0 connected peers ⇒ rebuild.
@@ -2784,27 +3727,69 @@ fn handle_swarm_event(
 
         // ── Identify ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Identify(identify_event)) => {
-            if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
+            if let libp2p::identify::Event::Received { peer_id, info, connection_id } = identify_event {
                 debug!(%peer_id, protocol = %info.protocol_version, "identify received");
-                let local_link = state.local_link_peers.contains_key(&peer_id);
-                for addr in info
-                    .listen_addrs
-                    .iter()
-                    .filter(|a| identify_addr_admissible(a, local_link))
-                    .take(MAX_IDENTIFY_ADDRS)
+                // A peer we dialled because mDNS found it, that doesn't speak OpenHydra's protocol, is
+                // another libp2p node on the LAN (mDNS is libp2p's shared service): drop that
+                // connection and leave the peer alone for a while. Only our LAN dials: an inbound
+                // connection, or a bootstrap (which doesn't serve that protocol), is never touched.
+                let openhydra = info.protocols.iter().any(|p| *p == crate::proxy::PROXY_PROTOCOL);
+                let same_network = crate::relay::remote_network_id(&info.agent_version) == our_network_id(state);
+                if state.lan_dialer.is_lan_dial(&connection_id)
+                    && !(openhydra && same_network)
+                    && state.lan_dialer.foreign(&connection_id, std::time::Instant::now())
                 {
-                    // F-9: skip IPv6 peer addresses on a host with no working
-                    // IPv6 — adding them to the routing table only leads libp2p
-                    // to later dial unreachable `/ip6/` addresses and eat
-                    // connection timeouts. (Relay v6 circuits are `/ip6/` too,
-                    // and equally undialable without v6.)
-                    if !state.ipv6_capable && is_ipv6_multiaddr(addr) {
-                        continue;
+                    if openhydra {
+                        info!(%peer_id, net = crate::relay::remote_network_id(&info.agent_version), "LAN peer is on another OpenHydra network; dropping the connection mDNS made");
+                    } else {
+                        info!(%peer_id, "LAN peer isn't an OpenHydra node; dropping the connection mDNS made");
                     }
-                    swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, addr.clone());
+                    let _ = swarm.close_connection(connection_id);
+                    return;
+                }
+                // A LAN peer of our network: tell it what we serve shortly, rather than at the next
+                // re-announce (up to 2 minutes). Without a reachable bootstrap there's no other way
+                // for it to learn (review 2026-10-29: a consumer that joined a LAN after the provider
+                // waited 58 s for its first answer). Over the internet, peers find providers through
+                // the DHT and the bootstraps' registry, so it's for LAN peers only.
+                if openhydra && same_network {
+                    state.lan_dialer.accepted(&connection_id);
+                }
+                if state.relay_conns.contains_key(&connection_id) {
+                    let ours = our_listen_ips(swarm);
+                    if let Some(c) = state.relay_conns.get_mut(&connection_id) {
+                        c.seen_as = multiaddr_ip(&info.observed_addr).map(|ip| (ip, ours.contains(&ip)));
+                    }
+                }
+                let on_lan = state.local_link_peers.contains_key(&peer_id);
+                debug!(%peer_id, openhydra, same_network, on_lan, due = ?state.lan_announce.due, "identify: LAN re-announce check");
+                // Once per peer while it stays connected: identify also runs every 5 minutes and on
+                // every push, and each re-announce floods the whole network (review 2026-10-29).
+                if openhydra && same_network && on_lan && state.lan_announced.insert(peer_id) {
+                    note_lan_subscriber(&mut state.lan_announce, std::time::Instant::now());
+                }
+                let local_link = state.local_link_peers.contains_key(&peer_id);
+                // What a peer claims about itself is not trusted (2026-10-27 review: any peer could
+                // put up to 32 addresses of its choosing, other people's machines included, into our
+                // routing table and so into every DHT answer we give). The routing table only gets
+                // its circuit addresses through a relay we use (the D-S5 rule signed records follow),
+                // which bounds them by the relays we trust; Kademlia lists a directly reachable peer
+                // itself once it has dialled it.
+                // A trusted relay's own addresses: places it's known at, for the circuit check.
+                if trusted_relay_pids(state).contains_peer(&peer_id) {
+                    let own = relay_self_addrs(&info.listen_addrs, on_public_network(state));
+                    state.relay_self_addrs.insert(peer_id, own);
+                }
+                let trusted = trusted_relay_pids(state);
+                for addr in identify_routing_addrs(&info.listen_addrs, &peer_id, &trusted, state.ipv6_capable) {
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                }
+                // Its direct addresses on the IP this connection really comes from are kept for our
+                // own dials to this peer only (a reconnect after a drop): the address book, which is
+                // never put in DHT answers. (`Swarm::add_peer_address` stores nothing: 2026-10-29.)
+                let conn_addr = state.conn_remote_addrs.get(&connection_id).map(|(_, a, _)| a);
+                for addr in identify_dial_addrs(&info.listen_addrs, conn_addr, local_link, state.ipv6_capable) {
+                    swarm.behaviour_mut().address_book.insert(peer_id, addr);
                 }
                 // R-DHT-2 (revised after the 2026-06-15 live test): do NOT confirm
                 // an Identify *observed* address as external. An observed addr is
@@ -2826,71 +3811,23 @@ fn handle_swarm_event(
                 let quic_v6_addrs: Vec<Multiaddr> = if !state.ipv6_capable {
                     Vec::new()
                 } else {
-                    info.listen_addrs.iter()
-                        .filter(|a| {
-                            let s = a.to_string();
-                            s.contains("/quic") && s.contains("/ip6/") && !s.contains("p2p-circuit")
-                        })
-                        .cloned()
-                        .collect()
+                    holepunch_v6_addrs(&info.listen_addrs)
                 };
-
-                if !quic_v6_addrs.is_empty() {
-                    state.peer_quic_addrs.insert(peer_id, quic_v6_addrs.clone());
-
-                    // Auto QUIC hole-punch: pursue a *v6* QUIC direct to this peer
-                    // by dialing their QUIC IPv6 addresses. v6-first: a v4 QUIC
-                    // direct does NOT count as done — we keep upgrading toward v6
-                    // (bounded by the back-off below) because v6's firewall punch
-                    // is far more stable than a v4 CGNAT hole.
-                    if !should_pursue_v6_upgrade(state.peer_connections.get(&peer_id)) {
-                        // Already hold the preferred v6 QUIC direct — reset back-off.
-                        state.quic_holepunch_attempts.remove(&peer_id);
-                    } else {
-                        // F7: skip public bootstrap relays — they're TCP-reachable
-                        // and hole-punch is meaningless for them; auto-QUIC-dialing
-                        // them is what churned the connection on UDP-hostile paths.
-                        let is_relay = quic_v6_addrs.iter().any(|a| {
-                            a.iter().any(|p| match p {
-                                libp2p::multiaddr::Protocol::Ip6(ip) =>
-                                    crate::relay::is_bootstrap_relay_ip(&ip.to_string()),
-                                libp2p::multiaddr::Protocol::Ip4(ip) =>
-                                    crate::relay::is_bootstrap_relay_ip(&ip.to_string()),
-                                _ => false,
-                            })
-                        });
-                        // F7 / #43-W1: back off after MAX_QUIC_HOLEPUNCH_ATTEMPTS
-                        // so a UDP-filtered path stops re-dialing (and re-logging)
-                        // every identify cycle. The cap was 3; raised to 8 for the
-                        // v6 case: a stateful-firewall v6 punch is *reliable once
-                        // correctly timed* (no port translation, unlike v4 CGNAT),
-                        // so a firewalled-v6 peer shouldn't be permanently shelved
-                        // after only 3 uncoordinated misses — it deserves more
-                        // eager retries alongside libp2p's coordinated DCUtR. The
-                        // back-off is also cleared wholesale on `rebootstrap()`, so
-                        // a network change re-enables punching from scratch.
-                        const MAX_QUIC_HOLEPUNCH_ATTEMPTS: u32 = 8;
-                        let attempts = state.quic_holepunch_attempts.entry(peer_id).or_insert(0);
-                        if is_relay {
-                            debug!(%peer_id, "auto_quic_holepunch_skip: public relay");
-                        } else if *attempts >= MAX_QUIC_HOLEPUNCH_ATTEMPTS {
-                            debug!(%peer_id, attempts = *attempts, "auto_quic_holepunch_skip: backed off");
-                        } else {
-                            *attempts += 1;
-                            for addr in &quic_v6_addrs {
-                                use libp2p::swarm::dial_opts::DialOpts;
-                                let ma = addr.clone();
-                                match swarm.dial_tracked(&mut state.dials_in_flight, DialOpts::unknown_peer_id().address(addr.clone()).build()) {
-                                    Ok(()) => {
-                                        state.quic_v6_holepunch_dials += 1;
-                                        debug!(%peer_id, %ma, "auto_quic_holepunch_dial");
-                                    }
-                                    Err(e) => debug!(%peer_id, %ma, %e, "auto_quic_holepunch_dial_failed"),
-                                }
-                            }
-                        }
+                // Stored for every peer, dialled only with a reason (they're the peer's own claims,
+                // so dialling them for every peer that connects let anyone point us at other
+                // machines, 2026-10-27 review): here, that it's a provider we know. A provider
+                // dials back when a peer sends it a request (see `pursue_v6_holepunch`).
+                let known_provider = {
+                    let pid = peer_id.to_base58();
+                    state.known_peers.values().any(|r| r.libp2p_peer_id == pid)
+                };
+                if store_claimed_v6_addrs(state, peer_id, &quic_v6_addrs) {
+                    if known_provider {
+                        pursue_v6_holepunch(swarm, state, peer_id, "identify");
                     }
                 }
+                // What the punch dialled, for connection reversal not to dial again.
+                let quic_v6_addrs = if known_provider { quic_v6_addrs } else { Vec::new() };
 
                 // ── Connection reversal (Tier 2) ──
                 // If enabled and we hold no *direct* connection to this peer (only a
@@ -2944,23 +3881,34 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Mdns(mdns_event)) => {
             match mdns_event {
                 libp2p::mdns::Event::Discovered(peers) => {
+                    // Dial what mDNS finds, so peers on a LAN connect with no bootstrap reachable
+                    // (review 2026-10-29: these were only logged). Not into the routing table by hand:
+                    // on the public network the routing table refuses private addresses anyway (the
+                    // patched libp2p-kad's filter), so none goes into a DHT answer.
                     for (peer_id, addr) in peers {
-                        info!(%peer_id, %addr, "mDNS discovered peer");
-                        swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&peer_id, addr);
+                        debug!(%peer_id, %addr, "mDNS discovered peer");
+                        state.lan_dialer.discovered(peer_id, addr);
+                    }
+                    if state.lan_dialer.round_due(std::time::Instant::now()) {
+                        drive_lan_dials(swarm, state);
                     }
                 }
                 // Phase 1.7: mDNS expiry — evict peers that are no longer
                 // reachable on LAN.
                 libp2p::mdns::Event::Expired(peers) => {
-                    for (peer_id, _) in peers {
-                        info!(%peer_id, "mDNS peer expired");
-                        // Drop the dead LAN route but keep `known_peers` — the TTL reaper owns
-                        // cache lifecycle. Wiping here collapsed multi-model providers on transient
-                        // mDNS churn. (No-op if still connected.)
-                        evict_unreachable_peer(swarm, peer_id);
+                    for (peer_id, addr) in peers {
+                        info!(%peer_id, %addr, "mDNS address expired");
+                        // Drop that one LAN route, not the whole peer: its other addresses (another
+                        // interface, its public address, a relay) still work, and evicting the peer
+                        // here dropped them too (review 2026-10-29). `known_peers` stays with the TTL
+                        // reaper. Not from the routing table while connected: Kademlia drops a peer
+                        // with its last address, and a missed mDNS refresh (common on WiFi) would
+                        // drop a live one.
+                        state.lan_dialer.expired(&peer_id, &addr);
+                        swarm.behaviour_mut().address_book.remove(&peer_id, &addr);
+                        if !swarm.is_connected(&peer_id) {
+                            swarm.behaviour_mut().kademlia.remove_address(&peer_id, &addr);
+                        }
                     }
                 }
             }
@@ -2970,9 +3918,13 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::RelayClient(relay_event)) => {
             match relay_event {
                 libp2p::relay::client::Event::ReservationReqAccepted {
-                    relay_peer_id, ..
+                    relay_peer_id, renewal, ..
                 } => {
                     info!(%relay_peer_id, "relay reservation accepted");
+                    if !renewal && first_time(&mut state.reservation_seen, state.announced) {
+                        info!(%relay_peer_id, "first relay reservation: re-announcing (the first announce went out before peers could reach us)");
+                        bump_net_generation(state);
+                    }
                 }
                 libp2p::relay::client::Event::OutboundCircuitEstablished {
                     relay_peer_id, ..
@@ -3089,7 +4041,11 @@ fn handle_swarm_event(
                     let msg_type = parsed.get("type").and_then(|v| v.as_str());
                     if msg_type == Some(PROVIDER_ANNOUNCE_TYPE) {
                         handled_internally = true;
-                        handle_provider_pex(state, &parsed, message.source);
+                        if handle_provider_pex(state, &parsed, message.source) {
+                            if let Some(source) = message.source {
+                                pursue_v6_holepunch_debounced(swarm, state, source, "record");
+                            }
+                        }
                     } else if msg_type == Some("PEER_DEPARTED") {
                         if let Some(departed_id_str) = parsed.get("libp2p_peer_id").and_then(|v| v.as_str()) {
                             if let Ok(departed_pid) = departed_id_str.parse::<PeerId>() {
@@ -3106,6 +4062,64 @@ fn handle_swarm_event(
                                     );
                                 }
                             }
+                        }
+                    } else if msg_type == Some(PROVIDER_GONE_TYPE) {
+                        // SECURITY: only from a bootstrap we were configured with (gossip is signed
+                        // and strict, so `message.source` is the verified author), only fresh, and
+                        // only once PROVIDER_GONE_QUORUM of them agree; never for a peer we're
+                        // connected to (we know better); and only records no newer than the
+                        // bootstraps saw, so a live provider's next announce wins.
+                        handled_internally = true;
+                        let bootstraps: Vec<PeerId> = state
+                            .relays
+                            .iter()
+                            .filter_map(|a| a.iter().find_map(|p| match p {
+                                libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+                                _ => None,
+                            }))
+                            .collect::<std::collections::BTreeSet<_>>() // one per bootstrap, not per address
+                            .into_iter()
+                            .collect();
+                        let subject = parsed.get("libp2p_peer_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<PeerId>().ok());
+                        let ts = parsed.get("timestamp").and_then(|v| v.as_u64());
+                        let last_record_ms = parsed.get("last_record_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                        match (message.source, subject, ts) {
+                            (Some(reporter), Some(gone), Some(ts))
+                                if bootstraps.contains(&reporter)
+                                    && withdrawal_is_fresh(ts, now_unix_ms() / 1000, PROVIDER_GONE_MAX_AGE_SECS)
+                                    && gone != *swarm.local_peer_id() =>
+                            {
+                                let mut quorum = PROVIDER_GONE_QUORUM.min(bootstraps.len());
+                                quorum = quorum.max(1);
+                                let now_ms = now_unix_ms();
+                                if let Some((last, first)) = note_provider_gone(&mut state.provider_gone, gone, reporter, last_record_ms, quorum, now_ms, ts.saturating_mul(1000)) {
+                                    if swarm.is_connected(&gone) {
+                                        debug!(%gone, "PROVIDER_GONE ignored: we're connected to it");
+                                    } else {
+                                        let id = gone.to_base58();
+                                        state.gone_providers.retain(|_, (_, at)| now_ms.saturating_sub(*at) < GONE_MEMORY_MS);
+                                        if state.gone_providers.len() < MAX_PROVIDER_GONE_PENDING {
+                                            state.gone_providers.insert(id.clone(), (last, first));
+                                        }
+                                        let mut models = evict_gone_provider(&mut state.known_peers, &state.known_received, &id, last, first);
+                                        // And what it served that's no longer cached here (a disconnect
+                                        // already dropped its records): the browse list's sticky cache
+                                        // keeps those for minutes unless they're marked gone too (e2e
+                                        // test 30 Oct: the consumer next to a killed provider listed it 180 s+).
+                                        models.extend(state.model_seen.keys().filter(|(_, p)| *p == id).map(|(m, _)| m.clone()));
+                                        models.sort();
+                                        models.dedup();
+                                        swarm.behaviour_mut().kademlia.remove_peer(&gone);
+                                        if !models.is_empty() {
+                                            info!(%gone, ?models, "evicted a provider the bootstraps report gone");
+                                        }
+                                        for m in &models {
+                                            note_withdrawn_model(&mut state.withdrawn_models, &state.known_peers, &mut state.model_seen, m, &id, std::time::Instant::now());
+                                        }
+                                    }
+                                }
+                            }
+                            (source, _, _) => debug!(?source, "PROVIDER_GONE ignored (not from a bootstrap of ours, stale or malformed)"),
                         }
                     } else if msg_type == Some(MODEL_WITHDRAWN_TYPE) {
                         // M6: a provider withdrawing a SINGLE model (it un-shared one but
@@ -3164,19 +4178,41 @@ fn handle_swarm_event(
                         .gossip_inbound_queue
                         .push_back((propagation_source.to_string(), message.data));
                 }
+            } else if let libp2p::gossipsub::Event::Subscribed { peer_id, topic } = gossip_event {
+                if topic.as_str() == crate::swarm::GOSSIPSUB_TOPIC
+                    && first_time(&mut state.gossip_peer_seen, state.announced)
+                {
+                    info!(%peer_id, "first gossip peer: re-announcing (the first announce had nobody to tell)");
+                    bump_net_generation(state);
+                }
             }
         }
 
         // Ping keepalive — log failures and evict unreachable peers
         // (Phase 1.6). Success is silent to avoid flooding logs.
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Ping(ping_event)) => {
+            if ping_event.result.is_ok() {
+                state.relay_ping_failures.remove(&ping_event.connection);
+                state.relayed_ping_failures.remove(&ping_event.connection);
+            }
             if let Err(ref e) = ping_event.result {
                 let peer = ping_event.peer;
                 warn!(%peer, error = %e, "ping failed");
+                if relay_connection_dead(state, peer, ping_event.connection, e, &our_listen_ips(swarm)) {
+                    // Our reservation rides this connection; closing it closes the reservation's
+                    // listener, and that schedules a fresh reservation on the relay.
+                    warn!(%peer, connection = ?ping_event.connection, "closing a relay connection that stopped answering pings");
+                    swarm.close_connection(ping_event.connection);
+                }
+                let busy = peer_busy(state, peer, |id| swarm.behaviour().grpc_proxy.is_pending_outbound(&peer, id));
+                if relayed_connection_dead(state, peer, ping_event.connection, e, busy) {
+                    warn!(%peer, connection = ?ping_event.connection, "closing an idle relayed connection that stopped answering pings");
+                    swarm.close_connection(ping_event.connection);
+                }
                 // Drop the dead route but keep `known_peers`: a ping failure to a relayed/NAT'd
                 // peer is transient, and wiping the cache here collapsed multi-model providers.
                 // The TTL reaper (fresh-or-connected) ages out a genuinely gone peer.
-                evict_unreachable_peer(swarm, peer);
+                evict_unreachable_peer(swarm, peer, &[]);
             }
         }
 
@@ -3218,7 +4254,7 @@ fn handle_swarm_event(
         }
 
         // ── Connection lifecycle ──
-        SwarmEvent::NewListenAddr { address, .. } => {
+        SwarmEvent::NewListenAddr { listener_id, address } => {
             info!(%address, "listening on");
             // R-DHT-2 (revised after the 2026-06-15 live test): a globally-routable
             // *listen* address is NOT proof of inbound reachability. The live test
@@ -3231,29 +4267,82 @@ fn handle_swarm_event(
             // now requires a positive AutoNAT v2 per-address verdict — the only
             // signal that actually proves an arbitrary querier can reach us — or a
             // UPnP mapping (see the AutonatV2Client / UPnP handlers). "No verdict" → stay
-            // client (safe), never a black hole. DCUtR is unaffected: it offers our
-            // listen addrs during hole-punch regardless of external confirmation.
+            // client (safe), never a black hole. DCUtR is unaffected: it offers the
+            // addresses peers observed us at (identify), regardless of confirmation.
             //
             // F-5: a circuit listen addr coming up means the reservation
             // succeeded — clear any pending backoff retry for it.
             if address.to_string().contains("/p2p-circuit") {
-                clear_reservation_retry(state, &address.to_string());
+                clear_reservation_retry(state, &address);
                 // #42: track live reservations so rebootstrap re-requests only
                 // the missing ones (avoids leaking duplicate circuit listeners).
                 state.reserved_circuits.insert(address.to_string());
-            } else if is_real_interface_addr(&address) {
-                // #42: a real interface came up (roam / wake / new link) — arm a
-                // debounced rebuild so the routing table, bootstrap connections
-                // and relay reservations refresh for the new network.
-                arm_reactive_rebootstrap(state, "new listen addr");
+                let now = std::time::Instant::now();
+                let v6_quic_listener = swarm.listeners().any(|a| is_v6_quic(a) && multiaddr_ip(a).is_some_and(|ip| !is_non_global_ip(ip)));
+                if let Some((relay, addr)) = relay_v6_quic_dial(state, listener_id, &address, now).filter(|_| v6_quic_listener) {
+                    state.relay_v6_quic_dialled.insert(relay, now);
+                    // From the listen socket (QUIC's default), so the relay sees the address peers
+                    // can punch to.
+                    let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(relay)
+                        .addresses(vec![addr.clone()])
+                        .condition(libp2p::swarm::dial_opts::PeerCondition::Always)
+                        .build();
+                    match swarm.dial_tracked(&mut state.dials_in_flight, opts) {
+                        Ok(()) => info!(%relay, %addr, "P1: dialling our relay over IPv6 QUIC so peers learn our IPv6 QUIC address"),
+                        Err(e) => debug!(%relay, %addr, error = %e, "P1: IPv6 QUIC dial to relay not started"),
+                    }
+                }
+            } else {
+                for (peer_id, addr) in startup_dials_ready(&mut state.startup_dials, &address) {
+                    let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                    info!(%peer_id, %dial_addr, from = %address, "bootstrap_dial: explicitly dialing bootstrap peer");
+                    if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, dial_addr.clone()) {
+                        warn!(%peer_id, %dial_addr, %e, "bootstrap_dial: failed");
+                    }
+                }
+                if state.startup_dials.is_empty() && state.startup_dials_until.take().is_some() {
+                    start_kad_bootstrap(swarm);
+                }
+                if is_real_interface_addr(&address) {
+                    // #42: a real interface came up (roam / wake / new link) — arm a
+                    // debounced rebuild so the routing table, bootstrap connections
+                    // and relay reservations refresh for the new network.
+                    arm_reactive_rebootstrap(state, "new listen addr");
+                }
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+            state.relay_dial_backoff.remove(&peer_id);
+            state.lan_dialer.established(&connection_id, std::time::Instant::now());
+            if endpoint.is_relayed() {
+                state.relayed_conns.insert(connection_id, peer_id);
+            }
+            if !endpoint.is_relayed() && crate::relay::relay_peer_ids(&state.relays).contains(&peer_id) {
+                state.relay_conns.insert(connection_id, RelayConn { since: std::time::Instant::now(), seen_as: None });
+                if is_v6_quic(endpoint.get_remote_address()) {
+                    state.relay_v6_quic_conns.insert(connection_id, peer_id);
+                }
+            }
+            // An address we reached a relay of ours at directly is one it's known at (the circuit
+            // check, relay.rs), whatever form (DNS name, IPv6) it was configured in.
+            if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                if !endpoint.is_relayed() && trusted_relay_pids(state).contains_peer(&peer_id) {
+                    let reached = state.relay_dialled_addrs.entry(peer_id).or_default();
+                    if !reached.contains(address) && reached.len() < MAX_RELAY_SELF_ADDRS {
+                        reached.push(address.clone());
+                    }
+                }
+            }
             if let Some(set) = state.dials_in_flight.get_mut(&peer_id) {
                 set.remove(&connection_id);
                 if set.is_empty() {
                     state.dials_in_flight.remove(&peer_id);
                 }
+            }
+            // The address this connection really runs over (relayed ones have no IP of the peer's):
+            // what identify's claims are checked against.
+            if !endpoint.is_relayed() {
+                state.conn_remote_addrs.insert(connection_id, (peer_id, endpoint.get_remote_address().clone(), std::time::Instant::now()));
             }
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
@@ -3299,6 +4388,7 @@ fn handle_swarm_event(
                     .or_insert(0) += 1;
             }
 
+            let is_our_relay = crate::relay::relay_peer_ids(&state.relays).contains(&peer_id);
             let info = state.peer_connections.entry(peer_id).or_default();
             if transport != TransportType::TcpRelay {
                 if let Some(ip) = &endpoint_ip {
@@ -3380,7 +4470,9 @@ fn handle_swarm_event(
             // v6-pref: if this peer now has BOTH a v6 and a v4 QUIC direct, arm the
             // grace window after which the redundant v4 is retired so traffic
             // settles on v6. Same earliest-wins arming as the relay case.
-            if should_arm_v4_close(info) {
+            // (Never for one of our relays: its v4 connection may hold our reservation, and P1 adds
+            // a v6 QUIC connection to it on purpose.)
+            if should_arm_v4_close(info) && !is_our_relay {
                 state
                     .v4_close_deadline
                     .entry(peer_id)
@@ -3420,6 +4512,13 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, .. } => {
+            state.relay_ping_failures.remove(&connection_id);
+            state.relay_conns.remove(&connection_id);
+            state.relay_v6_quic_conns.remove(&connection_id);
+            state.relayed_conns.remove(&connection_id);
+            state.relayed_ping_failures.remove(&connection_id);
+            state.conn_remote_addrs.remove(&connection_id);
+            state.lan_dialer.closed(&connection_id, std::time::Instant::now());
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
@@ -3510,6 +4609,7 @@ fn handle_swarm_event(
                 // last_repunch (debounce timestamps) and peer_quic_addrs (learned
                 // QUIC addrs) behind — one entry leaked per peer ever seen.
                 state.last_repunch.remove(&peer_id);
+                state.lan_announced.remove(&peer_id);
                 state.peer_quic_addrs.remove(&peer_id);
                 // H (E-N3 follow-up): the sibling back-off maps keyed per peer were missed by
                 // the original E-N3 prune and leaked one entry per peer ever seen on a stable
@@ -3521,7 +4621,9 @@ fn handle_swarm_event(
         SwarmEvent::ExternalAddrConfirmed { address } => {
             info!(%address, "external address confirmed");
             let is_circuit = address.to_string().contains("/p2p-circuit");
-            state.external_addrs.push(address.clone());
+            if !state.external_addrs.contains(&address) {
+                state.external_addrs.push(address.clone());
+            }
             // A3 DCUtR fix: only flip the peer to ``is_public`` when the
             // confirmed address is a *direct* multiaddr. A ``/p2p-circuit/``
             // confirmation means "a relay forwarded traffic for us" — not
@@ -3549,22 +4651,80 @@ fn handle_swarm_event(
                 );
             }
         }
+        // An address that no longer holds (a relay circuit whose relay connection closed) leaves
+        // the list `/status` reports.
+        SwarmEvent::ExternalAddrExpired { address } => {
+            info!(%address, "external address expired");
+            state.external_addrs.retain(|a| a != &address);
+            // The last address we were reachable at going (a UPnP lease lapsing, say): a server
+            // nobody can reach any more would hand out its own address in DHT answers and take
+            // queries it can't answer, so back to client. AutoNAT or a new mapping promotes again.
+            if should_demote_to_client(state) {
+                info!(%address, "no reachable direct address left: Kademlia client mode");
+                swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Client));
+                state.kad_server_mode = false;
+                state.nat_info.is_public = false;
+                state.nat_info.nat_type = "unknown".into();
+            }
+        }
         // A failed outgoing dial to a peer we hold no live connection to → drop it from the
         // routing table (dead path). Do NOT wipe `known_peers` here — that collapsed multi-model
         // providers on transient dial failures; the TTL reaper owns cache lifecycle. See
         // [`evict_unreachable_peer`].
         SwarmEvent::OutgoingConnectionError { peer_id, connection_id, error } => {
+            if state.lan_dialer.is_lan_dial(&connection_id) {
+                // A LAN dial that failed says nothing about the peer's other routes (a firewall that
+                // refuses LAN connections, or someone on the LAN announcing that peer at their own
+                // address): back it off, and touch nothing else (review 2026-10-29).
+                debug!(?peer_id, %error, "LAN dial failed");
+                state.lan_dialer.failed(&connection_id, std::time::Instant::now());
+                return;
+            }
             warn!(?peer_id, %error, "outgoing_connection_error");
+            // A bootstrap dial refused because our port's previous connection to it is still in
+            // TIME_WAIT (just restarted): dial those addresses again at once from a new port, at most
+            // once per bootstrap per IN_USE_REDIAL_EVERY.
+            if let Some(pid) = peer_id.filter(|p| state.bootstrap_peers.iter().any(|(b, _)| b == p)) {
+                let addrs: Vec<Multiaddr> = crate::transport::addrs_refused_as_in_use(&error)
+                    .into_iter()
+                    .map(|a: Multiaddr| a.into_iter().filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_))).collect())
+                    .collect();
+                let due = state.in_use_redials.get(&pid).map_or(true, |t| t.elapsed() >= IN_USE_REDIAL_EVERY);
+                if !addrs.is_empty() && due {
+                    state.in_use_redials.insert(pid, std::time::Instant::now());
+                    info!(%pid, ?addrs, "bootstrap_dial: local address in use (restart), dialing from a new port");
+                    let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(pid)
+                        .addresses(addrs)
+                        .condition(libp2p::swarm::dial_opts::PeerCondition::Always)
+                        .allocate_new_port()
+                        .build();
+                    if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, opts) {
+                        warn!(%pid, %e, "bootstrap_dial: failed");
+                    }
+                }
+            }
             if let Some(pid) = peer_id {
                 let connected = swarm.is_connected(&pid);
                 if !connected {
-                    evict_unreachable_peer(swarm, pid);
+                    evict_unreachable_peer(swarm, pid, &dial_error_addrs(&error));
                 }
                 // Nothing else can reach it now: fail its queued forwards at once (the caller
                 // retries with a fresh lookup) instead of after RELAY_FORWARD_TTL.
                 if dial_ended_unreachable(&mut state.dials_in_flight, pid, connection_id, connected) {
+                    let relay_limit = crate::transport::dial_refused_by_relay_limits(&error);
+                    let why = if relay_limit { DIAL_FAILED_RELAY_LIMIT } else { DIAL_FAILED_UNREACHABLE };
+                    if state.relay_dial_backoff.len() < MAX_RELAY_DIAL_BACKOFFS || state.relay_dial_backoff.contains_key(&pid) {
+                        let step = next_relay_dial_backoff(state.relay_dial_backoff.get(&pid).map(|b| b.step), relay_limit);
+                        state.relay_dial_backoff.insert(pid, RelayDialBackoff {
+                            until: std::time::Instant::now() + step,
+                            step,
+                            set_unix_ms: now_unix_ms(),
+                            why,
+                        });
+                        debug!(%pid, ?step, "relayed dials to this peer backed off");
+                    }
                     let drained = std::mem::take(&mut state.pending_relay_forwards);
-                    let (kept, failed) = fail_relay_forwards_for(drained, pid, DIAL_FAILED_UNREACHABLE);
+                    let (kept, failed) = fail_relay_forwards_for(drained, pid, why);
                     state.pending_relay_forwards = kept;
                     if failed > 0 {
                         info!(%pid, failed, "proxy_forward: dial failed, no other dial in flight — failing queued forwards now");
@@ -3576,6 +4736,11 @@ fn handle_swarm_event(
         SwarmEvent::IncomingConnectionError { error: error @ libp2p::swarm::ListenError::Denied { .. }, .. } => {
             debug!(%error, "incoming_connection_denied");
         }
+        // A handshake that fails is the other side's problem or a port scan, and hole punching makes
+        // dozens a minute (GPU test 2026-10-29: the providers' logs were full of them): not a warning.
+        SwarmEvent::IncomingConnectionError { error: error @ libp2p::swarm::ListenError::Transport(_), .. } => {
+            debug!(%error, "incoming_connection_error");
+        }
         SwarmEvent::IncomingConnectionError { error, .. } => {
             warn!(%error, "incoming_connection_error");
         }
@@ -3585,27 +4750,30 @@ fn handle_swarm_event(
             if address.to_string().contains("/p2p-circuit") {
                 // #42: reservation is no longer live — stop treating it as held.
                 state.reserved_circuits.remove(&address.to_string());
-                // Normal renewal: try an immediate re-listen first (libp2p
-                // usually auto-renews; this covers the case it didn't). If the
-                // immediate attempt errors, fall into the F-5 backoff retry so
-                // a persistently-failing relay doesn't strand us.
-                info!(%address, "relay reservation expired, requesting renewal");
-                match swarm.listen_on(address.clone()) {
-                    Ok(_) => info!(%address, "relay re-reservation requested"),
-                    Err(e) => {
-                        warn!(%address, %e, "relay re-reservation failed; scheduling backoff retry");
-                        schedule_reservation_retry(state, &address.to_string());
+                // (Defensive: libp2p-relay 0.18's listener doesn't expire circuit addresses on its own;
+                // they go with ListenerClosed.) The listener that held it renews it, or closes (and
+                // ListenerClosed schedules the retry). Only a relay none of our listeners is on needs one from here; listening
+                // again on a relay we still have a listener on is what started the churn.
+                if let Some(relay) = circuit_relay(&address) {
+                    if relay_has_listener(state, relay) {
+                        info!(%address, "relay reservation expired; its listener renews it");
+                    } else if let Some(circuit) = reservation_circuit(&state.relays, relay, Some(&address)) {
+                        schedule_reservation_retry(state, relay, circuit);
                     }
                 }
             } else if is_real_interface_addr(&address) {
                 // #42: a real interface address went away (roam / interface
                 // down) — expire the stale direct external addrs tied to it and
                 // arm a debounced rebuild for the new network.
+                let remaining: Vec<Multiaddr> = swarm.listeners().cloned().collect();
+                if addr_loss_leaves_network(&address, &remaining) {
+                    state.last_addr_loss = Some(std::time::Instant::now());
+                }
                 expire_direct_external_addrs(swarm, state);
                 arm_reactive_rebootstrap(state, "expired listen addr");
             }
         }
-        SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+        SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
             warn!(?addresses, ?reason, "listener_closed");
             let mut real_interface_closed = false;
             for addr in &addresses {
@@ -3619,20 +4787,26 @@ fn handle_swarm_event(
                             }
                         }
                     }
-                    // F-5: a closed circuit listener means the reservation
-                    // dropped/was rejected. Schedule a backed-off retry instead
-                    // of an immediate re-listen — an immediate re-listen against
-                    // a flapping or capped relay tight-loops the event loop and
-                    // spams the relay. The relay_retry_ticker drives the re-listen
-                    // once the backoff window elapses.
-                    schedule_reservation_retry(state, &addr.to_string());
                 } else if is_real_interface_addr(addr) {
                     real_interface_closed = true;
                 }
             }
+            let remaining: Vec<Multiaddr> = swarm.listeners().cloned().collect();
+            let left_network = addresses.iter().any(|a| addr_loss_leaves_network(a, &remaining));
+            // F-5: a closed circuit listener means the reservation dropped or was refused. Schedule
+            // one backed-off retry per relay it was on (not one per address it reported), and none
+            // for a relay another listener of ours is still on. An immediate re-listen against a
+            // flapping or capped relay tight-loops the event loop and spams the relay; the
+            // relay_retry_ticker re-listens once the backoff window elapses.
+            for (relay, circuit) in relays_to_re_reserve(state, listener_id, &addresses) {
+                schedule_reservation_retry(state, relay, circuit);
+            }
             if real_interface_closed {
                 // #42: a real interface listener closed (roam / wake) — expire
                 // stale direct external addrs and arm a debounced rebuild.
+                if left_network {
+                    state.last_addr_loss = Some(std::time::Instant::now());
+                }
                 expire_direct_external_addrs(swarm, state);
                 arm_reactive_rebootstrap(state, "listener closed");
             }
@@ -3650,6 +4824,12 @@ fn handle_swarm_event(
             trace!("unhandled_swarm_event");
         }
     }
+}
+
+/// Whether we're a Kademlia server with no direct external address left (circuits don't count:
+/// reaching us through a relay doesn't make us reachable).
+fn should_demote_to_client(state: &LoopState) -> bool {
+    state.kad_server_mode && !state.external_addrs.iter().any(|a| !a.to_string().contains("/p2p-circuit"))
 }
 
 /// Handle Kademlia events.
@@ -3677,10 +4857,7 @@ fn handle_kad_event(
                                 .find(|r| r.libp2p_peer_id == pid_str && r.model_id == pending.model_id)
                                 .cloned();
                             if let Some(record) = cached {
-                                // Deduplicate: don't add if already in results
-                                if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
-                                    pending.records.push(record);
-                                }
+                                pending.merge(record, now_unix_ms());
                                 continue;
                             }
                             // 2. Check local Kademlia store (populated by put_record replication)
@@ -3693,17 +4870,17 @@ fn handle_kad_event(
                                     // H1: reject unverified records (DHT poisoning).
                                     if let Err(e) = dht::verify_peer_record(&record) {
                                         warn!(%pid_str, %e, "dht_record_rejected: provider-store verify failed");
-                                    } else if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str)
+                                    } else if !is_gone_record(&state.gone_providers, &record, now_unix_ms())
                                         && install_known_peer_in(
-                                            &mut state.known_peers,
-                                            &mut state.known_received,
-                                            &state.local_libp2p,
-                                            &record,
-                                            now_unix_ms(),
-                                        )
-                                        .is_some()
+                                        &mut state.known_peers,
+                                        &mut state.known_received,
+                                        &state.local_libp2p,
+                                        &record,
+                                        now_unix_ms(),
+                                    )
+                                    .is_some()
                                     {
-                                        pending.records.push(record);
+                                        pending.merge(record, now_unix_ms());
                                     }
                                 }
                             } else {
@@ -3853,11 +5030,20 @@ fn handle_kad_event(
                                         }
                                     }
                                 }
-                                // Cache the peer.
-                                state
-                                    .known_peers
-                                    .insert(known_peer_key(&peer_record), peer_record.clone());
-                                pending.records.push(peer_record);
+                                // Cache the peer, under the same rules as every other path (review
+                                // 2026-10-30: this one skipped the age, newer-only and receive-time checks).
+                                if !is_gone_record(&state.gone_providers, &peer_record, now_unix_ms())
+                                    && install_known_peer_in(
+                                    &mut state.known_peers,
+                                    &mut state.known_received,
+                                    &state.local_libp2p,
+                                    &peer_record,
+                                    now_unix_ms(),
+                                )
+                                .is_some()
+                                {
+                                    pending.merge(peer_record, now_unix_ms());
+                                }
                             }
                             Err(e) => {
                                 warn!("failed to decode DHT record: {e}");
@@ -3867,21 +5053,18 @@ fn handle_kad_event(
                 }
                 Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
                     // Query complete — send results back.
-                    if let Some(pending) = state.pending_discovers.remove(&id) {
-                        let peers = discovered_from_records(state, &pending.records);
-                        // C11: cache a non-empty result so repeat requests skip get_providers.
-                        if !peers.is_empty() {
-                            state.discover_cache.insert(
-                                pending.model_id.clone(),
-                                (now_unix_ms(), state.net_generation.load(std::sync::atomic::Ordering::Relaxed)),
-                            );
-                        }
-                        let _ = pending.reply.send(Ok(peers));
+                    if let Some(pending) = state.pending_discovers.get_mut(&id) {
+                        pending.providers_done = true;
+                        pending.outstanding = 0;
                     }
+                    maybe_reply_discover(state, id);
                 }
                 Err(e) => {
                     if let Some(pending) = state.pending_discovers.remove(&id) {
-                        let _ = pending.reply.send(Err(format!("kademlia get_record: {e:?}")));
+                        settle_discover(state, &pending);
+                        for w in pending.waiters {
+                            let _ = w.reply.send(Err(format!("kademlia get_record: {e:?}")));
+                        }
                     }
                 }
             }
@@ -3903,7 +5086,7 @@ fn handle_kad_event(
         // we must explicitly accept them, which lets us verify signed records
         // before storing/replicating so this node never amplifies poison.
         kad::Event::InboundRequest { request } => {
-            handle_inbound_kad_request(request, swarm);
+            handle_inbound_kad_request(request, swarm, state);
         }
         kad::Event::RoutingUpdated { peer, .. } => {
             debug!(%peer, "kademlia routing updated");
@@ -3914,7 +5097,7 @@ fn handle_kad_event(
             warn!(%peer, "kademlia reports peer unroutable — dropping route, keeping cache");
             // Routing-only: keep `known_peers` (TTL reaper owns lifecycle). Wiping here collapsed
             // multi-model providers whenever Kademlia transiently declared a relayed peer unroutable.
-            evict_unreachable_peer(swarm, peer);
+            evict_unreachable_peer(swarm, peer, &[]);
         }
         _ => {
             debug!(?event, "unhandled kademlia event");
@@ -3927,13 +5110,79 @@ fn handle_kad_event(
 /// provider's advertised `relay_address` is only injected into the routing table
 /// if its relay hop is in this set (so a runtime-configured relay like netcup is
 /// accepted while an arbitrary/attacker relay is rejected).
-fn trusted_relay_pids(state: &LoopState) -> std::collections::HashSet<PeerId> {
-    let mut set: std::collections::HashSet<PeerId> =
-        state.bootstrap_peers.iter().map(|(pid, _)| *pid).collect();
+fn trusted_relay_pids(state: &LoopState) -> crate::relay::TrustedRelays {
+    let mut trusted = crate::relay::TrustedRelays::default();
+    for (pid, addr) in &state.bootstrap_peers {
+        trusted.add_for(*pid, addr.clone());
+    }
     // The relays this node uses (the production ones only on the public network: a private
     // deployment never dials a circuit through them).
-    set.extend(crate::relay::relay_peer_ids(&state.relays));
-    set
+    for addr in &state.relays {
+        trusted.add(addr);
+    }
+    // And the addresses those relays report for themselves (review 2026-10-29: peers reserve
+    // through whichever relay address they dialled, which the configured list may not have).
+    for (pid, addrs) in state.relay_self_addrs.iter().chain(&state.relay_dialled_addrs) {
+        if trusted.contains_peer(pid) {
+            for addr in addrs {
+                trusted.add_for(*pid, addr.clone());
+            }
+        }
+    }
+    trusted
+}
+
+/// Which network this node is on ([`crate::relay::network_id`]), as its identify tells peers.
+fn our_network_id(state: &LoopState) -> String {
+    crate::relay::network_id(&state.bootstrap_peers, on_public_network(state))
+}
+
+/// Dial the LAN peers mDNS lists that are due a dial ([`crate::mdns::LanDialer::due`]). On every
+/// discovery and on the heal tick, so a peer skipped or backed off is tried again.
+fn drive_lan_dials(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &mut LoopState) {
+    // Nothing to gain dialling a peer we already reach over the LAN, or directly by any path.
+    let due = state.lan_dialer.due(
+        |p| state.local_link_peers.contains_key(p) || state.peer_connections.get(p).is_some_and(|c| c.has_direct()),
+        std::time::Instant::now(),
+    );
+    for (peer_id, addrs) in due {
+        // `NotDialing`, not `Disconnected…`: a peer we reach only through a relay is worth a direct
+        // LAN connection too.
+        let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+            .condition(libp2p::swarm::dial_opts::PeerCondition::NotDialing)
+            .addresses(addrs.clone())
+            .build();
+        let id = opts.connection_id();
+        match swarm.dial(opts) {
+            Ok(()) => {
+                info!(%peer_id, "dialling a peer mDNS found on the LAN");
+                state.lan_dialer.dialled(id, peer_id, &addrs);
+            }
+            Err(e) => debug!(%peer_id, %e, "mDNS peer not dialled"),
+        }
+    }
+}
+
+/// Whether this node is on OpenHydra's public network: its relays include the production ones,
+/// which `relay::relay_addrs` adds exactly when `relay::uses_public_network` says so.
+fn on_public_network(state: &LoopState) -> bool {
+    let production = crate::relay::bootstrap_relay_peer_ids();
+    crate::relay::relay_peer_ids(&state.relays).iter().any(|p| production.contains(p))
+}
+
+/// What a trusted relay's identify says about its own addresses that we take as places it's known
+/// at: direct ones only, at most [`MAX_RELAY_SELF_ADDRS`]; on the public network global ones only
+/// (identify also sends loopback and private listen addresses, and a trusted relay's id in front of
+/// one would point queriers at their own machine or LAN).
+fn relay_self_addrs(listen_addrs: &[Multiaddr], public_network: bool) -> Vec<Multiaddr> {
+    listen_addrs
+        .iter()
+        .filter(|a| !a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)))
+        .filter(|a| !public_network || crate::swarm::routable_on_public_network(a))
+        .filter(|a| matches!(a.iter().next(), Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))))
+        .take(MAX_RELAY_SELF_ADDRS)
+        .cloned()
+        .collect()
 }
 
 /// D-S3: accept-or-drop an inbound Kademlia PUT under `StoreInserts::FilterBoth`.
@@ -3948,42 +5197,56 @@ fn trusted_relay_pids(state: &LoopState) -> std::collections::HashSet<PeerId> {
 fn handle_inbound_kad_request(
     request: kad::InboundRequest,
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
 ) {
     match request {
         kad::InboundRequest::PutRecord { source, record: Some(record), .. } => {
-            match dht::decode_record(&record.value) {
-                Ok(peer_record) => {
-                    if let Err(e) = dht::verify_peer_record(&peer_record) {
-                        warn!(%source, %e,
-                              "kad_put_rejected: inbound record failed verification (poison?)");
-                        return;
-                    }
-                    // H (key-binding): a valid signature proves the record is authentic but NOT
-                    // that it is stored under its canonical key. Without this, one valid identity
-                    // could replay its own signed record under thousands of distinct keys to fill
-                    // the bounded MemoryStore and block legitimate stores. Require the storage key
-                    // to be the one derived from the record's own (model_id, libp2p_peer_id).
-                    let expected_key =
-                        dht::peer_record_key(&peer_record.model_id, &peer_record.libp2p_peer_id);
-                    if record.key != expected_key {
-                        warn!(%source,
-                              "kad_put_rejected: record key not bound to its (model_id, libp2p_peer_id)");
-                        return;
-                    }
-                    if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().put(record) {
-                        debug!(%source, ?e, "kad_put: store rejected verified record (capacity?)");
-                    }
-                }
+            use libp2p::kad::store::RecordStore;
+            // Verified, recent, stored only under its canonical key (H key-binding) and never over
+            // a newer one, within its publisher's and network's share (see `dht`).
+            let peer_record = match dht::check_put_record(&record, now_unix_ms()) {
+                Ok(r) => r,
                 Err(e) => {
-                    warn!(%source, %e, "kad_put_rejected: undecodable inbound record");
+                    debug!(%source, %e, "kad_put_rejected");
+                    return;
                 }
+            };
+            if !dht::newer_than_stored(swarm.behaviour_mut().kademlia.store_mut().get(&record.key).as_deref(), &peer_record) {
+                debug!(%source, "kad_put_rejected: older than the record we hold");
+                return;
+            }
+            let origin = state
+                .conn_remote_addrs
+                .values()
+                .find(|(p, _, _)| *p == source)
+                .and_then(|(_, a, _)| multiaddr_ip(a))
+                .map(crate::ip_limits::origin_key)
+                .unwrap_or_else(|| format!("relayed:{source}"));
+            if !state.put_quota.admit(&record.key, &peer_record.libp2p_peer_id, &origin, std::time::Instant::now()) {
+                debug!(%source, %origin, "kad_put_rejected: publisher or network over its share of the store");
+                return;
+            }
+            if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                debug!(%source, ?e, "kad_put: store rejected verified record (capacity?)");
             }
         }
         // Filtered but empty (shouldn't happen with FilterBoth) — nothing to store.
         kad::InboundRequest::PutRecord { record: None, .. } => {}
         kad::InboundRequest::AddProvider { record: Some(provider) } => {
             // No signature to verify here; the read side fetches + verifies the
-            // provider's actual signed record before trusting it.
+            // provider's actual signed record before trusting it. Each provider and network gets its
+            // share of the provider store (model keys are free).
+            let origin = state
+                .conn_remote_addrs
+                .values()
+                .find(|(p, _, _)| *p == provider.provider)
+                .and_then(|(_, a, _)| multiaddr_ip(a))
+                .map(crate::ip_limits::origin_key)
+                .unwrap_or_else(|| format!("relayed:{}", provider.provider));
+            if !state.provider_quota.admit(&provider.key, &provider.provider.to_base58(), &origin, std::time::Instant::now()) {
+                debug!(provider = %provider.provider, %origin, "kad_add_provider: over its share of the store");
+                return;
+            }
             if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().add_provider(provider) {
                 debug!(?e, "kad_add_provider: store rejected (capacity?)");
             }
@@ -4014,11 +5277,8 @@ fn ingest_discovered_record(
     if !accept_and_install_record(swarm, state, &peer_record) {
         return;
     }
-    let pid_str = peer_record.libp2p_peer_id.clone();
     if let Some(pending) = state.pending_discovers.get_mut(&discover_id) {
-        if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
-            pending.records.push(peer_record);
-        }
+        pending.merge(peer_record, now_unix_ms());
     }
 }
 
@@ -4043,6 +5303,11 @@ fn accept_and_install_record(
         warn!(%e, "record_rejected: verify failed");
         return false;
     }
+    // A stale copy of a provider the bootstraps reported gone: not even its address goes back into
+    // the routing table (review 2026-10-30).
+    if is_gone_record(&state.gone_providers, peer_record, now_unix_ms()) {
+        return false;
+    }
     if !peer_record.relay_address.is_empty() && !peer_record.libp2p_peer_id.is_empty() {
         if let Ok(pid) = peer_record.libp2p_peer_id.parse::<PeerId>() {
             let trusted = trusted_relay_pids(state);
@@ -4058,7 +5323,13 @@ fn accept_and_install_record(
             }
         }
     }
-    install_known_peer(state, peer_record, now_unix_ms()).is_some()
+    let installed = install_known_peer(state, peer_record, now_unix_ms()).is_some();
+    if installed {
+        if let Ok(pid) = peer_record.libp2p_peer_id.parse::<PeerId>() {
+            pursue_v6_holepunch_debounced(swarm, state, pid, "record");
+        }
+    }
+    installed
 }
 
 /// C7 command handler: ask a connected bootstrap "who serves `model_id`?". Picks the first
@@ -4134,32 +5405,159 @@ fn handle_registry_query_event(
     }
 }
 
-/// Reply to a pending discover the moment its result is settled, **without waiting for the
-/// get_providers query to converge** (that tail is a fixed ~10s timeout that otherwise
-/// dominates per-request latency). "Settled" = no record fetches still outstanding AND
-/// either at least one provider record resolved (fast path) or the query has fully finished
-/// (so an empty result can return). Ranking / empty handling is the consumer's job.
+/// Whether a lookup has finished: the query is done and no record fetch is outstanding.
+fn lookup_done(p: &PendingDiscover) -> bool {
+    p.providers_done && p.outstanding == 0
+}
+
+/// Whether a waiting caller can be answered now: the lookup finished; or, with no record fetch
+/// outstanding, a caller with nothing known has providers, or a retry has new information (a
+/// provider new, or reachable at a different address, since it joined); or a retry's deadline has
+/// passed, whatever is outstanding.
+fn waiter_settled(
+    kind: DiscoverKind,
+    done: bool,
+    outstanding: usize,
+    records: usize,
+    info_gen: u64,
+    info_at_join: u64,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    done || deadline.is_some_and(|d| now >= d)
+        || (outstanding == 0
+            && match kind {
+                DiscoverKind::Reply => records > 0,
+                DiscoverKind::Retry => info_gen > info_at_join,
+            })
+}
+
+/// Did a lookup numbered `seq` start after the invalidate numbered `set_at` (or was there none)?
+fn started_after(set_at: Option<u64>, seq: u64) -> bool {
+    set_at.map_or(true, |set_at| seq > set_at)
+}
+
+/// A finished lookup: true if it started after the model's last `InvalidateDiscover` (or there was
+/// none), in which case it clears the model's wait flag and may mark the model fresh in the C11
+/// cache. One started before predates the failure that set the flag, so it does neither.
+fn settle_discover(state: &mut LoopState, pending: &PendingDiscover) -> bool {
+    let fresh = started_after(state.discover_wait_for_lookup.get(&pending.model_id).copied(), pending.seq);
+    if fresh {
+        state.discover_wait_for_lookup.remove(&pending.model_id);
+    }
+    fresh
+}
+
+/// Answer a lookup's waiting callers whose answer is settled ([`waiter_settled`]), **without
+/// waiting for the get_providers query to converge** (that tail is a fixed ~10 s timeout that
+/// otherwise dominates per-request latency); once the lookup has finished, answer the rest and
+/// retire it. Ranking / empty handling is the consumer's job.
 fn maybe_reply_discover(state: &mut LoopState, discover_id: kad::QueryId) {
-    let ready = match state.pending_discovers.get(&discover_id) {
-        Some(p) => p.outstanding == 0 && (!p.records.is_empty() || p.providers_done),
-        None => return,
-    };
-    if ready {
+    let now = std::time::Instant::now();
+    let Some(pending) = state.pending_discovers.get(&discover_id) else { return };
+    let done = lookup_done(pending);
+    let any_settled = pending.waiters.iter().any(|w| {
+        waiter_settled(w.kind, done, pending.outstanding, pending.records.len(), pending.info_gen, w.info_at_join, w.deadline, now)
+    });
+    if !done && !any_settled {
+        return;
+    }
+    // Answer from the current state: a provider's newer record may have arrived by gossip or PEX
+    // while the lookup ran (`known_peers`), not only from the DHT.
+    let now_ms = now_unix_ms();
+    let current: Vec<PeerRecord> = state
+        .known_peers
+        .values()
+        .filter(|r| r.model_id == pending.model_id && r.libp2p_peer_id != state.local_libp2p)
+        .cloned()
+        .collect();
+    let pending = state.pending_discovers.get_mut(&discover_id).expect("present");
+    for record in current {
+        merge_record(&mut pending.records, record, now_ms);
+    }
+    // R-DHT-8: `discovered_from_records` stamps the liveness hint (live libp2p connection?)
+    // so the consumer prefers connected providers and failover is the exception. All
+    // records here are already H1/PEX-verified, so we never surface an unverified candidate.
+    let records = pending.records.clone();
+    let peers = discovered_from_records(state, &records);
+    let pending = state.pending_discovers.get_mut(&discover_id).expect("present");
+    let (settled, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.waiters).into_iter().partition(|w| {
+        waiter_settled(w.kind, done, pending.outstanding, pending.records.len(), pending.info_gen, w.info_at_join, w.deadline, now)
+    });
+    pending.waiters = waiting;
+    for w in settled {
+        let _ = w.reply.send(Ok(peers.clone()));
+    }
+    if done {
         let pending = state.pending_discovers.remove(&discover_id).expect("present");
-        // R-DHT-8: `discovered_from_records` stamps the liveness hint (live libp2p connection?)
-        // so the consumer prefers connected providers and failover is the exception. All
-        // records here are already H1/PEX-verified, so we never surface an unverified candidate.
-        let peers = discovered_from_records(state, &pending.records);
+        let fresh = settle_discover(state, &pending);
         // C11: remember this successful discover so the next request for the same model can
         // answer from `known_peers` without a fresh get_providers round-trip. Only cache a
         // non-empty result — an empty one has nothing to serve and should re-query.
-        if !peers.is_empty() {
+        if fresh && !peers.is_empty() {
             state.discover_cache.insert(
                 pending.model_id.clone(),
                 (now_unix_ms(), state.net_generation.load(std::sync::atomic::Ordering::Relaxed)),
             );
         }
-        let _ = pending.reply.send(Ok(peers));
+    }
+}
+
+/// A re-publish of our provider records for LAN peers that just subscribed: due a moment after the
+/// first one (so its gossip subscription is in place), at most once per [`LAN_ANNOUNCE_EVERY`].
+#[derive(Debug, Default)]
+struct LanAnnounce {
+    due: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+}
+
+/// How long after a LAN peer subscribes our records go out.
+const LAN_ANNOUNCE_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+/// At most one LAN re-publish per this long (a burst of joins is one re-publish).
+const LAN_ANNOUNCE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn note_lan_subscriber(a: &mut LanAnnounce, now: std::time::Instant) {
+    if a.due.is_some() {
+        return;
+    }
+    let earliest = a.last.map_or(now, |l| l + LAN_ANNOUNCE_EVERY);
+    a.due = Some(earliest.max(now + LAN_ANNOUNCE_DELAY));
+}
+
+/// Whether the LAN re-publish is due at `now` (it then counts as done).
+fn lan_announce_due(a: &mut LanAnnounce, now: std::time::Instant) -> bool {
+    match a.due {
+        Some(d) if now >= d => {
+            a.due = None;
+            a.last = Some(now);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Re-publish this node's own provider records on the gossip topic (a LAN peer just joined).
+fn drive_lan_announce(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &mut LoopState) {
+    if !lan_announce_due(&mut state.lan_announce, std::time::Instant::now()) {
+        return;
+    }
+    let own: Vec<PeerRecord> =
+        state.known_peers.values().filter(|r| r.libp2p_peer_id == state.local_libp2p).cloned().collect();
+    if !own.is_empty() {
+        debug!(n = own.len(), "provider_pex: re-publishing for a LAN peer that just joined");
+    }
+    for record in &own {
+        publish_provider_pex(swarm, record);
+    }
+}
+
+/// The discover tick: answer waiting callers whose retry deadline has passed or whose lookup
+/// learned something by gossip since ([`install_known_peer`] merges into running lookups).
+fn drive_discover_waiters(state: &mut LoopState) {
+    let ids: Vec<kad::QueryId> =
+        state.pending_discovers.iter().filter(|(_, p)| !p.waiters.is_empty()).map(|(id, _)| *id).collect();
+    for id in ids {
+        maybe_reply_discover(state, id);
     }
 }
 
@@ -4283,6 +5681,7 @@ fn reversal_candidate_addrs(
         .filter(|a| !a.to_string().contains("p2p-circuit"))
         .filter(|a| ipv6_capable || !is_ipv6_multiaddr(a))
         .filter(|a| is_globally_reachable_addr(a))
+        .take(MAX_IDENTIFY_DIAL_ADDRS)
         .cloned()
         .collect()
 }
@@ -4401,15 +5800,9 @@ fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<String> {
     None
 }
 
-/// Extract an IP string from a multiaddr string representation.
-/// Parses `/ip4/1.2.3.4/...` or `/ip6/::1/...` without requiring
-/// a full Multiaddr parse (which can fail on partial addresses).
-/// The most identify listen addresses taken from one peer (a peer may list any number).
-const MAX_IDENTIFY_ADDRS: usize = 32;
-
 /// An address on this machine or a private network: loopback, unspecified, RFC 1918, CGNAT
 /// (100.64/10), link-local, IPv6 unique-local.
-fn is_non_global_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_non_global_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_loopback()
@@ -4432,6 +5825,108 @@ fn is_non_global_ip(ip: std::net::IpAddr) -> bool {
 /// Whether a connection (by its remote address) is over loopback or a private network, not a relay.
 fn is_local_link(addr_str: &str, ip: Option<&str>) -> bool {
     !addr_str.contains("p2p-circuit") && ip.and_then(|i| i.parse::<std::net::IpAddr>().ok()).is_some_and(is_non_global_ip)
+}
+
+/// Circuit addresses a peer's identify may add to the routing table (per peer, at most).
+const MAX_IDENTIFY_CIRCUIT_ADDRS: usize = 8;
+/// A trusted relay's own addresses taken from its identify (per relay, at most).
+const MAX_RELAY_SELF_ADDRS: usize = 16;
+/// Direct addresses kept from a peer's identify for our own dials to it (per peer, at most).
+const MAX_IDENTIFY_DIAL_ADDRS: usize = 4;
+/// Claimed IPv6 QUIC addresses dialled per hole-punch attempt (per peer, at most).
+const MAX_HOLEPUNCH_V6_ADDRS: usize = 2;
+
+/// The part of a peer's identify that goes into the routing table: its circuit addresses through a
+/// relay we use (the D-S5 check signed records go through), so a peer behind a home router stays
+/// reachable. Nothing direct: Kademlia lists a directly reachable peer itself after dialling it.
+fn identify_routing_addrs(
+    listen_addrs: &[Multiaddr],
+    peer: &PeerId,
+    trusted_relays: &crate::relay::TrustedRelays,
+    ipv6_capable: bool,
+) -> Vec<Multiaddr> {
+    let mut out: Vec<Multiaddr> = Vec::new();
+    for a in listen_addrs.iter().filter(|a| ipv6_capable || !is_ipv6_multiaddr(a)) {
+        if let Some(ma) = crate::relay::safe_injectable_circuit_addr(&a.to_string(), peer, trusted_relays) {
+            if !out.contains(&ma) {
+                out.push(ma);
+            }
+        }
+        if out.len() >= MAX_IDENTIFY_CIRCUIT_ADDRS {
+            break;
+        }
+    }
+    out
+}
+
+/// The direct addresses from a peer's identify kept for our own dials to it: only on the IP the
+/// connection really comes from (`conn_addr`; none for a relayed one), so a peer can only point at
+/// itself, and only admissible ones (a LAN peer's LAN address is fine for a LAN dial).
+fn identify_dial_addrs(
+    listen_addrs: &[Multiaddr],
+    conn_addr: Option<&Multiaddr>,
+    local_link: bool,
+    ipv6_capable: bool,
+) -> Vec<Multiaddr> {
+    let Some(conn_ip) = conn_addr.and_then(multiaddr_ip) else { return Vec::new() };
+    listen_addrs
+        .iter()
+        .filter(|a| !a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)))
+        .filter(|a| ipv6_capable || !is_ipv6_multiaddr(a))
+        .filter(|a| identify_addr_admissible(a, local_link))
+        .filter(|a| multiaddr_ip(a) == Some(conn_ip))
+        .take(MAX_IDENTIFY_DIAL_ADDRS)
+        .cloned()
+        .collect()
+}
+
+/// A peer's claimed IPv6 QUIC addresses worth a hole-punch dial: global unicast only (no loopback,
+/// unique-local, link-local, multicast, documentation or IPv4-mapped), never a circuit, at most
+/// [`MAX_HOLEPUNCH_V6_ADDRS`].
+fn holepunch_v6_addrs(listen_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    listen_addrs
+        .iter()
+        .filter(|a| {
+            let mut v6 = None;
+            let mut quic = false;
+            for p in a.iter() {
+                match p {
+                    Protocol::Ip6(ip) => v6 = Some(ip),
+                    Protocol::QuicV1 => quic = true,
+                    Protocol::P2pCircuit | Protocol::Ip4(_) => return false,
+                    _ => {}
+                }
+            }
+            quic && v6.is_some_and(|ip| {
+                let seg = ip.segments();
+                !(ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || ip.to_ipv4_mapped().is_some()
+                    || (seg[0] & 0xfe00) == 0xfc00
+                    || (seg[0] & 0xffc0) == 0xfe80
+                    || (seg[0] == 0x2001 && seg[1] == 0x0db8))
+            })
+        })
+        .take(MAX_HOLEPUNCH_V6_ADDRS)
+        .cloned()
+        .collect()
+}
+
+/// A hole-punch dial to a claimed address that only counts if this very peer answers.
+fn holepunch_dial_opts(peer: PeerId, addr: Multiaddr) -> libp2p::swarm::dial_opts::DialOpts {
+    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+    DialOpts::peer_id(peer).addresses(vec![addr]).condition(PeerCondition::Always).build()
+}
+
+/// The IP in a multiaddr, if it has one.
+fn multiaddr_ip(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.into()),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.into()),
+        _ => None,
+    })
 }
 
 /// Whether a peer's identify listen address goes into the routing table, where other nodes learn it
@@ -4457,6 +5952,9 @@ fn identify_addr_admissible(addr: &Multiaddr, local_link: bool) -> bool {
     }
 }
 
+/// Extract an IP string from a multiaddr string representation.
+/// Parses `/ip4/1.2.3.4/...` or `/ip6/::1/...` without requiring
+/// a full Multiaddr parse (which can fail on partial addresses).
 fn extract_ip_from_multiaddr_str(addr_str: &str) -> Option<String> {
     for segment in addr_str.split('/') {
         // The IP follows "/ip4/" or "/ip6/" — grab the next segment.
@@ -4572,11 +6070,13 @@ fn handle_grpc_proxy_event(
         }
         request_response::Event::InboundFailure { error, request_id, .. } => {
             warn!(?error, "proxy inbound failure");
+            state.responses_writing.remove(&request_id);
             if let Some((f, _, _)) = state.pending_sent.remove(&request_id) {
                 f(false);
             }
         }
         request_response::Event::ResponseSent { request_id, .. } => {
+            state.responses_writing.remove(&request_id);
             if let Some((f, _, _)) = state.pending_sent.remove(&request_id) {
                 f(true);
             }
@@ -4648,6 +6148,12 @@ fn handle_proxy_forward(
             .grpc_proxy
             .send_request(&peer_id, ProxyRequest(data));
         state.pending_proxy.insert(req_id, reply);
+        // A4: the provider dials us back over IPv6 once it accepts this request; punching toward
+        // it now too means both ends' firewalls see outbound packets at the same time, which is
+        // what a hole punch through two stateful firewalls needs (its rounds were one-sided).
+        if direct_conns == 0 {
+            pursue_v6_holepunch_debounced(swarm, state, peer_id, "request");
+        }
     } else {
         info!(%peer_id, "proxy_forward: peer not connected, dialing via relay");
         // Finding A: dial the peer ONCE via every bootstrap-relay circuit as a
@@ -4665,6 +6171,14 @@ fn handle_proxy_forward(
                   "proxy_forward: pending_relay_forwards at cap — shedding");
             let _ = reply.send(Err("proxy_forward: relay queue full".into()));
             return;
+        }
+        if let Some(b) = state.relay_dial_backoff.get(&peer_id).filter(|b| b.until > std::time::Instant::now()) {
+            // A dial to it just failed: answer as that dial did, without spending relay budget.
+            if state.dials_in_flight.get(&peer_id).map_or(true, |d| d.is_empty()) {
+                debug!(%peer_id, "proxy_forward: peer in relayed-dial back-off — failing at once");
+                let _ = reply.send(Err(format!("proxy_forward: {}", b.why)));
+                return;
+            }
         }
         let circuit_addrs = relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable);
         match swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer_id, circuit_addrs)) {
@@ -4816,6 +6330,12 @@ fn handle_proxy_forward_no_wait(
                   "proxy_forward_no_wait: pending_relay_forwards at cap — dropping");
             return;
         }
+        if state.relay_dial_backoff.get(&peer_id).is_some_and(|b| b.until > std::time::Instant::now())
+            && state.dials_in_flight.get(&peer_id).map_or(true, |d| d.is_empty())
+        {
+            debug!(%peer_id, "proxy_forward_no_wait: peer in relayed-dial back-off — dropped");
+            return;
+        }
         match swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer_id, relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable))) {
             Ok(()) => {
                 let (dummy_tx, _dummy_rx) = oneshot::channel();
@@ -4876,39 +6396,169 @@ fn handle_open_proxy(
     });
 }
 
+/// Dial a peer's claimed IPv6 QUIC addresses (stored from its identify) to get a v6 direct
+/// connection, unless we already hold one. Callers decide whether there's a reason to:
+///
+/// * `identify`: the peer is a provider we know (consumer side);
+/// * `serve`: the agent accepted a serve request from the peer, every gate passed (provider side;
+///   [`SwarmCommand::ServeAccepted`]). Home routers commonly drop unsolicited inbound v6 (ACT does),
+///   so a consumer's dials alone never reach a provider behind one; the provider's own dial is what
+///   opens its firewall to the consumer. Measured 29 Oct, ACT Asus: only the other side sending, 0
+///   of 14 packets arrive; both, they pass within 0.33 s. Only an accepted serve counts — not any
+///   bytes a connected peer sends (review 2026-10-29);
+/// * `record`: a provider's record arrived after its identify, so the identify trigger missed it.
+///
+/// The dial names the peer, so only that peer can count as answering (the packets go out regardless);
+/// public relays are skipped; nothing without working IPv6; at most `MAX_QUIC_HOLEPUNCH_ATTEMPTS`
+/// rounds per peer until it disconnects, a v6 direct forms, or the network changes (`rebootstrap`
+/// clears the counts), and at most [`MAX_PUNCH_ROUNDS_PER_MINUTE`] rounds node-wide.
+fn pursue_v6_holepunch(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    peer_id: PeerId,
+    trigger: &'static str,
+) {
+    let targets = v6_holepunch_targets(state, peer_id);
+    dial_v6_targets(swarm, state, peer_id, targets, trigger);
+}
+
+fn dial_v6_targets(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    peer_id: PeerId,
+    targets: Vec<Multiaddr>,
+    trigger: &'static str,
+) {
+    for addr in targets {
+        let ma = addr.clone();
+        // The peer's id is required: whoever answers at a claimed address must be this peer. Not
+        // counted as a dial in flight: a punch failing says nothing about whether the peer can be
+        // reached, so it mustn't keep a queued forward waiting for its outcome (A4 review).
+        match swarm.dial(holepunch_dial_opts(peer_id, addr)) {
+            Ok(()) => {
+                state.quic_v6_holepunch_dials += 1;
+                debug!(%peer_id, %ma, trigger, "auto_quic_holepunch_dial");
+            }
+            Err(e) => debug!(%peer_id, %ma, %e, trigger, "auto_quic_holepunch_dial_failed"),
+        }
+    }
+}
+
+/// F7 / #43-W1: punch rounds per peer. The cap was 3; raised to 8 for the v6 case: a
+/// stateful-firewall v6 punch is reliable once correctly timed (no port translation, unlike v4
+/// CGNAT), so a firewalled-v6 peer shouldn't be shelved after 3 uncoordinated misses.
+const MAX_QUIC_HOLEPUNCH_ATTEMPTS: u32 = 8;
+
+/// Node-wide cap on IPv6 hole-punch rounds a minute (each dials at most
+/// [`MAX_HOLEPUNCH_V6_ADDRS`] addresses), whatever the trigger: these dial addresses peers claim, so
+/// many peers (or many peer ids) can't turn us into a packet source at their command.
+const MAX_PUNCH_ROUNDS_PER_MINUTE: u32 = 30;
+
+/// Store `peer`'s claimed IPv6 QUIC addresses for hole-punching, leaving out any another connected
+/// peer already claims (one host can't honestly be two peers at one address and port; dialling such
+/// an address for each of many peer ids would multiply the packets sent to it). Returns whether any
+/// were stored. The trade-off: the first connected claimant keeps an address, so a peer claiming a
+/// host's address first blocks punches toward that host while it stays connected, and a node that
+/// restarts with a new peer id while its old connection lingers gets none until it re-identifies.
+fn store_claimed_v6_addrs(state: &mut LoopState, peer: PeerId, addrs: &[Multiaddr]) -> bool {
+    let fresh: Vec<Multiaddr> = addrs
+        .iter()
+        .filter(|a| !state.peer_quic_addrs.iter().any(|(p, held)| *p != peer && held.contains(a)))
+        .cloned()
+        .collect();
+    if fresh.is_empty() {
+        return false;
+    }
+    state.peer_quic_addrs.insert(peer, fresh);
+    true
+}
+
+/// The addresses [`pursue_v6_holepunch`] dials now (counting the round), or none.
+fn v6_holepunch_targets(state: &mut LoopState, peer_id: PeerId) -> Vec<Multiaddr> {
+    // F-9: no working IPv6 here (re-probed on every rebootstrap), so nothing to dial.
+    if !state.ipv6_capable {
+        return Vec::new();
+    }
+    let Some(addrs) = state.peer_quic_addrs.get(&peer_id).filter(|a| !a.is_empty()).cloned() else {
+        return Vec::new();
+    };
+    // v6-first: a v4 QUIC direct doesn't count as done.
+    if !should_pursue_v6_upgrade(state.peer_connections.get(&peer_id)) {
+        state.quic_holepunch_attempts.remove(&peer_id);
+        return Vec::new();
+    }
+    // F7: public bootstrap relays are reachable as they are; punching them churned connections
+    // on UDP-hostile paths.
+    let is_relay = addrs.iter().any(|a| {
+        a.iter().any(|p| match p {
+            libp2p::multiaddr::Protocol::Ip6(ip) => crate::relay::is_bootstrap_relay_ip(&ip.to_string()),
+            libp2p::multiaddr::Protocol::Ip4(ip) => crate::relay::is_bootstrap_relay_ip(&ip.to_string()),
+            _ => false,
+        })
+    });
+    if is_relay {
+        debug!(%peer_id, "auto_quic_holepunch_skip: public relay");
+        return Vec::new();
+    }
+    let attempts = state.quic_holepunch_attempts.entry(peer_id).or_insert(0);
+    if *attempts >= MAX_QUIC_HOLEPUNCH_ATTEMPTS {
+        debug!(%peer_id, attempts = *attempts, "auto_quic_holepunch_skip: backed off");
+        return Vec::new();
+    }
+    let now = std::time::Instant::now();
+    if now.duration_since(state.punch_window.0) >= std::time::Duration::from_secs(60) {
+        state.punch_window = (now, 0);
+    }
+    if state.punch_window.1 >= MAX_PUNCH_ROUNDS_PER_MINUTE {
+        debug!(%peer_id, "auto_quic_holepunch_skip: node-wide budget spent");
+        return Vec::new();
+    }
+    state.punch_window.1 += 1;
+    *attempts += 1;
+    addrs
+}
+
+/// [`pursue_v6_holepunch`] for the triggers that can fire in bursts (every request; every record
+/// refresh): at most once per [`REPUNCH_DEBOUNCE`] per peer, shared with `TriggerRepunch`.
+fn pursue_v6_holepunch_debounced(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    peer_id: PeerId,
+    trigger: &'static str,
+) {
+    let targets = debounced_v6_targets(state, peer_id, std::time::Instant::now());
+    dial_v6_targets(swarm, state, peer_id, targets, trigger);
+}
+
+/// [`v6_holepunch_targets`] for a debounced trigger at `now`: none while the peer's wait runs; the
+/// wait starts only when a punch actually goes out (a refused one — budget, cap, no IPv6 — doesn't
+/// use it up).
+fn debounced_v6_targets(state: &mut LoopState, peer_id: PeerId, now: std::time::Instant) -> Vec<Multiaddr> {
+    if !state.peer_quic_addrs.contains_key(&peer_id)
+        || !should_pursue_v6_upgrade(state.peer_connections.get(&peer_id))
+        || state.last_repunch.get(&peer_id).is_some_and(|t| now.duration_since(*t) < REPUNCH_DEBOUNCE)
+    {
+        return Vec::new();
+    }
+    let targets = v6_holepunch_targets(state, peer_id);
+    if !targets.is_empty() {
+        state.last_repunch.insert(peer_id, now);
+    }
+    targets
+}
+
 // ── Fix 4: TriggerRepunch with debounce ────────────────────────────────
 
+/// A re-punch asked for (the agent's `TriggerRepunch`, or a forward that just rode a new relay
+/// connection): the same guards as every other punch (working IPv6, no direct path yet, the
+/// per-peer cap, the node-wide budget, the debounce). It used to dial the peer's claimed addresses
+/// past all of them (A4 review 2026-10-29).
 fn handle_trigger_repunch(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     peer_id: PeerId,
     state: &mut LoopState,
 ) {
-    if let Some(last) = state.last_repunch.get(&peer_id) {
-        if last.elapsed() < REPUNCH_DEBOUNCE {
-            debug!(%peer_id, "repunch_debounced: skipping (last was {}s ago)",
-                last.elapsed().as_secs());
-            return;
-        }
-    }
-    state.last_repunch.insert(peer_id, std::time::Instant::now());
-
-    let addrs = match state.peer_quic_addrs.get(&peer_id) {
-        Some(addrs) if !addrs.is_empty() => addrs.clone(),
-        _ => {
-            debug!(%peer_id, "repunch: no QUIC IPv6 addresses cached for peer");
-            return;
-        }
-    };
-
-    info!(%peer_id, count = addrs.len(), "repunch: re-dialing QUIC IPv6 addresses");
-    for addr in addrs {
-        use libp2p::swarm::dial_opts::DialOpts;
-        let ma = addr.clone();
-        match swarm.dial_tracked(&mut state.dials_in_flight, DialOpts::unknown_peer_id().address(addr).build()) {
-            Ok(()) => info!(%ma, "repunch_dial_issued"),
-            Err(e) => debug!(%ma, %e, "repunch_dial_failed"),
-        }
-    }
+    pursue_v6_holepunch_debounced(swarm, state, peer_id, "repunch");
 }
 
 // ── CP-3: Ring event handling + re-injection ─────────────────────────
@@ -4940,6 +6590,441 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The relays' circuits as a reservation on EU reports them after a roam (28/29 Oct logs): one
+    /// per transport, all through the same relay.
+    fn eu_circuits(me: &PeerId) -> Vec<Multiaddr> {
+        let eu = "12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT";
+        ["/ip4/172.105.69.49/tcp/4001", "/ip4/172.105.69.49/udp/4001/quic-v1", "/ip6/2a01:7e01::2000:84ff:fec5:4520/tcp/4001", "/ip6/2a01:7e01::2000:84ff:fec5:4520/udp/4001/quic-v1"]
+            .iter()
+            .map(|a| format!("{a}/p2p/{eu}/p2p-circuit/p2p/{me}").parse().unwrap())
+            .collect()
+    }
+
+    fn eu() -> PeerId {
+        "12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT".parse().unwrap()
+    }
+
+    #[test]
+    fn startup_tcp_dials_wait_for_a_listen_address_of_their_family() {
+        let a = PeerId::random();
+        let b = PeerId::random();
+        let v4: Multiaddr = "/ip4/45.79.190.172/tcp/4001".parse().unwrap();
+        let v6: Multiaddr = "/ip6/2600:3c03::1/tcp/4001".parse().unwrap();
+        let dns: Multiaddr = "/dns/bootstrap-us.openhydra.co/tcp/4001".parse().unwrap();
+        let lo: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let mut pending = vec![(a, v4.clone()), (a, v6.clone()), (b, dns.clone()), (b, lo.clone())];
+        // Loopback listen addresses serve only loopback dials; QUIC and circuit ones none.
+        assert_eq!(startup_dials_ready(&mut pending, &"/ip6/::1/tcp/4987".parse().unwrap()), vec![]);
+        assert_eq!(startup_dials_ready(&mut pending, &"/ip4/192.168.0.3/udp/4987/quic-v1".parse().unwrap()), vec![]);
+        assert_eq!(startup_dials_ready(&mut pending, &"/ip4/127.0.0.1/tcp/4987".parse().unwrap()), vec![(b, lo)]);
+        // The v4 interface address: v4 and the DNS name go, v6 waits for its own.
+        assert_eq!(startup_dials_ready(&mut pending, &"/ip4/192.168.0.3/tcp/4987".parse().unwrap()), vec![(a, v4), (b, dns)]);
+        assert_eq!(pending, vec![(a, v6.clone())]);
+        assert_eq!(startup_dials_ready(&mut pending, &"/ip6/2406:7400:56::3/tcp/4987".parse().unwrap()), vec![(a, v6)]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_rebootstrap_skips_bootstraps_already_connected_on_that_transport_since_the_last_move() {
+        let mut state = LoopState::new();
+        let a = PeerId::random();
+        let b = PeerId::random();
+        let a4: Multiaddr = "/ip4/45.79.190.172/tcp/4001".parse().unwrap();
+        let a6: Multiaddr = "/ip6/2600:3c03::1/tcp/4001".parse().unwrap();
+        let b4: Multiaddr = "/dns4/bootstrap-eu.openhydra.co/tcp/4001".parse().unwrap();
+        state.bootstrap_peers = vec![(a, a4.clone()), (a, a6.clone()), (b, b4.clone())];
+        let conn = libp2p::swarm::ConnectionId::new_unchecked;
+        let t0 = std::time::Instant::now();
+        // a over v4 TCP; b only over v4 QUIC (another transport); a over v6 QUIC (another transport).
+        state.conn_remote_addrs.insert(conn(1), (a, "/ip4/45.79.190.172/tcp/4001".parse().unwrap(), t0));
+        state.conn_remote_addrs.insert(conn(2), (b, "/ip4/172.105.69.49/udp/4001/quic-v1".parse().unwrap(), t0));
+        state.conn_remote_addrs.insert(conn(3), (a, "/ip6/2600:3c03::1/udp/4001/quic-v1".parse().unwrap(), t0));
+        assert_eq!(bootstrap_redials(&state), vec![(a, a6.clone()), (b, b4.clone())]);
+        // A /dns4 address is connected once a v4 TCP connection to that peer is.
+        state.conn_remote_addrs.insert(conn(4), (b, "/ip4/172.105.69.49/tcp/4001".parse().unwrap(), t0));
+        assert_eq!(bootstrap_redials(&state), vec![(a, a6.clone())]);
+        // After we lost an interface address, older connections don't count: dial everything.
+        state.last_addr_loss = Some(t0 + std::time::Duration::from_secs(1));
+        assert_eq!(bootstrap_redials(&state).len(), 3);
+        // A connection made since then does.
+        state.conn_remote_addrs.insert(conn(5), (a, "/ip4/45.79.190.172/tcp/4001".parse().unwrap(), t0 + std::time::Duration::from_secs(2)));
+        assert_eq!(bootstrap_redials(&state), vec![(a, a6), (b, b4)]);
+    }
+
+    #[test]
+    fn the_first_reservation_and_gossip_peer_re_announce_once_and_only_after_an_announce() {
+        let mut seen = false;
+        assert!(!first_time(&mut seen, false), "nothing announced yet: nothing to repeat");
+        assert!(!first_time(&mut seen, true), "only the first time counts");
+        let mut seen = false;
+        assert!(first_time(&mut seen, true));
+        assert!(!first_time(&mut seen, true));
+        // The bump is what makes the provider re-announce.
+        let state = LoopState::new();
+        let before = state.net_generation.load(std::sync::atomic::Ordering::Relaxed);
+        bump_net_generation(&state);
+        assert_eq!(state.net_generation.load(std::sync::atomic::Ordering::Relaxed), before + 1);
+    }
+
+    #[test]
+    fn a_server_whose_last_direct_address_expires_goes_back_to_client() {
+        let mut state = LoopState::new();
+        let upnp: Multiaddr = "/ip4/49.207.231.148/tcp/4001".parse().unwrap();
+        let circuit: Multiaddr = "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit".parse().unwrap();
+        state.kad_server_mode = true;
+        state.external_addrs = vec![upnp.clone(), circuit.clone()];
+        assert!(!should_demote_to_client(&state), "still reachable at the mapping");
+        state.external_addrs.retain(|a| a != &upnp); // the lease lapsed
+        assert!(should_demote_to_client(&state), "only a circuit left");
+        state.kad_server_mode = false;
+        assert!(!should_demote_to_client(&state), "a client stays one");
+    }
+
+    #[test]
+    fn only_losing_the_network_counts_as_an_address_loss() {
+        let ma = |s: &str| -> Multiaddr { s.parse().unwrap() };
+        let wifi4 = ma("/ip4/192.168.0.4/tcp/4993");
+        let tmp6 = ma("/ip6/2406:7400:56:9e97:f1ce:9282:52ec:c9f0/udp/4993/quic-v1");
+        let other6 = ma("/ip6/2406:7400:56:9e97:3abd:5d47:eb85:335f/tcp/4993");
+        let docker = ma("/ip4/172.17.0.1/tcp/4993");
+        let virbr = ma("/ip4/192.168.122.1/tcp/4993");
+        let lo = ma("/ip4/127.0.0.1/tcp/4993");
+        // Leaving the Wi-Fi: only virtual and loopback addresses are left.
+        assert!(addr_loss_leaves_network(&wifi4, &[docker.clone(), virbr.clone(), lo.clone(), other6.clone()]));
+        // Ethernet still up next to it: not a move.
+        assert!(!addr_loss_leaves_network(&wifi4, &[ma("/ip4/10.0.0.7/tcp/4993")]));
+        // The Wi-Fi's own other listen addresses (its QUIC one) don't keep it.
+        assert!(addr_loss_leaves_network(&wifi4, &[ma("/ip4/192.168.0.4/udp/4993/quic-v1")]));
+        // A container bridge or a VM network going: never.
+        assert!(!addr_loss_leaves_network(&docker, &[]));
+        assert!(!addr_loss_leaves_network(&virbr, &[]));
+        assert!(!addr_loss_leaves_network(&ma("/ip4/100.101.1.2/tcp/1"), &[]));
+        // An IPv6 temporary address rotating (another one in its /64 stays): not a move; the last
+        // one in the /64 going: a move. Link-local and loopback never count.
+        assert!(!addr_loss_leaves_network(&tmp6, &[other6.clone(), wifi4.clone()]));
+        assert!(addr_loss_leaves_network(&tmp6, &[ma("/ip6/2401:4900:c907:8361::4/tcp/4993")]));
+        assert!(!addr_loss_leaves_network(&ma("/ip6/fe80::1/tcp/4993"), &[]));
+        assert!(!addr_loss_leaves_network(&lo, &[]));
+    }
+
+    #[test]
+    fn a_held_reservation_makes_one_ipv6_quic_dial_to_its_relay() {
+        let me = PeerId::random();
+        let circuits = eu_circuits(&me);
+        let mut state = LoopState::new();
+        state.ipv6_capable = true;
+        let listener = libp2p::core::transport::ListenerId::next();
+        state.relay_listeners.insert(listener, eu());
+        let now = std::time::Instant::now();
+        let want: Multiaddr = "/ip6/2a01:7e01::2000:84ff:fec5:4520/udp/4001/quic-v1/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT".parse().unwrap();
+        // Only the relay's IPv6 QUIC circuit names an address to dial; v4 and TCP ones don't.
+        for c in &circuits[..3] {
+            assert_eq!(relay_v6_quic_dial(&state, listener, c, now), None, "{c}");
+        }
+        assert_eq!(relay_v6_quic_dial(&state, listener, &circuits[3], now), Some((eu(), want.clone())));
+        // A non-global IPv6 relay address is never dialled.
+        let ula: Multiaddr = format!("/ip6/fd00::1/udp/4001/quic-v1/p2p/{}/p2p-circuit/p2p/{me}", eu()).parse().unwrap();
+        assert_eq!(relay_v6_quic_dial(&state, listener, &ula, now), None);
+        // Not one of our reservation listeners (or a listener on another relay): nothing.
+        assert_eq!(relay_v6_quic_dial(&state, libp2p::core::transport::ListenerId::next(), &circuits[3], now), None);
+        state.relay_listeners.insert(listener, PeerId::random());
+        assert_eq!(relay_v6_quic_dial(&state, listener, &circuits[3], now), None);
+        state.relay_listeners.insert(listener, eu());
+        // No working IPv6 here: nothing.
+        state.ipv6_capable = false;
+        assert_eq!(relay_v6_quic_dial(&state, listener, &circuits[3], now), None);
+        state.ipv6_capable = true;
+        // Dialled recently: not again until RELAY_V6_QUIC_REDIAL has passed.
+        state.relay_v6_quic_dialled.insert(eu(), now);
+        assert_eq!(relay_v6_quic_dial(&state, listener, &circuits[3], now + std::time::Duration::from_secs(60)), None);
+        assert!(relay_v6_quic_dial(&state, listener, &circuits[3], now + RELAY_V6_QUIC_REDIAL).is_some());
+        // Already connected to it over IPv6 QUIC: nothing.
+        state.relay_v6_quic_conns.insert(libp2p::swarm::ConnectionId::new_unchecked(7), eu());
+        assert_eq!(relay_v6_quic_dial(&state, listener, &circuits[3], now + RELAY_V6_QUIC_REDIAL), None);
+        assert!(is_v6_quic(&"/ip6/2a01:7e01::1/udp/4001/quic-v1".parse().unwrap()));
+        assert!(!is_v6_quic(&"/ip6/2a01:7e01::1/tcp/4001".parse().unwrap()));
+        assert!(!is_v6_quic(&"/ip4/1.2.3.4/udp/4001/quic-v1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_circuit_names_its_relay_and_the_circuit_to_reserve_at() {
+        let me = PeerId::random();
+        let circuits = eu_circuits(&me);
+        assert!(circuits.iter().all(|c| circuit_relay(c) == Some(eu())));
+        assert_eq!(circuit_relay(&"/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT".parse().unwrap()), None);
+        let relays = crate::relay::relay_addrs(&[], crate::relay::PublicRelays::Auto);
+        // The configured address (v4 TCP, listed first) wins over whichever circuit closed.
+        let want: Multiaddr = "/ip4/172.105.69.49/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT/p2p-circuit".parse().unwrap();
+        assert_eq!(reservation_circuit(&relays, eu(), Some(&circuits[3])), Some(want));
+        // A relay we weren't configured with: the circuit as seen, without our own id.
+        let want: Multiaddr = "/ip6/2a01:7e01::2000:84ff:fec5:4520/udp/4001/quic-v1/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT/p2p-circuit".parse().unwrap();
+        assert_eq!(reservation_circuit(&[], eu(), Some(&circuits[3])), Some(want));
+    }
+
+    #[test]
+    fn a_lost_reservation_is_retried_once_per_relay_not_once_per_circuit() {
+        let me = PeerId::random();
+        let mut state = LoopState::new();
+        state.relays = crate::relay::relay_addrs(&[], crate::relay::PublicRelays::Auto);
+        let l = libp2p::core::transport::ListenerId::next();
+        state.relay_listeners.insert(l, eu());
+        // The reservation's listener closes reporting all four circuits (what a roam does).
+        let again = relays_to_re_reserve(&mut state, l, &eu_circuits(&me));
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!(again[0].0, eu());
+        assert!(state.relay_listeners.is_empty());
+        for (relay, circuit) in again {
+            schedule_reservation_retry(&mut state, relay, circuit.clone());
+            schedule_reservation_retry(&mut state, relay, circuit);
+        }
+        assert_eq!(state.relay_reservation_retries.len(), 1, "one entry per relay");
+        assert_eq!(state.relay_reservation_retries[&eu()].0, 2, "a second failure lengthens the wait");
+        // A circuit through the relay coming up ends the retries.
+        clear_reservation_retry(&mut state, &eu_circuits(&me)[1]);
+        assert!(state.relay_reservation_retries.is_empty());
+    }
+
+    #[test]
+    fn a_relay_connection_is_closed_for_failed_pings_only_when_it_runs_over_a_network_we_left() {
+        let mut state = LoopState::new();
+        state.relays = crate::relay::relay_addrs(&[], crate::relay::PublicRelays::Auto);
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let timeout = libp2p::ping::Failure::Timeout;
+        let conn = libp2p::swarm::ConnectionId::new_unchecked;
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        let ours: std::collections::HashSet<std::net::IpAddr> = [ip("192.168.0.4"), ip("2406:7400:56:9e97::4")].into();
+        // Behind NAT on ACT, a busy connection failing pings, nothing changed: never closed.
+        state.relay_conns.insert(conn(1), RelayConn { since: at(0), seen_as: Some((ip("49.207.231.148"), false)) });
+        for _ in 0..6 {
+            assert!(!relay_connection_dead(&mut state, eu(), conn(1), &timeout, &ours));
+        }
+        // A newer relay connection from the same /16 (a CGNAT pool handing out another address): still not.
+        state.relay_conns.insert(conn(2), RelayConn { since: at(10), seen_as: Some((ip("49.207.9.9"), false)) });
+        assert!(!relay_connection_dead(&mut state, eu(), conn(1), &timeout, &ours));
+        // After a move to Airtel a newer connection sees us from another /16: the old one goes, at
+        // the 2nd reported failure; the new one is never judged by the older one.
+        state.relay_ping_failures.clear();
+        state.relay_conns.insert(conn(3), RelayConn { since: at(100), seen_as: Some((ip("106.192.224.140"), false)) });
+        assert!(!relay_connection_dead(&mut state, eu(), conn(1), &timeout, &ours));
+        assert!(relay_connection_dead(&mut state, eu(), conn(1), &timeout, &ours));
+        for _ in 0..3 {
+            assert!(!relay_connection_dead(&mut state, eu(), conn(3), &timeout, &ours), "the newest isn't from an old network");
+        }
+        // No NAT: the relay saw one of our own addresses, and it's gone.
+        state.relay_conns.insert(conn(4), RelayConn { since: at(0), seen_as: Some((ip("2406:7400:56:9e97::4"), true)) });
+        assert!(!relay_connection_dead(&mut state, eu(), conn(4), &timeout, &ours));
+        assert!(!relay_connection_dead(&mut state, eu(), conn(4), &timeout, &ours), "still ours: not closed");
+        let left: std::collections::HashSet<std::net::IpAddr> = [ip("10.120.222.114"), ip("2401:4900:c907::4")].into();
+        assert!(relay_connection_dead(&mut state, eu(), conn(4), &timeout, &left));
+        // A connection whose relay hasn't said where it sees us, a peer without ping, a non-relay: never.
+        state.relay_conns.insert(conn(5), RelayConn { since: at(0), seen_as: None });
+        for _ in 0..3 {
+            assert!(!relay_connection_dead(&mut state, eu(), conn(5), &timeout, &left));
+            assert!(!relay_connection_dead(&mut state, eu(), conn(1), &libp2p::ping::Failure::Unsupported, &ours));
+            assert!(!relay_connection_dead(&mut state, PeerId::random(), conn(1), &timeout, &ours));
+        }
+    }
+
+    #[test]
+    fn an_idle_relayed_connection_is_closed_for_failed_pings_a_busy_one_never() {
+        let mut state = LoopState::new();
+        let p = PeerId::random();
+        let conn = libp2p::swarm::ConnectionId::new_unchecked;
+        let timeout = libp2p::ping::Failure::Timeout;
+        state.relayed_conns.insert(conn(1), p);
+        // Busy (a transfer under way): never, however many pings fail.
+        for _ in 0..5 {
+            assert!(!relayed_connection_dead(&mut state, p, conn(1), &timeout, true));
+        }
+        // Idle once it's done: closed at the next failure, the count already past the limit.
+        assert!(relayed_connection_dead(&mut state, p, conn(1), &timeout, false));
+        // A fresh idle one: the 2nd reported failure closes it; a success in between resets.
+        assert!(!relayed_connection_dead(&mut state, p, conn(1), &timeout, false));
+        state.relayed_ping_failures.remove(&conn(1)); // what a successful ping does
+        assert!(!relayed_connection_dead(&mut state, p, conn(1), &timeout, false));
+        assert!(relayed_connection_dead(&mut state, p, conn(1), &timeout, false));
+        // A direct connection, another peer's connection, a peer without ping: never.
+        for _ in 0..3 {
+            assert!(!relayed_connection_dead(&mut state, p, conn(2), &timeout, false));
+            assert!(!relayed_connection_dead(&mut state, PeerId::random(), conn(1), &timeout, false));
+            assert!(!relayed_connection_dead(&mut state, p, conn(1), &libp2p::ping::Failure::Unsupported, false));
+        }
+        // What counts as busy.
+        let never = |_: &request_response::OutboundRequestId| false;
+        assert!(!peer_busy(&state, p, never));
+        // (libp2p request ids can't be made in a test; a response being written and an inbound
+        // request are counted the same way as this.)
+        let (tx, _rx) = oneshot::channel();
+        state.pending_relay_forwards.push((p, vec![], tx, std::time::Instant::now()));
+        assert!(peer_busy(&state, p, never), "a forward queued for it");
+        assert!(!peer_busy(&state, PeerId::random(), never));
+    }
+
+    #[test]
+    fn a_failed_dial_names_only_the_addresses_it_tried() {
+        let a: Multiaddr = "/ip4/203.0.113.7/tcp/4001".parse().unwrap();
+        let b: Multiaddr = "/ip6/2001:db8::7/udp/4001/quic-v1".parse().unwrap();
+        let err = libp2p::swarm::DialError::Transport(vec![
+            (a.clone(), libp2p::TransportError::MultiaddrNotSupported(a.clone())),
+            (b.clone(), libp2p::TransportError::MultiaddrNotSupported(b.clone())),
+        ]);
+        assert_eq!(dial_error_addrs(&err), vec![a, b]);
+        assert!(dial_error_addrs(&libp2p::swarm::DialError::NoAddresses).is_empty(), "no address tried: none forgotten");
+        assert!(dial_error_addrs(&libp2p::swarm::DialError::Aborted).is_empty());
+    }
+
+    #[test]
+    fn relays_are_reserved_on_once_each_at_their_first_address() {
+        let mut state = LoopState::new();
+        state.relays = crate::relay::relay_addrs(&[], crate::relay::PublicRelays::Auto);
+        let want: std::collections::HashSet<PeerId> = crate::relay::relay_peer_ids(&state.relays).into_iter().collect();
+        assert_eq!(want.len(), 4);
+        let picks = relays_to_reserve(&state);
+        assert_eq!(picks.len(), want.len(), "one per relay, though each is listed twice: {picks:?}");
+        for (relay, circuit) in &picks {
+            let first = state.relays.iter().find(|a| a.iter().any(|p| p == libp2p::multiaddr::Protocol::P2p(*relay))).unwrap();
+            assert_eq!(circuit, &first.clone().with(libp2p::multiaddr::Protocol::P2pCircuit));
+        }
+        // A relay with a listener of ours (held or still being requested) isn't asked again.
+        state.relay_listeners.insert(libp2p::core::transport::ListenerId::next(), eu());
+        let picks = relays_to_reserve(&state);
+        assert_eq!(picks.len(), want.len() - 1);
+        assert!(picks.iter().all(|(r, _)| *r != eu()));
+    }
+
+    #[test]
+    fn a_due_retry_waits_while_a_listener_is_on_the_relay() {
+        let mut state = LoopState::new();
+        state.relays = crate::relay::relay_addrs(&[], crate::relay::PublicRelays::Auto);
+        let circuit = reservation_circuit(&state.relays, eu(), None).unwrap();
+        schedule_reservation_retry(&mut state, eu(), circuit.clone());
+        let later = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+        assert!(due_reservation_retries(&state, tokio::time::Instant::now()).is_empty(), "not yet");
+        assert_eq!(due_reservation_retries(&state, later), vec![(eu(), circuit)]);
+        let l = libp2p::core::transport::ListenerId::next();
+        state.relay_listeners.insert(l, eu());
+        assert!(due_reservation_retries(&state, later).is_empty(), "a request is out");
+        state.relay_listeners.remove(&l);
+        assert_eq!(due_reservation_retries(&state, later).len(), 1, "and it failed: retry");
+    }
+
+    #[test]
+    fn an_address_two_peers_claim_is_kept_for_neither_new_claimant() {
+        let mut state = LoopState::new();
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let shared: Multiaddr = "/ip6/2406:7400:56:9e97::1/udp/4001/quic-v1".parse().unwrap();
+        let own: Multiaddr = "/ip6/2406:7400:56:9e97::2/udp/4001/quic-v1".parse().unwrap();
+        assert!(store_claimed_v6_addrs(&mut state, a, &[shared.clone()]));
+        assert!(!store_claimed_v6_addrs(&mut state, b, &[shared.clone()]), "already a's");
+        assert!(store_claimed_v6_addrs(&mut state, b, &[shared.clone(), own.clone()]));
+        assert_eq!(state.peer_quic_addrs[&b], vec![own]);
+        assert!(store_claimed_v6_addrs(&mut state, a, &[shared.clone()]), "a re-identifying keeps its own");
+    }
+
+    #[test]
+    fn hole_punch_rounds_are_capped_node_wide_and_need_ipv6() {
+        let mut state = LoopState::new();
+        state.ipv6_capable = true;
+        let addr: Multiaddr = "/ip6/2406:7400:56:9e97::1/udp/4001/quic-v1".parse().unwrap();
+        let mut rounds = 0;
+        for i in 0..(MAX_PUNCH_ROUNDS_PER_MINUTE + 5) {
+            let p = PeerId::random();
+            let a: Multiaddr = format!("/ip6/2406:7400:56:9e97::{:x}/udp/4001/quic-v1", i + 10).parse().unwrap();
+            state.peer_quic_addrs.insert(p, vec![a]);
+            rounds += (!v6_holepunch_targets(&mut state, p).is_empty()) as u32;
+        }
+        assert_eq!(rounds, MAX_PUNCH_ROUNDS_PER_MINUTE);
+        // Without working IPv6, nothing at all.
+        let mut state = LoopState::new();
+        state.ipv6_capable = false;
+        let p = PeerId::random();
+        state.peer_quic_addrs.insert(p, vec![addr]);
+        assert!(v6_holepunch_targets(&mut state, p).is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_listener_closing_leaves_the_live_one_alone() {
+        let me = PeerId::random();
+        let mut state = LoopState::new();
+        state.relays = crate::relay::relay_addrs(&[], crate::relay::PublicRelays::Auto);
+        let (live, dup) = (libp2p::core::transport::ListenerId::next(), libp2p::core::transport::ListenerId::next());
+        state.relay_listeners.insert(live, eu());
+        state.relay_listeners.insert(dup, eu());
+        // libp2p keeps one reservation per relay and ends the other request, before any address.
+        assert!(relays_to_re_reserve(&mut state, dup, &[]).is_empty(), "the relay still has a listener");
+        assert!(relay_has_listener(&state, eu()));
+        // The live one closing later (its connection went) does need a retry.
+        assert_eq!(relays_to_re_reserve(&mut state, live, &eu_circuits(&me)).len(), 1);
+        // And a request refused before reporting an address is still retried, known by its id.
+        let refused = libp2p::core::transport::ListenerId::next();
+        state.relay_listeners.insert(refused, eu());
+        assert_eq!(relays_to_re_reserve(&mut state, refused, &[]).len(), 1);
+        // A non-relay listener closing is no business of this.
+        assert!(relays_to_re_reserve(&mut state, libp2p::core::transport::ListenerId::next(), &["/ip4/0.0.0.0/tcp/4001".parse().unwrap()]).is_empty());
+    }
+
+    #[test]
+    fn a_v6_punch_dials_stored_addresses_until_a_v6_direct_or_the_cap() {
+        let mut state = LoopState::new();
+        state.ipv6_capable = true;
+        let peer = PeerId::random();
+        assert!(v6_holepunch_targets(&mut state, peer).is_empty(), "no addresses stored");
+        let addr: Multiaddr = "/ip6/2406:7400:56:9e97::1/udp/4001/quic-v1".parse().unwrap();
+        state.peer_quic_addrs.insert(peer, vec![addr.clone()]);
+        for _ in 0..MAX_QUIC_HOLEPUNCH_ATTEMPTS {
+            assert_eq!(v6_holepunch_targets(&mut state, peer), vec![addr.clone()]);
+        }
+        assert!(v6_holepunch_targets(&mut state, peer).is_empty(), "backed off after the cap");
+        // A v4 QUIC direct isn't enough: with the count cleared, it still dials.
+        state.quic_holepunch_attempts.clear();
+        state.peer_connections.insert(peer, PeerConnectionInfo { quic_direct_v4: 1, ..Default::default() });
+        assert_eq!(v6_holepunch_targets(&mut state, peer), vec![addr.clone()], "a v4 direct doesn't stop it");
+        // A v6 one does, and clears the count.
+        state.peer_connections.insert(peer, PeerConnectionInfo { quic_direct_v6: 1, ..Default::default() });
+        assert!(v6_holepunch_targets(&mut state, peer).is_empty());
+        assert!(!state.quic_holepunch_attempts.contains_key(&peer), "count cleared");
+    }
+
+    #[test]
+    fn a_v6_punch_never_targets_a_public_relay() {
+        let mut state = LoopState::new();
+        state.ipv6_capable = true;
+        let peer = PeerId::random();
+        let ip = crate::relay::BOOTSTRAP_RELAY_IPS.iter().find(|ip| ip.contains(':')).expect("a v6 relay");
+        state.peer_quic_addrs.insert(peer, vec![format!("/ip6/{ip}/udp/4001/quic-v1").parse().unwrap()]);
+        assert!(v6_holepunch_targets(&mut state, peer).is_empty());
+    }
+
+    #[test]
+    fn a_burst_of_requests_punches_once_per_debounce() {
+        let mut state = LoopState::new();
+        state.ipv6_capable = true;
+        let peer = PeerId::random();
+        let t0 = std::time::Instant::now();
+        assert!(debounced_v6_targets(&mut state, peer, t0).is_empty(), "nothing stored: nothing to punch");
+        state.peer_quic_addrs.insert(peer, vec!["/ip6/2401:4900:c907::1/udp/4941/quic-v1".parse().unwrap()]);
+        assert_eq!(debounced_v6_targets(&mut state, peer, t0).len(), 1);
+        assert!(debounced_v6_targets(&mut state, peer, t0 + std::time::Duration::from_secs(1)).is_empty());
+        assert!(debounced_v6_targets(&mut state, peer, t0 + REPUNCH_DEBOUNCE - std::time::Duration::from_millis(1)).is_empty());
+        assert_eq!(debounced_v6_targets(&mut state, peer, t0 + REPUNCH_DEBOUNCE).len(), 1);
+        state.peer_connections.insert(peer, PeerConnectionInfo { quic_direct_v6: 1, ..Default::default() });
+        assert!(debounced_v6_targets(&mut state, peer, t0 + REPUNCH_DEBOUNCE * 3).is_empty(), "already have v6 direct");
+    }
+
+    #[test]
+    fn a_refused_punch_does_not_use_up_the_wait() {
+        let mut state = LoopState::new();
+        state.ipv6_capable = false;
+        let peer = PeerId::random();
+        state.peer_quic_addrs.insert(peer, vec!["/ip6/2401:4900:c907::1/udp/4941/quic-v1".parse().unwrap()]);
+        let t0 = std::time::Instant::now();
+        assert!(debounced_v6_targets(&mut state, peer, t0).is_empty(), "no IPv6: refused");
+        assert!(!state.last_repunch.contains_key(&peer));
+        state.ipv6_capable = true;
+        assert_eq!(debounced_v6_targets(&mut state, peer, t0 + std::time::Duration::from_secs(1)).len(), 1, "so a punch can go out at once");
+    }
 
     #[test]
     fn identify_addresses_cannot_point_other_nodes_at_their_own_network() {
@@ -4987,6 +7072,283 @@ mod tests {
 
         // Clock skew (now < stored) must not underflow into a false "fresh".
         assert!(discover_cache_fresh(&cache, "m", 999_999, 7, ttl)); // saturating_sub → 0 < ttl
+    }
+
+    #[test]
+    fn discover_answers_from_known_providers_unless_they_all_just_failed() {
+        use DiscoverMode::*;
+        assert_eq!(discover_mode(true, true, false), CacheHit);
+        assert_eq!(discover_mode(true, false, false), AnswerThenRefresh, "no wait on the DHT when providers are known");
+        assert_eq!(discover_mode(true, true, true), WaitForLookup, "the retry after every candidate failed looks in the DHT");
+        assert_eq!(discover_mode(true, false, true), WaitForLookup);
+        assert_eq!(discover_mode(false, false, false), WaitForLookup);
+        assert_eq!(discover_mode(false, true, false), WaitForLookup);
+    }
+
+    #[test]
+    fn a_retry_waits_for_new_information_or_its_deadline() {
+        use DiscoverKind::*;
+        let now = std::time::Instant::now();
+        let soon = Some(now + RETRY_SETTLE);
+        let late = Some(now - std::time::Duration::from_millis(1));
+        assert!(waiter_settled(Reply, false, 0, 1, 0, 0, None, now), "a caller with nothing known takes the first providers");
+        assert!(!waiter_settled(Reply, false, 0, 0, 0, 0, None, now));
+        assert!(!waiter_settled(Retry, false, 0, 2, 3, 3, soon, now), "the providers that just failed aren't an answer");
+        assert!(waiter_settled(Retry, false, 0, 2, 4, 3, soon, now), "a new provider, or a new address, is");
+        assert!(!waiter_settled(Retry, false, 1, 2, 4, 3, soon, now), "not with a record fetch outstanding");
+        assert!(waiter_settled(Retry, false, 1, 2, 3, 3, late, now), "the deadline answers whatever is outstanding");
+        for kind in [Reply, Retry] {
+            assert!(waiter_settled(kind, true, 0, 0, 0, 0, None, now), "a finished lookup answers everyone");
+        }
+    }
+
+    #[test]
+    fn a_lan_join_republishes_soon_and_a_burst_only_once() {
+        let t0 = std::time::Instant::now();
+        let mut a = LanAnnounce::default();
+        note_lan_subscriber(&mut a, t0);
+        assert!(!lan_announce_due(&mut a, t0), "not before the subscription settles");
+        assert!(lan_announce_due(&mut a, t0 + LAN_ANNOUNCE_DELAY));
+        // More joins right after: one more re-publish, not before LAN_ANNOUNCE_EVERY.
+        for ms in [100, 200, 300] {
+            note_lan_subscriber(&mut a, t0 + LAN_ANNOUNCE_DELAY + std::time::Duration::from_millis(ms));
+        }
+        assert!(!lan_announce_due(&mut a, t0 + LAN_ANNOUNCE_DELAY + std::time::Duration::from_secs(5)));
+        assert!(lan_announce_due(&mut a, t0 + LAN_ANNOUNCE_DELAY + LAN_ANNOUNCE_EVERY));
+        assert!(!lan_announce_due(&mut a, t0 + LAN_ANNOUNCE_DELAY + LAN_ANNOUNCE_EVERY * 2), "nothing new since");
+    }
+
+    fn rec_at(peer: &str, ms: u64, relay: &str) -> PeerRecord {
+        PeerRecord { libp2p_peer_id: peer.into(), model_id: "m".into(), updated_unix_ms: ms, relay_address: relay.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn the_newest_signed_record_wins_and_only_an_address_change_is_news() {
+        let now = 1_000_000;
+        let mut list = vec![rec_at("A", now - 10_000, "")];
+        assert_eq!(merge_record(&mut list, rec_at("A", now - 20_000, "/old"), now), Merge::Kept, "older");
+        assert_eq!(merge_record(&mut list, rec_at("A", now - 10_000, "/same-time"), now), Merge::Kept, "as old");
+        assert_eq!(
+            merge_record(&mut list, rec_at("A", now - 5_000, ""), now),
+            Merge::Replaced { address_changed: false },
+            "a republish with the same address"
+        );
+        assert_eq!(
+            merge_record(&mut list, rec_at("A", now - 1_000, "/ip4/1.2.3.4/tcp/4001/p2p/R/p2p-circuit"), now),
+            Merge::Replaced { address_changed: true },
+            "reachable through a relay now"
+        );
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].relay_address, "/ip4/1.2.3.4/tcp/4001/p2p/R/p2p-circuit");
+        assert_eq!(merge_record(&mut list, rec_at("A", now + MAX_RECORD_SKEW_MS + 1, "/future"), now), Merge::Kept, "dated too far ahead");
+        assert_eq!(merge_record(&mut list, rec_at("B", now, ""), now), Merge::Added);
+        assert_eq!(list.len(), 2);
+    }
+
+    /// GPU test 2026-10-29: records carried no time, and the reaper kept an unconnected provider
+    /// only by that time, so a consumer lost every provider it had only heard of over gossip a
+    /// minute later. It goes by when the record arrived now.
+    #[test]
+    fn reaper_keeps_a_gossip_learned_provider_for_its_ttl() {
+        let now = 10_000_000;
+        assert!(keep_known_peer(false, Some(now - 60_000), now), "heard a minute ago, never connected");
+        assert!(keep_known_peer(false, Some(now - KNOWN_PEER_TTL_MS + 1), now));
+        assert!(!keep_known_peer(false, Some(now - KNOWN_PEER_TTL_MS), now), "not heard of for the whole TTL");
+        assert!(!keep_known_peer(false, None, now));
+        assert!(keep_known_peer(true, None, now), "connected");
+    }
+
+    /// Review 2026-10-30: a replayed or re-forwarded copy of a provider's last record must neither
+    /// renew it (a dead provider would stay listed for ever) nor replace a newer one (a roamed
+    /// provider's old address would come back).
+    #[test]
+    fn provider_gone_needs_a_quorum_of_distinct_bootstraps() {
+        let mut pending = HashMap::new();
+        let (p, b1, b2) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let now = 1_000_000_000;
+        assert_eq!(note_provider_gone(&mut pending, p, b1, 50, 2, now, now), None);
+        assert_eq!(note_provider_gone(&mut pending, p, b1, 60, 2, now + 1, now + 1), None, "the same bootstrap twice is one report");
+        assert_eq!(note_provider_gone(&mut pending, p, b2, 40, 2, now + 2, now + 2), Some((60, now)), "newest record time named");
+        assert!(pending.is_empty());
+        // Reports older than the window don't count towards a later quorum.
+        assert_eq!(note_provider_gone(&mut pending, p, b1, 1, 2, now, now), None);
+        assert_eq!(note_provider_gone(&mut pending, p, b2, 1, 2, now + PROVIDER_GONE_MAX_AGE_SECS * 1000 + 1, now + PROVIDER_GONE_MAX_AGE_SECS * 1000 + 1), None);
+        // With one bootstrap configured, its report is enough.
+        assert_eq!(note_provider_gone(&mut HashMap::new(), p, b1, 7, 1, now, now), Some((7, now)));
+        // The cutoff is the earliest report's own time, not when it arrived (a replay arrives late).
+        let mut late = HashMap::new();
+        assert_eq!(note_provider_gone(&mut late, p, b1, 3, 2, now + 50_000, now + 50_000), None);
+        assert_eq!(note_provider_gone(&mut late, p, b2, 3, 2, now + 60_000, now), Some((3, now)));
+    }
+
+    #[test]
+    fn a_gone_provider_is_not_cached_again_from_a_stale_copy() {
+        let rec = |t: u64| PeerRecord { libp2p_peer_id: "P".into(), model_id: "m".into(), updated_unix_ms: t, ..Default::default() };
+        let mut gone = HashMap::new();
+        gone.insert("P".to_string(), (150u64, 1_000u64));
+        assert!(is_gone_record(&gone, &rec(150), 2_000), "the record the bootstraps saw");
+        assert!(!is_gone_record(&gone, &rec(0), 2_000), "undated: can't tell, never refused");
+        assert!(!is_gone_record(&gone, &rec(151), 2_000), "announced since: alive");
+        assert!(!is_gone_record(&gone, &rec(100), 1_000 + GONE_MEMORY_MS), "forgotten after the memory");
+        assert!(!is_gone_record(&gone, &PeerRecord { libp2p_peer_id: "Q".into(), ..rec(1) }, 2_000));
+    }
+
+    #[test]
+    fn a_gone_provider_loses_only_records_no_newer_than_the_bootstraps_saw() {
+        let rec = |lp: &str, m: &str, t: u64| PeerRecord { libp2p_peer_id: lp.into(), model_id: m.into(), updated_unix_ms: t, ..Default::default() };
+        let mut known = HashMap::new();
+        let mut received = HashMap::new();
+        for r in [rec("P", "a", 100), rec("P", "b", 200), rec("Q", "a", 100), rec("P", "legacy", 0), rec("P", "legacy2", 0)] {
+            let k = known_peer_key(&r);
+            received.insert(k.clone(), if r.model_id == "legacy2" { 5_000 } else { 1_000 });
+            known.insert(k, r);
+        }
+        // Bootstraps held P's records up to time 150; reports began at 2_000 (ms).
+        let gone = evict_gone_provider(&mut known, &received, "P", 150, 2_000);
+        assert_eq!(gone, vec!["a".to_string(), "legacy".to_string()]);
+        let left: Vec<_> = known.values().map(|r| (r.libp2p_peer_id.as_str(), r.model_id.as_str())).collect();
+        assert!(left.contains(&("P", "b")), "announced after what the bootstraps saw: alive");
+        assert!(left.contains(&("P", "legacy2")), "an undated record received after the reports began");
+        assert!(left.contains(&("Q", "a")), "another provider of the same model");
+    }
+
+    #[test]
+    fn relayed_dial_backoff_doubles_to_a_cap_and_respects_relay_limits() {
+        use std::time::Duration;
+        let s = |d: u64| Duration::from_secs(d);
+        assert_eq!(next_relay_dial_backoff(None, false), s(2));
+        assert_eq!(next_relay_dial_backoff(Some(s(2)), false), s(4));
+        assert_eq!(next_relay_dial_backoff(Some(s(8)), false), s(16));
+        assert_eq!(next_relay_dial_backoff(Some(s(16)), false), s(16), "capped");
+        assert_eq!(next_relay_dial_backoff(None, true), s(20), "the relays said no: let their budget refill");
+        assert_eq!(next_relay_dial_backoff(Some(s(16)), true), s(20));
+    }
+
+    #[test]
+    fn only_a_newer_record_renews_or_replaces() {
+        let (mut known, mut received) = (HashMap::new(), HashMap::new());
+        let now = 10_000_000_000;
+        let rec = |t: u64, host: &str| PeerRecord {
+            libp2p_peer_id: "p".into(), model_id: "m".into(), host: host.into(), updated_unix_ms: t, ..Default::default()
+        };
+        assert_eq!(install_known_peer_in(&mut known, &mut received, "me", &rec(now - 10_000, "new"), now - 10_000), Some(Install::New));
+        let key = known_peer_key(&rec(0, ""));
+        // The same record again later: kept, not renewed.
+        assert_eq!(install_known_peer_in(&mut known, &mut received, "me", &rec(now - 10_000, "new"), now), Some(Install::Duplicate));
+        assert_eq!(received[&key], now - 10_000);
+        // An older one: refused, the newer address stays.
+        assert_eq!(install_known_peer_in(&mut known, &mut received, "me", &rec(now - 20_000, "old"), now), None);
+        assert_eq!(known[&key].host, "new");
+        // A legacy (time 0) copy can't roll a dated record back either.
+        assert_eq!(install_known_peer_in(&mut known, &mut received, "me", &rec(0, "legacy"), now), None);
+        assert_eq!(known[&key].host, "new");
+        // A newer one replaces and renews.
+        assert_eq!(install_known_peer_in(&mut known, &mut received, "me", &rec(now - 1_000, "newer"), now), Some(Install::Renewed));
+        assert_eq!((known[&key].host.as_str(), received[&key]), ("newer", now));
+        // Over an hour old: refused outright.
+        let (mut k2, mut r2) = (HashMap::new(), HashMap::new());
+        assert_eq!(install_known_peer_in(&mut k2, &mut r2, "me", &rec(now - dht::MAX_RECORD_AGE_MS - 1, "x"), now), None);
+        // Undated records from older nodes still renew on receipt.
+        assert_eq!(install_known_peer_in(&mut k2, &mut r2, "me", &rec(0, "a"), now - 5), Some(Install::New));
+        assert_eq!(install_known_peer_in(&mut k2, &mut r2, "me", &rec(0, "a"), now), Some(Install::Renewed));
+        assert_eq!(r2[&key], now);
+    }
+
+    #[test]
+    fn only_a_lookup_started_after_the_invalidate_clears_it() {
+        assert!(started_after(None, 1));
+        assert!(started_after(Some(5), 6));
+        assert!(!started_after(Some(5), 4), "a lookup already running when every candidate failed");
+    }
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn identify_puts_only_circuits_through_our_relays_in_the_routing_table() {
+        let (peer, relay, stranger) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut trusted = crate::relay::TrustedRelays::default();
+        trusted.add(&ma(&format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}")));
+        let ours = ma(&format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}"));
+        let theirs = ma(&format!("/ip4/9.9.9.9/tcp/4001/p2p/{stranger}/p2p-circuit/p2p/{peer}"));
+        let claims = vec![
+            ma("/ip4/8.8.8.8/tcp/4001"),        // a direct claim: never into the table
+            ma("/ip6/2606:4700::1111/udp/4001/quic-v1"),
+            theirs,                              // a circuit through a relay we don't use
+            ours.clone(),
+        ];
+        let got = identify_routing_addrs(&claims, &peer, &trusted, true);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].to_string().contains(&relay.to_base58()), "{got:?}");
+        // The relay's real peer id in front of other machines' addresses (review 2026-10-29, which
+        // this test used to accept): none goes into the table, however many it claims.
+        let flood: Vec<Multiaddr> = (0..50)
+            .map(|i| ma(&format!("/ip4/45.79.190.{i}/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}")))
+            .filter(|a| !a.to_string().starts_with("/ip4/45.79.190.172/"))
+            .collect();
+        assert!(identify_routing_addrs(&flood, &peer, &trusted, true).is_empty());
+        // Many genuine ones (a relay known at several addresses) are still capped.
+        for i in 0..20 {
+            trusted.add_for(relay, ma(&format!("/ip4/45.79.191.{i}/tcp/4001")));
+        }
+        let many: Vec<Multiaddr> = (0..20)
+            .map(|i| ma(&format!("/ip4/45.79.191.{i}/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}")))
+            .collect();
+        assert_eq!(identify_routing_addrs(&many, &peer, &trusted, true).len(), MAX_IDENTIFY_CIRCUIT_ADDRS);
+    }
+
+    #[test]
+    fn a_relays_own_addresses_are_taken_global_only_on_the_public_network() {
+        let claims = vec![
+            ma("/ip4/127.0.0.1/tcp/4001"),
+            ma("/ip4/10.0.0.5/tcp/4001"),
+            ma("/ip4/172.17.0.1/tcp/4001"),
+            ma("/ip4/45.79.190.172/udp/4001/quic-v1"),
+            ma("/ip6/2600:3c03::2000:68ff:fe81:55b0/tcp/4001"),
+            ma(&format!("/ip4/1.2.3.4/tcp/4001/p2p/{}/p2p-circuit", PeerId::random())),
+        ];
+        let public = relay_self_addrs(&claims, true);
+        assert_eq!(public, vec![claims[3].clone(), claims[4].clone()]);
+        let private = relay_self_addrs(&claims, false);
+        assert_eq!(private.len(), 5, "a private deployment's relays are its own: their LAN addresses count");
+    }
+
+    #[test]
+    fn identify_dial_addresses_only_on_the_ip_the_connection_comes_from() {
+        let conn = ma("/ip4/54.116.38.169/tcp/51868");
+        let claims = vec![
+            ma("/ip4/54.116.38.169/tcp/4001"),
+            ma("/ip4/54.116.38.169/udp/4001/quic-v1"),
+            ma("/ip4/1.2.3.4/tcp/22"),          // someone else's machine
+            ma("/ip4/10.0.0.5/tcp/4001"),       // a private address, not a LAN peer
+        ];
+        let got = identify_dial_addrs(&claims, Some(&conn), false, true);
+        assert_eq!(got, vec![claims[0].clone(), claims[1].clone()]);
+        assert!(identify_dial_addrs(&claims, None, false, true).is_empty(), "a relayed connection gives none");
+        let many: Vec<Multiaddr> = (4000..4020).map(|p| ma(&format!("/ip4/54.116.38.169/tcp/{p}"))).collect();
+        assert_eq!(identify_dial_addrs(&many, Some(&conn), false, true).len(), MAX_IDENTIFY_DIAL_ADDRS);
+        // A LAN peer's own LAN address is fine for a LAN dial.
+        let lan = ma("/ip4/192.168.1.6/tcp/60000");
+        assert_eq!(identify_dial_addrs(&[ma("/ip4/192.168.1.6/tcp/4111")], Some(&lan), true, true).len(), 1);
+    }
+
+    #[test]
+    fn holepunch_dials_only_a_few_global_ipv6_quic_addresses() {
+        let claims = vec![
+            ma("/ip6/::1/udp/4001/quic-v1"),
+            ma("/ip6/fd00::1/udp/4001/quic-v1"),
+            ma("/ip6/fe80::1/udp/4001/quic-v1"),
+            ma("/ip6/::ffff:1.2.3.4/udp/4001/quic-v1"),
+            ma("/ip6/ff02::1/udp/4001/quic-v1"),
+            ma("/ip6/2001:db8::1/udp/4001/quic-v1"),
+            ma("/ip6/2401:4900:1cb9:a4e7::1/tcp/4001"), // not QUIC
+            ma("/ip6/2401:4900:1cb9:a4e7::1/udp/4001/quic-v1"),
+            ma("/ip6/2401:4900:1cb9:a4e7::2/udp/4001/quic-v1"),
+            ma("/ip6/2401:4900:1cb9:a4e7::3/udp/4001/quic-v1"),
+        ];
+        let got = holepunch_v6_addrs(&claims);
+        assert_eq!(got, vec![claims[7].clone(), claims[8].clone()]);
     }
 
     #[test]
@@ -5062,9 +7424,9 @@ mod tests {
         let mut received: HashMap<String, u64> = HashMap::new();
         let mut put = |r: PeerRecord, t: u64| install_known_peer_in(&mut known, &mut received, "ME", &r, t);
         assert_eq!(put(rec("A", "m", now + MAX_RECORD_SKEW_MS + 1), now), None);
-        assert_eq!(put(rec("A", "m", 0), now), Some(true), "an honest record, dated 0");
-        assert_eq!(put(rec("A", "m", 0), now + 1), Some(false), "a refresh");
-        assert_eq!(put(rec("ME", "mine", 0), now), Some(true));
+        assert_eq!(put(rec("A", "m", 0), now), Some(Install::New), "an honest record, dated 0");
+        assert_eq!(put(rec("A", "m", 0), now + 1), Some(Install::Renewed), "a refresh");
+        assert_eq!(put(rec("ME", "mine", 0), now), Some(Install::New));
         assert_eq!(put(rec("C", "x\" onclick=\"y", 0), now), None, "an odd model name is never cached");
         // A flood of one peer's records, dated "now" by its signer, received after A's: its own
         // least recently received go, nobody else's.
@@ -5352,8 +7714,13 @@ mod tests {
         // Capped at 120s from attempt 8 onward — and never overflows for
         // large/pathological attempt counts.
         assert_eq!(reservation_retry_delay_ms(8), 120_000);
-        assert_eq!(reservation_retry_delay_ms(50), 120_000);
-        assert_eq!(reservation_retry_delay_ms(u32::MAX), 120_000);
+        assert_eq!(reservation_retry_delay_ms(12), 120_000);
+        // A relay that keeps refusing: every 10 minutes, logged once an hour.
+        assert_eq!(reservation_retry_delay_ms(13), 600_000);
+        assert_eq!(reservation_retry_delay_ms(50), 600_000);
+        assert_eq!(reservation_retry_delay_ms(u32::MAX), 600_000);
+        assert!((1..=12).all(reservation_retry_loud));
+        assert_eq!((13..=36).filter(|a| reservation_retry_loud(*a)).count(), 4, "one an hour");
         // Monotonic non-decreasing.
         let mut prev = 0u64;
         for a in 1..=20u32 {
@@ -5690,18 +8057,53 @@ mod tests {
         // The original v4 connection closed during the grace; two inbound duplicates remain, due together.
         peers.insert(pid, PeerConnectionInfo { quic_direct_v4: 2, ..Default::default() });
         let (d1, d2) = (ConnectionId::new_unchecked(11), ConnectionId::new_unchecked(12));
-        let (close, stay) = quic_dups_due(&[(d1, pid, false), (d2, pid, false)], &peers);
+        // (Seen from a node whose id is below the peer's: it closes inbound duplicates.)
+        let low = lower_than(&pid);
+        let (close, stay) = quic_dups_due(&[(d1, pid, false), (d2, pid, false)], &peers, &low);
         assert_eq!(close, vec![d1], "one closes, one stays");
         assert_eq!(stay, vec![(d2, pid, false)]);
         // With the original still open (three in all), both duplicates close.
         peers.insert(pid, PeerConnectionInfo { quic_direct_v4: 3, ..Default::default() });
-        let (close, stay) = quic_dups_due(&[(d1, pid, false), (d2, pid, false)], &peers);
+        let (close, stay) = quic_dups_due(&[(d1, pid, false), (d2, pid, false)], &peers, &low);
         assert_eq!(close, vec![d1, d2]);
         assert!(stay.is_empty());
         // Another family is counted apart.
         peers.insert(pid, PeerConnectionInfo { quic_direct_v4: 2, quic_direct_v6: 1, ..Default::default() });
-        let (close, _) = quic_dups_due(&[(d1, pid, false), (d2, pid, true)], &peers);
+        let (close, _) = quic_dups_due(&[(d1, pid, false), (d2, pid, true)], &peers, &low);
         assert_eq!(close, vec![d1]);
+    }
+
+    /// A peer id below `pid` (ids compare by their bytes).
+    fn lower_than(pid: &PeerId) -> PeerId {
+        loop {
+            let p = PeerId::random();
+            if p < *pid {
+                return p;
+            }
+        }
+    }
+
+    #[test]
+    fn when_both_ends_dial_at_once_the_connection_the_lower_id_dialled_stays() {
+        use libp2p::swarm::ConnectionId;
+        let a = PeerId::random();
+        let b = lower_than(&a); // b < a
+        let (x, y) = (ConnectionId::new_unchecked(21), ConnectionId::new_unchecked(22));
+        // x: dialled by b; y: dialled by a. Each side has both, one v6 pair.
+        let mut at_a = HashMap::new();
+        at_a.insert(b, PeerConnectionInfo { quic_direct_v6: 2, ..Default::default() });
+        let mut at_b = HashMap::new();
+        at_b.insert(a, PeerConnectionInfo { quic_direct_v6: 2, ..Default::default() });
+        // At a (the higher id), its inbound duplicate is x, b's: it stays.
+        let (close, _) = quic_dups_due(&[(x, b, true)], &at_a, &a);
+        assert!(close.is_empty(), "the higher id leaves the lower id's connection alone");
+        // At b (the lower id), its inbound duplicate is y, a's: it closes. x survives on both ends.
+        let (close, _) = quic_dups_due(&[(y, a, true)], &at_b, &b);
+        assert_eq!(close, vec![y]);
+        // More than a pair is closed down as before, whoever is higher.
+        at_a.insert(b, PeerConnectionInfo { quic_direct_v6: 3, ..Default::default() });
+        let (close, _) = quic_dups_due(&[(x, b, true)], &at_a, &a);
+        assert_eq!(close, vec![x]);
     }
 
     #[test]
@@ -5734,7 +8136,7 @@ mod tests {
         let redundant = |info: PeerConnectionInfo, v6: bool| {
             let pid = PeerId::random();
             let peers = HashMap::from([(pid, info)]);
-            !quic_dups_due(&[(libp2p::swarm::ConnectionId::new_unchecked(1), pid, v6)], &peers).0.is_empty()
+            !quic_dups_due(&[(libp2p::swarm::ConnectionId::new_unchecked(1), pid, v6)], &peers, &lower_than(&pid)).0.is_empty()
         };
         // original + deferred duplicate
         assert!(redundant(PeerConnectionInfo { quic_direct_v4: 2, ..Default::default() }, false));

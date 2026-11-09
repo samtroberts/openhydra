@@ -422,4 +422,15 @@ pub struct StatusSnapshot {
     pub known_models: Vec<String>,
     pub known_providers: Vec<KnownProvider>,
     pub counters: NetCounters,
+    /// Peers subscribed to our gossip topic, and those of them in our gossip mesh (we forward
+    /// to and receive forwards from mesh peers only), as libp2p ids.
+    #[serde(default)]
+    pub gossip_topic_peers: Vec<String>,
+    #[serde(default)]
+    pub gossip_mesh_peers: Vec<String>,
+    /// Models that just left the network — their last provider withdrew them, or the bootstraps
+    /// report it gone — and that no known provider serves: a browse list drops these at once
+    /// instead of keeping them on its sticky timer.
+    #[serde(default)]
+    pub recently_withdrawn: Vec<String>,
 }

@@ -218,6 +218,28 @@ pub fn build_peer_record(
     }
 }
 
+/// How many models [`Provider::warm_up_engine`] warms: each one loads into the engine's memory, and
+/// more than fit would only push each other out.
+const MAX_WARM_UP_MODELS: usize = 2;
+
+/// Whether `model` on engine `engine` is worth a warm-up request before announcing. Local engines
+/// that load a model on first use (Ollama, llama.cpp's router, and whatever `auto` found running):
+/// on a fresh GPU machine Ollama's first requests took 1m40s (2026-10-29: the model loaded in a
+/// second, the first generation didn't come for 100 s; later ones in 36 ms), past a consumer's
+/// 90 s timeout. Never a hosted API (it would bill the operator), and never an image or video
+/// workflow (one "request" there is a whole generation).
+fn warm_up_worthwhile(engine: &str, model: &DetectedModel) -> bool {
+    let name = model.engine_ref.to_ascii_lowercase();
+    matches!(engine, "ollama" | "llama.cpp" | "auto")
+        && !model.family.starts_with("comfyui")
+        && model.family != "stable-diffusion"
+        // Embedding models don't chat; Ollama's cloud models run on ollama.com, on the operator's quota.
+        && !model.family.contains("bert")
+        && !name.contains("embed")
+        && !name.ends_with("-cloud")
+        && !name.ends_with(":cloud")
+}
+
 /// The names this provider's models go by on the network. Other nodes refuse a record whose model
 /// name is outside `openhydra_protocol::model_id::is_valid_model_id` (a leading `/`, backslashes,
 /// brackets, quotes…), so a model whose engine id is one of those — a vLLM model served from a
@@ -2468,6 +2490,8 @@ impl<A: EngineAdapter> Provider<A> {
                 return;
             }
         };
+        // Every gate passed: the network may dial this consumer's IPv6 back (A4).
+        self.net.serve_accepted(&source_peer);
         // Capture the small fields needed after `req` is moved into the serve (which consumes
         // `messages`), for the ack, buffer, commitment, and stats.
         let nonce = req.nonce;
@@ -2873,6 +2897,50 @@ impl<A: EngineAdapter> Provider<A> {
             std::thread::sleep(BASE_THROTTLE.mul_f64(mult));
         }
         self.throttling.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Send each shared text model one 1-token request, so the engine is warm when the first
+    /// request from the network comes (see [`warm_up_worthwhile`]). Returns how many answered.
+    /// Blocks for as long as the engine takes (callers bound their wait), but starts no model
+    /// after `deadline`: a load then could push out one the operator is using (review 2026-10-29).
+    pub fn warm_up_engine(&self, deadline: std::time::Instant) -> usize {
+        let engine = self.adapter.engine_name();
+        let Ok(models) = self.adapter.detect_models() else { return 0 };
+        let policy = self.policy.snapshot();
+        let mut warmed = 0;
+        for m in models
+            .iter()
+            .filter(|m| policy.is_shared(&m.engine_ref) && warm_up_worthwhile(engine, m))
+            .take(MAX_WARM_UP_MODELS)
+        {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let request = crate::adapter::InferenceRequest {
+                model_ref: m.engine_ref.clone(),
+                messages: vec![crate::adapter::ChatMessage::new("user", "Hi")],
+                max_tokens: Some(1),
+                temperature: Some(0.0),
+                tools: Vec::new(),
+                think: None,
+                seed: None,
+                stop: Default::default(),
+            };
+            let started = std::time::Instant::now();
+            match self.adapter.serve_stream(&request, &mut |_| {}) {
+                Ok(_) => {
+                    warmed += 1;
+                    eprintln!("openhydra-agent: warmed up {} in {:.1}s", m.engine_ref, started.elapsed().as_secs_f64());
+                }
+                Err(e) => eprintln!("openhydra-agent: warm-up of {} failed ({e}); announcing anyway", m.engine_ref),
+            }
+        }
+        warmed
+    }
+
+    /// Re-read the share-policy file if it changed (the watcher only starts with the serve loop).
+    pub fn reload_share_policy(&self) -> bool {
+        self.policy.reload_if_changed()
     }
 
     /// Detect the engine's models and announce a record for each. Returns how many were
@@ -3564,6 +3632,8 @@ impl<A: EngineAdapter> Provider<A> {
                                 return refusal;
                             }
                         };
+                        // Every gate passed: the network may dial this consumer's IPv6 back (A4).
+                        self.net.serve_accepted(source_peer);
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -3661,6 +3731,33 @@ mod tests {
     }
 
     use super::*;
+
+    /// Review 2026-10-14 M9 (test first): on the crypto rail, a consumer whose tokenizer recount pays
+    /// less than this provider's own count of the serve builds a cumulative step below the floor the
+    /// provider holds it to (its own count, at weight 1), so the receipt is refused and nothing is
+    /// co-signed. Shown with the real functions both sides use.
+    #[test]
+    fn m9_a_recount_below_the_providers_own_count_falls_below_its_settlement_floor() {
+        use openhydra_protocol::payout::{check_cumulative, gated_accrual_asset, CumulativeError};
+        use openhydra_protocol::trust::AuthenticityTier;
+        use openhydra_protocol::weight::{cost_tier_for_handle, receipt_weighted_units};
+        let peg = 10;
+        let step_for = |pay: u64, achieved: AuthenticityTier| {
+            let s = gated_accrual_asset(cost_tier_for_handle("qwen3:8b"), achieved, receipt_weighted_units(pay, None), peg);
+            s.net_to_provider + s.protocol_fee
+        };
+        // The provider counted 300; the consumer's recount pays 100 (a 3x over-bill, or an honest
+        // provider the recount wrongly flags). An unverified provider is priced at the floor tier.
+        let floor = settlement_floor_units(Some(300), 100);
+        assert_eq!(
+            check_cumulative(0, Some(step_for(100, AuthenticityTier::SelfReported)), floor, Some(peg)),
+            Err(CumulativeError::BelowFloor)
+        );
+        // Paid what it counted: accepted.
+        assert_eq!(check_cumulative(0, Some(step_for(300, AuthenticityTier::SelfReported)), floor, Some(peg)), Ok(()));
+        // A verified provider (priced above the floor tier) still clears it at a third of its count.
+        assert_eq!(check_cumulative(0, Some(step_for(100, AuthenticityTier::ReputationRedundant)), floor, Some(peg)), Ok(()));
+    }
     use crate::adapter::{InferenceRequest, ServeOutcome};
     use crate::serve::{parse_response, ServeChunk, ServeRequest};
 
@@ -5233,6 +5330,55 @@ mod tests {
         // Closed (settled, or evicted): it stops too.
         let closed = [3u8; 16];
         assert_eq!(run(closed).tokens, 1);
+    }
+
+    fn warm_model(engine_ref: &str, family: &str) -> DetectedModel {
+        DetectedModel {
+            engine_ref: engine_ref.into(),
+            canonical_id: String::new(),
+            family: family.into(),
+            params: String::new(),
+            quant: String::new(),
+            size_bytes: 0,
+            weight_digest: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_warm_up_asks_shared_text_models_for_one_token_and_nothing_else() {
+        /// An Ollama-like engine with two text models, an unshared one and an image checkpoint.
+        struct Recording(Mutex<Vec<(String, Option<u32>)>>);
+        impl EngineAdapter for Recording {
+            fn engine_name(&self) -> &'static str {
+                "ollama"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                let m = |r: &str, family: &str| warm_model(r, family);
+                Ok(vec![m("a", "qwen2"), m("b", "llama"), m("private", "qwen2"), m("img", "stable-diffusion"), m("c", "qwen2")])
+            }
+            fn serve_stream(&self, req: &InferenceRequest, _: &mut dyn FnMut(&str)) -> Result<ServeOutcome, AdapterError> {
+                self.0.lock().unwrap().push((req.model_ref.clone(), req.max_tokens));
+                Ok(ServeOutcome { tokens: 1, done: true, engine: Default::default(), tool_calls: Vec::new() })
+            }
+        }
+        let (_dir, provider) = test_provider(Recording(Default::default()));
+        let provider = provider.with_shared_models(["img", "a", "b", "c"]);
+        assert_eq!(provider.warm_up_engine(std::time::Instant::now() + Duration::from_secs(60)), 2);
+        let asked = provider.adapter.0.lock().unwrap().clone();
+        assert_eq!(asked, vec![("a".to_string(), Some(1)), ("b".to_string(), Some(1))], "shared text models, at most two, one token each");
+        // A hosted API or an image workflow engine is never warmed.
+        let model = |family: &str| warm_model("m", family);
+        assert!(!warm_up_worthwhile("anthropic", &model("claude")));
+        assert!(!warm_up_worthwhile("comfyui", &model("comfyui-workflow")));
+        assert!(!warm_up_worthwhile("auto", &model("comfyui-workflow")));
+        assert!(warm_up_worthwhile("auto", &model("qwen2")));
+        assert!(warm_up_worthwhile("llama.cpp", &model("")));
+        // Embedding and Ollama cloud models never.
+        assert!(!warm_up_worthwhile("ollama", &model("nomic-bert")));
+        assert!(!warm_up_worthwhile("ollama", &warm_model("mxbai-embed-large:latest", "")));
+        assert!(!warm_up_worthwhile("ollama", &warm_model("gpt-oss:120b-cloud", "gptoss")));
+        // Past the deadline it starts nothing.
+        assert_eq!(provider.warm_up_engine(std::time::Instant::now()), 0);
     }
 
     #[test]

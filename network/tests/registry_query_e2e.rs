@@ -49,6 +49,75 @@ fn record(model: &str, peer: &str) -> PeerRecord {
     }
 }
 
+/// Live probe against a DEPLOYED bootstrap — proves the real `bootstrap_bin.rs` answer path
+/// (protocol negotiation + `providers_for` lookup + reply) over the network, which the in-process
+/// test above can't (it uses an inline responder). Ignored by default (needs egress + a running
+/// bootstrap); run explicitly:
+///
+///   OH_BOOTSTRAP='/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb' \
+///   OH_MODELS='qwen2.5-coder:1.5b,tinyllama:latest,tinyllama,__absent__' \
+///   cargo test -p openhydra-network --test registry_query_e2e -- --ignored --nocapture live_probe
+///
+/// Success = every query gets a Response (not OutboundFailure). A non-empty count additionally
+/// proves the ingest→query chain end to end. Record counts per model are printed.
+#[tokio::test]
+#[ignore = "hits a live deployed bootstrap; run with --ignored"]
+async fn live_probe_deployed_bootstrap_answers() {
+    let addr: libp2p::Multiaddr = std::env::var("OH_BOOTSTRAP")
+        .expect("set OH_BOOTSTRAP to the bootstrap multiaddr")
+        .parse()
+        .expect("valid multiaddr");
+    let models: Vec<String> = std::env::var("OH_MODELS")
+        .unwrap_or_else(|_| "qwen2.5-coder:1.5b,tinyllama:latest,tinyllama,__absent__".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut consumer = build_swarm(ProtocolSupport::Outbound);
+    consumer.dial(addr).expect("dial bootstrap");
+
+    use std::collections::HashMap;
+    let mut pending: HashMap<request_response::OutboundRequestId, String> = HashMap::new();
+    let mut answered = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+
+    loop {
+        tokio::select! {
+            ev = consumer.select_next_some() => match ev {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if pending.is_empty() => {
+                    for m in &models {
+                        let id = consumer.behaviour_mut().send_request(&peer_id, RegistryQuery { model_id: m.clone() });
+                        pending.insert(id, m.clone());
+                    }
+                }
+                SwarmEvent::Behaviour(request_response::Event::Message {
+                    message: request_response::Message::Response { request_id, response }, ..
+                }) => {
+                    let model = pending.remove(&request_id).unwrap_or_default();
+                    println!("LIVE registry answer: model={model:?} records={}", response.records.len());
+                    for r in &response.records {
+                        println!("    provider peer_id={} libp2p={} model_id={}", r.peer_id, r.libp2p_peer_id, r.model_id);
+                    }
+                    answered += 1;
+                    if answered == models.len() {
+                        assert!(answered > 0, "deployed bootstrap answered no queries");
+                        return; // every query got a Response → answer path proven
+                    }
+                }
+                SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, request_id, .. }) => {
+                    let model = pending.get(&request_id).cloned().unwrap_or_default();
+                    panic!("deployed bootstrap FAILED to answer model={model:?}: {error} — answer path broken or protocol unsupported");
+                }
+                _ => {}
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("timed out — {answered}/{} queries answered by the deployed bootstrap", models.len());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn consumer_queries_bootstrap_registry_over_the_wire() {
     let mut bootstrap = build_swarm(ProtocolSupport::Inbound);

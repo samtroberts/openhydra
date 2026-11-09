@@ -34,7 +34,12 @@ struct PersistedRoutingTable {
     nodes: Vec<PersistedNode>,
 }
 
-const FORMAT_VERSION: u32 = 1;
+/// 2 (27 Oct 2026): caches written before then may hold addresses a peer only claimed (identify
+/// went straight into the routing table), so a version-1 file is ignored once and the node rejoins
+/// through the bootstraps. Since then the table only holds addresses Kademlia dialled itself.
+const FORMAT_VERSION: u32 = 2;
+/// Addresses kept per contact, on save and on load.
+const MAX_ADDRS_PER_NODE: usize = 4;
 
 /// Derive the routing-cache path from the identity-key path: a sibling
 /// `routing_cache.json`. Keeping it next to the identity ties the cache to the
@@ -83,7 +88,7 @@ pub fn load(path: &Path) -> Vec<(PeerId, Multiaddr)> {
                 continue;
             }
         };
-        for addr_str in node.addrs {
+        for addr_str in node.addrs.into_iter().take(MAX_ADDRS_PER_NODE) {
             // Don't reload relay-circuit addresses: a `/p2p-circuit` contact is
             // only valid while that specific relay reservation is live, which it
             // won't be across a restart. Direct addresses are what's worth warming.
@@ -112,6 +117,7 @@ pub fn save(path: &Path, entries: &[(PeerId, Vec<Multiaddr>)]) -> std::io::Resul
                 // Persist only direct addresses (see `load`): circuit addrs are
                 // ephemeral and would just churn the file.
                 .filter(|a| !a.to_string().contains("/p2p-circuit"))
+                .take(MAX_ADDRS_PER_NODE)
                 .map(|a| a.to_string())
                 .collect(),
         })
@@ -190,5 +196,29 @@ mod tests {
         save(&path, &[(p, vec![direct.clone(), circuit])]).unwrap();
         let loaded = load(&path);
         assert_eq!(loaded, vec![(p, direct)]);
+    }
+
+    #[test]
+    fn a_version_1_cache_is_ignored() {
+        // Written before 27 Oct 2026, when claimed addresses could reach the routing table.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing_cache.json");
+        let v1 = format!(r#"{{"version":1,"nodes":[{{"peer_id":"{}","addrs":["/ip4/8.8.8.8/tcp/4001"]}}]}}"#, PeerId::random());
+        std::fs::write(&path, v1).unwrap();
+        assert!(load(&path).is_empty());
+    }
+
+    #[test]
+    fn at_most_four_addresses_per_contact_are_saved_or_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing_cache.json");
+        let p = PeerId::random();
+        let many: Vec<Multiaddr> = (1..=10).map(|i| format!("/ip4/8.8.8.{i}/tcp/4001").parse().unwrap()).collect();
+        save(&path, &[(p, many.clone())]).unwrap();
+        assert_eq!(load(&path).len(), 4);
+        // And a hand-edited file with more is cut on load too.
+        let addrs: Vec<String> = many.iter().map(|a| format!("\"{a}\"")).collect();
+        std::fs::write(&path, format!(r#"{{"version":2,"nodes":[{{"peer_id":"{p}","addrs":[{}]}}]}}"#, addrs.join(","))).unwrap();
+        assert_eq!(load(&path).len(), 4);
     }
 }

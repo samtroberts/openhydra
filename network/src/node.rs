@@ -74,6 +74,19 @@ impl Default for NodeConfig {
     }
 }
 
+static MDNS_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn LAN discovery (mDNS) off for every node this process starts from now on (`--no-mdns`): an
+/// off switch if LAN dialling misbehaves somewhere, without a new release. A process-wide setting
+/// rather than a [`NodeConfig`] field, so the many places that build a `NodeConfig` don't change.
+pub fn disable_mdns() {
+    MDNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn mdns_enabled() -> bool {
+    !MDNS_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn dirs_default_identity() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".openhydra").join("identity.key")
@@ -133,6 +146,7 @@ pub fn start_node(
         bootstrap_peers = kept;
     }
     let public_network = crate::relay::uses_public_network(&bootstrap_peers, config.public_relays);
+    let network_id = crate::relay::network_id(&bootstrap_peers, public_network);
     if config.public_relays == crate::relay::PublicRelays::Auto && !public_network {
         // Said once, plainly: a node given only its own bootstraps relays through them alone (L9).
         info!("none of the bootstraps is OpenHydra's: using them as relays, not OpenHydra's (pass --public-relays on to use OpenHydra's relays too)");
@@ -194,6 +208,9 @@ pub fn start_node(
                     protocol_version: "openhydra/0.1.0".into(),
                     enable_peer_relay,
                     fence_openhydra,
+                    public_network,
+                    enable_mdns: mdns_enabled(),
+                    network_id,
                 };
 
                 let keypair_for_loop = identity.keypair.clone();
@@ -203,7 +220,7 @@ pub fn start_node(
                         event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, pcp_bind).await;
                     }
                     Err(e) => {
-                        let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
+                        let _ = startup_tx.send(Err(format!("build_swarm: {}", crate::transport::error_chain(e.as_ref()))));
                     }
                 }
             });

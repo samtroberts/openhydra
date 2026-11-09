@@ -5,6 +5,7 @@
 //! Drives the swarm through a synchronous [`handle::NetworkHandle`] for the
 //! `openhydra-agent` host (and the `openhydra-bootstrap` binary).
 
+pub mod address_book;
 pub mod behaviour;
 pub mod card;
 pub mod proxy;

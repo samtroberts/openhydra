@@ -33,7 +33,14 @@ mail() { # subject, body; fails if the email wasn't sent, so it's tried again ne
   echo "couldn't send the email: $1" >&2
   return 1
 }
-age() { [ -e "$1" ] && echo $(( now - $(cat "$1") )) || echo 999999999; }
+# Seconds since the time stored in $1; very large when the file is missing, empty, garbled (a write
+# on a full disk) or in the future (a clock that ran ahead), so a broken state file errs towards
+# alerting rather than going quiet.
+age() {
+  t=$(cat "$1" 2>/dev/null)
+  case "$t" in ''|*[!0-9]*|???????????*) echo 999999999; return;; esac
+  if [ $(( 10#$t )) -gt "$now" ]; then echo 999999999; else echo $(( now - 10#$t )); fi
+}
 
 if [ "$code" -eq 0 ]; then
   if [ ! -e "$STATE/alerted" ] || mail "RECOVERED" "The last run found no problems."; then
