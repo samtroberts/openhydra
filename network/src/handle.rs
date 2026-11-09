@@ -55,6 +55,8 @@ pub struct NetworkHandle {
     /// relay addresses under the *same* pinned PeerId without waiting out the
     /// periodic re-announce interval.
     net_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The latest ping round trip to each peer, recorded by the event loop.
+    peer_rtts: Arc<crate::rtt::PeerRtts>,
 }
 
 impl NetworkHandle {
@@ -73,7 +75,7 @@ impl NetworkHandle {
             hex::encode(pk.to_bytes())
         };
         let keypair = identity.keypair.clone();
-        let (cmd_tx, proxy_queue, thread, net_generation) = start_node(&config)?;
+        let (cmd_tx, proxy_queue, thread, net_generation, peer_rtts) = start_node(&config)?;
         Ok(Self {
             cmd_tx,
             proxy_queue,
@@ -83,7 +85,15 @@ impl NetworkHandle {
             public_key_hex,
             keypair,
             net_generation,
+            peer_rtts,
         })
+    }
+
+    /// The latest ping round trip to `libp2p_peer_id` (base58), if this node pinged it in the last
+    /// five minutes and is still connected to it (only connected peers are pinged, and a peer's
+    /// round trip is dropped when its last connection closes).
+    pub fn peer_rtt(&self, libp2p_peer_id: &str) -> Option<std::time::Duration> {
+        self.peer_rtts.get(libp2p_peer_id)
     }
 
     /// #42: the current network generation. The event loop bumps this each time

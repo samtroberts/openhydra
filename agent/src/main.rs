@@ -111,6 +111,13 @@ struct NodeArgs {
     #[arg(long = "network-id")]
     network_id: Option<String>,
 
+    /// Allow connections only with the peers listed in this file (one peer id per line; `#` starts a
+    /// comment). Any other peer is refused, on TCP, QUIC and relay circuits alike, so outsiders can't
+    /// join a private deployment's network even if they know its addresses. The `--bootstrap` peers
+    /// are always allowed. Off unless set.
+    #[arg(long = "allow-peers-file")]
+    allow_peers_file: Option<std::path::PathBuf>,
+
     /// Serve a read-only introspection endpoint (peers / DHT / swarm / transfer
     /// counters as JSON) on this address, e.g. `127.0.0.1:9464` or `127.0.0.1:0`
     /// (ephemeral). Off unless set; bind loopback unless you mean to expose it. If
@@ -130,6 +137,24 @@ impl NodeArgs {
             // Process-wide too (see `set_network_name`).
             if let Err(e) = openhydra_network::relay::set_network_name(name) {
                 eprintln!("openhydra-agent: --network-id: {e}");
+                std::process::exit(2);
+            }
+        }
+        if let Some(path) = &self.allow_peers_file {
+            // Process-wide, before any node starts. The configured bootstraps are always allowed (a
+            // node that can't reach them can't join anything).
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("openhydra-agent: --allow-peers-file {}: {e}", path.display());
+                std::process::exit(2);
+            });
+            let mut peers = openhydra_network::fence::parse_allowlist(&text).unwrap_or_else(|e| {
+                eprintln!("openhydra-agent: --allow-peers-file {}: {e}", path.display());
+                std::process::exit(2);
+            });
+            peers.extend(self.bootstrap.iter().filter_map(|a| openhydra_network::fence::peer_id_in(a)));
+            eprintln!("openhydra-agent: peer allowlist: {} peer(s) may connect (from {})", peers.len(), path.display());
+            if let Err(e) = openhydra_network::fence::set_allowed_peers(peers) {
+                eprintln!("openhydra-agent: {e}");
                 std::process::exit(2);
             }
         }
@@ -244,6 +269,9 @@ enum SwarmAction {
     List(SwarmDirArg),
     /// (Owner) Revoke a member by its public key.
     Revoke(SwarmRevokeArgs),
+    /// Leave or forget a swarm: delete this node's record of it. A member's credential is dropped;
+    /// an owner's group key is destroyed (needs `--yes`).
+    Forget(SwarmForgetArgs),
     /// (Control member, M5) Send a signed `REMOTE_SCOPE_SET` to a rig: flip one of its models'
     /// share scope (Private/Global/Device) from this device. Needs a stored control credential.
     RemoteScope(SwarmRemoteScopeArgs),
@@ -339,6 +367,19 @@ struct SwarmAcceptArgs {
 }
 
 #[derive(Args)]
+struct SwarmForgetArgs {
+    /// The swarm (group public key) to forget.
+    #[arg(long)]
+    swarm: String,
+    /// Confirm forgetting a swarm you OWN: its group key is deleted, so no credential can be issued
+    /// or checked for it again and every member's access ends.
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    dir: SwarmDirArg,
+}
+
+#[derive(Args)]
 struct SwarmRevokeArgs {
     /// The swarm (group public key) you own.
     #[arg(long)]
@@ -364,6 +405,22 @@ enum CardAction {
     /// Verify a card (from `--magnet`, `--file`, or stdin) and print its model + provider peer id,
     /// or the reason it's invalid/expired. Exit non-zero on failure.
     Verify(CardVerifyArgs),
+    /// Verify a card (from `--magnet`, `--file`, or stdin) and add it to the cards file that
+    /// `serve --cards-file` reads. A card for the same provider and model replaces the old one.
+    Import(CardImportArgs),
+}
+
+#[derive(Args)]
+struct CardImportArgs {
+    /// A magnet string `openhydra:card:...`.
+    #[arg(long, conflicts_with = "file")]
+    magnet: Option<String>,
+    /// A `.openhydra` JSON file.
+    #[arg(long)]
+    file: Option<std::path::PathBuf>,
+    /// The cards file to add it to (default `~/.openhydra/cards.json`, the one the desktop app uses).
+    #[arg(long = "cards-file")]
+    cards_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -667,7 +724,9 @@ struct ProvideArgs {
 
     /// This machine's own gateway (consumer) libp2p PeerId, when it runs one under its own identity
     /// (the desktop app does): its serves are self-serves it never settles, so a provider that charges
-    /// exempts it from the payment gate. Get it from `openhydra-agent peer-id --identity <gateway-key>`.
+    /// exempts it from the payment gate, and it counts as this machine for Device and Private models
+    /// (it may use them without a swarm credential). Only ever set it to a gateway on this machine.
+    /// Get it from `openhydra-agent peer-id --identity <gateway-key>`.
     /// Set `--self-provider` on that gateway to this provider's id too: otherwise the gateway settles
     /// self-serves this provider never records, and a provider that charges sees nothing to settle.
     #[arg(long = "self-consumer")]
@@ -1091,6 +1150,37 @@ fn run() -> Result<(), String> {
                         v.card.model_id, v.card.libp2p_peer_id, v.card.openhydra_peer_id, v.card.expires_at
                     );
                 }
+                CardAction::Import(a) => {
+                    let input = match (a.magnet, a.file) {
+                        (Some(m), _) => m,
+                        (None, Some(f)) => std::fs::read_to_string(&f)
+                            .map_err(|e| format!("read {}: {e}", f.display()))?,
+                        (None, None) => {
+                            use std::io::Read;
+                            let mut s = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut s)
+                                .map_err(|e| format!("read stdin: {e}"))?;
+                            s
+                        }
+                    };
+                    let v = openhydra_agent::cards::parse_and_verify(&input, now_ms)?;
+                    let path = a.cards_file.unwrap_or_else(|| {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                        std::path::PathBuf::from(home).join(".openhydra").join("cards.json")
+                    });
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+                    }
+                    openhydra_agent::cards::add_card(&path, &v.card)?;
+                    let private = if v.card.swarm_public_key.is_empty() { "" } else { " (private: needs a credential for its swarm)" };
+                    println!(
+                        "imported model {:?} served by {} into {}{private}",
+                        v.card.model_id,
+                        v.card.libp2p_peer_id,
+                        path.display()
+                    );
+                }
             }
             return Ok(());
         }
@@ -1181,6 +1271,23 @@ fn run() -> Result<(), String> {
                         a.member.trim(),
                     )?;
                     println!("revoked {}", a.member.trim());
+                }
+                SwarmAction::Forget(a) => {
+                    let dir = resolve_dir(a.dir.swarms_dir);
+                    let pk = a.swarm.trim();
+                    match openhydra_agent::swarms::read_swarm(&dir, pk)? {
+                        None => return Err(format!("no swarm {pk} in {}", dir.display()).into()),
+                        Some(rec) if rec.role == openhydra_agent::swarms::SwarmRole::Owner && !a.yes => {
+                            return Err(format!(
+                                "you own swarm {pk}: forgetting it deletes its group key and ends every member's \
+                                 access; run again with --yes to do that"
+                            )
+                            .into())
+                        }
+                        Some(_) => {}
+                    }
+                    openhydra_agent::swarms::forget_swarm(&dir, pk)?;
+                    println!("forgot swarm {pk}");
                 }
                 SwarmAction::RemoteScope(a) => {
                     use openhydra_network::identity::Identity;

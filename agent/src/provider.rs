@@ -1081,27 +1081,33 @@ fn reply_to_matches(reply_to: &str, source_peer: &str) -> bool {
 /// M4-base reach-gate decision as pure logic (no `self`, unit-testable). Decides *who* may reach an
 /// already-shared model, from its `scope`:
 /// - `Global`  → anyone (public marketplace).
-/// - `Device`  → loopback only: the request must come from this node (`own_peer`) — a self-serve.
+/// - `Device`  → this machine only: the request must come from one of `own_peers` (this node, or the
+///   co-located consumer that the desktop's gateway dials with) — a self-serve.
 /// - `Private` / `Unknown` → self-serve is allowed; otherwise a valid swarm `credential` (for a swarm
-///   the `authorizer` owns, bound to `source_peer`) is required. `Unknown` (a newer policy's scope
-///   this build can't read) is treated as `Private` so an unrecognised reach never serves the public.
+///   the `authorizer` owns, bound to `source_peer`) is required, and when the model is bound to some
+///   swarms (`allowed_swarms`), the credential's swarm must be one of them. `Unknown` (a newer
+///   policy's scope this build can't read) is treated as `Private` so an unrecognised reach never
+///   serves the public.
 ///
 /// `Ok(())` ⇒ proceed. `Err((reason, is_swarm_refusal))` ⇒ refuse; `is_swarm_refusal` is true only for
 /// a credential-gate failure (so the caller bumps the swarm counter, not for a device-only refusal).
+#[allow(clippy::too_many_arguments)]
 fn scope_gate(
     scope: crate::share_policy::Scope,
     model_ref: &str,
     source_peer: &str,
-    own_peer: &str,
+    own_peers: &[&str],
+    allowed_swarms: Option<&std::collections::BTreeSet<String>>,
     credential: Option<&openhydra_network::membership::MembershipCredential>,
     authorizer: Option<&crate::swarms::SwarmAuthorizer>,
     now_ms: u64,
 ) -> Result<(), (String, bool)> {
     use crate::share_policy::Scope;
+    let own = own_peers.contains(&source_peer);
     match scope {
         Scope::Global => Ok(()),
         Scope::Device => {
-            if source_peer == own_peer {
+            if own {
                 Ok(())
             } else {
                 Err((
@@ -1111,7 +1117,7 @@ fn scope_gate(
             }
         }
         Scope::Private | Scope::Unknown => {
-            if source_peer == own_peer {
+            if own {
                 return Ok(()); // self-serve of one's own private model needs no credential
             }
             let Some(auth) = authorizer else {
@@ -1120,9 +1126,14 @@ fn scope_gate(
                     false,
                 ));
             };
-            auth.authorize(credential, source_peer, now_ms)
-                .map(|_| ())
-                .map_err(|e| (e.to_string(), true))
+            let served = auth.authorize(credential, source_peer, now_ms).map_err(|e| (e.to_string(), true))?;
+            match allowed_swarms {
+                Some(allowed) if !allowed.contains(&served.swarm_public_key.to_ascii_lowercase()) => Err((
+                    format!("model '{model_ref}' is not shared with your swarm"),
+                    true,
+                )),
+                _ => Ok(()),
+            }
         }
     }
 }
@@ -1168,15 +1179,49 @@ fn generate_guarded(
     on_chunk: &mut dyn FnMut(&[u8]),
     keep_going: &mut dyn FnMut(u64) -> bool,
     still_wanted: Option<&(dyn Fn() -> bool + Sync)>,
+    load_now: Option<&dyn Fn() -> crate::serve::ProviderLoad>,
 ) -> ServeSummary {
+    // The terminal `Done` carries this provider's load, read as the serve ends. Other frames pass
+    // through untouched (and undecoded).
+    let mut stamped = |chunk: &[u8]| match load_now {
+        Some(load_now) if crate::serve::is_done_frame(chunk) => on_chunk(&stamp_load(chunk, load_now())),
+        _ => on_chunk(chunk),
+    };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::serve::handle_serve_request_watched(req, adapter, on_chunk, keep_going, still_wanted)
+        crate::serve::handle_serve_request_watched(req, adapter, &mut stamped, keep_going, still_wanted)
     })) {
         Ok(summary) => summary,
         Err(_) => {
             on_chunk(&ServeChunk::Error("provider generation failed".into()).encode());
             ServeSummary { ok: false, ..Default::default() } // tokens 0 → no commitment recorded
         }
+    }
+}
+
+/// `chunk` with `load` written into it when it is the terminal `Done` frame; any other frame unchanged.
+fn stamp_load(chunk: &[u8], load: crate::serve::ProviderLoad) -> Vec<u8> {
+    match ServeChunk::decode(chunk) {
+        Ok(ServeChunk::Done { tokens, mut metrics }) => {
+            metrics.load = Some(load);
+            ServeChunk::Done { tokens, metrics }.encode()
+        }
+        _ => chunk.to_vec(),
+    }
+}
+
+/// Counts a serve as running on this provider for as long as it lives.
+struct ServeSlot<'a>(&'a std::sync::atomic::AtomicU32);
+
+impl<'a> ServeSlot<'a> {
+    fn start(count: &'a std::sync::atomic::AtomicU32) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        ServeSlot(count)
+    }
+}
+
+impl Drop for ServeSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1419,6 +1464,11 @@ pub struct Provider<A: EngineAdapter> {
     /// This machine's own gateway, when it runs under another identity (the desktop's): exempt from
     /// the payment gate, like our own peer id (it never settles with us).
     self_consumer: Option<String>,
+    /// Serves running right now, and how many run at once, for the load each serve reports.
+    running: std::sync::atomic::AtomicU32,
+    serve_slots: std::sync::atomic::AtomicU32,
+    /// Recent decode speed across serves, tokens a second (a moving average; 0 until one is seen).
+    recent_tok_s: std::sync::atomic::AtomicU32,
     /// The on-chain claim kept with each `settled_receipts` entry (same key), on a settlement chain.
     settled_claims: Mutex<HashMap<String, KeptClaim>>,
     /// The on-chain deployment paying receipts settle on: a paying receipt is co-signed only with a
@@ -1595,6 +1645,9 @@ impl<A: EngineAdapter> Provider<A> {
             settled_claims: Mutex::new(HashMap::new()),
             settlement_chain: None,
             self_consumer: None,
+            running: std::sync::atomic::AtomicU32::new(0),
+            serve_slots: std::sync::atomic::AtomicU32::new(1),
+            recent_tok_s: std::sync::atomic::AtomicU32::new(0),
             paid_generating: Arc::new(Mutex::new(HashMap::new())),
             next_reservation: std::sync::atomic::AtomicU64::new(0),
             private_members: Mutex::new(HashMap::new()),
@@ -1996,6 +2049,34 @@ impl<A: EngineAdapter> Provider<A> {
 
     /// Whether `peer` is this node, or our own co-located consumer (the desktop's gateway): it never
     /// settles with us.
+    /// The peers that count as this machine for the reach gate: this node, and the co-located
+    /// consumer (the desktop's gateway dials with its own key, so without it the app couldn't use
+    /// its own Device or Private models).
+    fn own_peers(&self) -> Vec<&str> {
+        let mut own = vec![self.net.libp2p_peer_id()];
+        own.extend(self.self_consumer.as_deref());
+        own
+    }
+
+    /// This provider's load as a serve ends: the serves still running besides it, its slots, and its
+    /// recent speed.
+    fn load_now(&self) -> crate::serve::ProviderLoad {
+        crate::serve::ProviderLoad {
+            in_flight: self.running.load(Ordering::SeqCst).saturating_sub(1),
+            capacity: self.serve_slots.load(Ordering::SeqCst).max(1),
+            decode_tok_s: self.recent_tok_s.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Fold one serve's decode speed into the recent average (one part in four).
+    fn note_speed(&self, tok_s: f64) {
+        if tok_s > 0.0 && tok_s.is_finite() {
+            let prev = f64::from(self.recent_tok_s.load(Ordering::Relaxed));
+            let next = if prev == 0.0 { tok_s } else { prev * 0.75 + tok_s * 0.25 };
+            self.recent_tok_s.store(next.round().min(f64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        }
+    }
+
     fn is_own_consumer(&self, peer: &str) -> bool {
         peer == self.net.libp2p_peer_id() || self.self_consumer.as_deref() == Some(peer)
     }
@@ -2107,11 +2188,15 @@ impl<A: EngineAdapter> Provider<A> {
             Some(scope) => scope,
             None => self.policy.strictest_scope(),
         };
+        // The swarms that may reach it: the model's own binding, or, for a name the gate doesn't
+        // recognise, only what every binding allows (it could be an alias for any of them).
+        let allowed_swarms = if known { self.policy.swarms_of(engine_ref) } else { self.policy.strictest_swarms() };
         match scope_gate(
             scope,
             &req.model_ref,
             source_peer,
-            self.net.libp2p_peer_id(),
+            &self.own_peers(),
+            allowed_swarms.as_ref(),
             req.credential.as_ref(),
             self.swarm_auth.as_deref(),
             now_unix_ms(),
@@ -2170,7 +2255,8 @@ impl<A: EngineAdapter> Provider<A> {
                 scope,
                 model,
                 peer,
-                self.net.libp2p_peer_id(),
+                &self.own_peers(),
+                self.policy.swarms_of(model).as_ref(),
                 credential.as_ref(),
                 self.swarm_auth.as_deref(),
                 now,
@@ -2524,13 +2610,16 @@ impl<A: EngineAdapter> Provider<A> {
         // Asked between deltas, and (for the consumer still polling) from a watcher while none flow.
         let streams = &self.streams;
         let still_wanted = move || stream_wanted_in(streams, &nonce);
+        let running = ServeSlot::start(&self.running);
         let summary = generate_guarded(
             req,
             &self.adapter,
             &mut |c| self.stream_append(nonce, c),
             &mut |sent| self.stream_wanted(&nonce) && budget(sent),
             Some(&still_wanted),
+            Some(&|| self.load_now()),
         );
+        drop(running);
         // B-S1: the serve's commitment (what its settlement receipt is checked against) is what the
         // consumer's polls returned, recorded as they return it (`commit_fetched`): a stream it read
         // only part of is owed for that part, and one it read nothing of is owed nothing.
@@ -2542,6 +2631,7 @@ impl<A: EngineAdapter> Provider<A> {
         if let Some(stats) = &self.stats {
             let e = &summary.metrics.engine;
             let native_tps = sample_tps(e);
+            self.note_speed(native_tps);
             // A serve to our own gateway isn't a market transaction: counted apart from served.
             stats.record_serve_for(&engine_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
         }
@@ -3022,6 +3112,8 @@ impl<A: EngineAdapter> Provider<A> {
             if !policy.announce_globally(&model.engine_ref) {
                 continue;
             }
+            // Load is reported with each serve, not in the advert: an advert is two minutes old at
+            // best, and self-reported load there would weigh against earned reputation in ranking.
             let record = build_peer_record(
                 model,
                 names.public(&model.engine_ref),
@@ -3166,6 +3258,7 @@ impl<A: EngineAdapter> Provider<A> {
         // hold the only worker while every other serve is shed): such an engine serves leechers at
         // full priority.
         let max_concurrency = if exclusive { 1 } else { max_concurrency };
+        self.serve_slots.store(u32::try_from(max_concurrency.max(1)).unwrap_or(u32::MAX), Ordering::SeqCst);
         let pool = if exclusive { WorkerPool::with_queue(1, 0) } else { WorkerPool::new(max_concurrency) };
         let challenge_pool = exclusive.then(|| WorkerPool::new(CONTROL_WORKERS));
         let control_pool = WorkerPool::new(CONTROL_WORKERS);
@@ -3674,13 +3767,16 @@ impl<A: EngineAdapter> Provider<A> {
                         // nonce stuck `Generating` until the consumer's serve timeout). The panic
                         // path pushes the terminal into `chunks`, which is stored + returned below.
                         req.model_ref = engine_ref.clone();
+                        let running = ServeSlot::start(&self.running);
                         let summary = generate_guarded(
                             req,
                             &self.adapter,
                             &mut |c| chunks.push(c.to_vec()),
                             &mut self.serve_budget(reservation.as_ref()),
                             None,
+                            Some(&|| self.load_now()),
                         );
+                        drop(running);
                         // B-S1: record what we served under the consumer's committed nonce so
                         // its settlement receipt can be validated (right tokens/model, once). Not
                         // delivered yet: it is once the reply (or a fetch of it by nonce) is sent
@@ -3700,6 +3796,7 @@ impl<A: EngineAdapter> Provider<A> {
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
                             let native_tps = sample_tps(e);
+                            self.note_speed(native_tps);
                             stats.record_serve_for(&engine_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
                         }
                         summary
@@ -4028,25 +4125,25 @@ mod tests {
 
         #[test]
         fn global_is_open_to_anyone_no_credential_needed() {
-            assert!(scope_gate(Scope::Global, "m", "12D3KooWStranger", OWN, None, None, 0).is_ok());
+            assert!(scope_gate(Scope::Global, "m", "12D3KooWStranger", &[OWN], None, None, None, 0).is_ok());
         }
 
         #[test]
         fn device_is_loopback_only() {
             // Our own node (self-serve) passes; any other peer is refused as device-only.
-            assert!(scope_gate(Scope::Device, "m", OWN, OWN, None, None, 0).is_ok());
-            let err = scope_gate(Scope::Device, "m", "12D3KooWOther", OWN, None, None, 0).unwrap_err();
+            assert!(scope_gate(Scope::Device, "m", OWN, &[OWN], None, None, None, 0).is_ok());
+            let err = scope_gate(Scope::Device, "m", "12D3KooWOther", &[OWN], None, None, None, 0).unwrap_err();
             assert!(err.0.contains("device-only") && !err.1);
         }
 
         #[test]
         fn private_self_serve_needs_no_credential() {
-            assert!(scope_gate(Scope::Private, "m", OWN, OWN, None, None, 0).is_ok());
+            assert!(scope_gate(Scope::Private, "m", OWN, &[OWN], None, None, None, 0).is_ok());
         }
 
         #[test]
         fn private_without_an_authorizer_is_refused_fail_closed() {
-            let err = scope_gate(Scope::Private, "m", "12D3KooWMember", OWN, None, None, 0).unwrap_err();
+            let err = scope_gate(Scope::Private, "m", "12D3KooWMember", &[OWN], None, None, None, 0).unwrap_err();
             assert!(err.0.contains("no swarm configured") && !err.1, "device-only-style, not a swarm-counter refusal");
         }
 
@@ -4061,12 +4158,47 @@ mod tests {
             let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
 
             // Valid credential bound to the connecting member → proceed.
-            assert!(scope_gate(Scope::Private, "m", &member_peer, OWN, Some(&approved.credential), Some(&auth), 4_000).is_ok());
+            assert!(scope_gate(Scope::Private, "m", &member_peer, &[OWN], None, Some(&approved.credential), Some(&auth), 4_000).is_ok());
             // A stranger with no credential → refused, and it counts as a swarm refusal.
-            let err = scope_gate(Scope::Private, "m", "12D3KooWStranger", OWN, None, Some(&auth), 4_000).unwrap_err();
+            let err = scope_gate(Scope::Private, "m", "12D3KooWStranger", &[OWN], None, None, Some(&auth), 4_000).unwrap_err();
             assert!(err.1, "a credential-gate refusal bumps the swarm counter");
             // `Unknown` scope is gated exactly like `Private` (fail-closed): the same stranger is refused.
-            assert!(scope_gate(Scope::Unknown, "m", "12D3KooWStranger", OWN, None, Some(&auth), 4_000).is_err());
+            assert!(scope_gate(Scope::Unknown, "m", "12D3KooWStranger", &[OWN], None, None, Some(&auth), 4_000).is_err());
+        }
+
+        #[test]
+        fn a_model_bound_to_one_swarm_refuses_a_member_of_another() {
+            let owner_dir = tempfile::tempdir().unwrap();
+            let member = Identity::load_or_create(&tempfile::tempdir().unwrap().path().join("id")).unwrap();
+            let team_a = create_swarm(owner_dir.path(), "team a", 1_000).unwrap();
+            let team_b = create_swarm(owner_dir.path(), "team b", 1_000).unwrap();
+            let req = build_enrollment_request(&member, &team_a.swarm_public_key, "m", 2_000).unwrap();
+            let approved = approve_member(owner_dir.path(), &team_a.swarm_public_key, &req.magnet, "m", 24 * HOUR, 3_000).unwrap();
+            let member_peer = credential_member_peer_id(&approved.credential).unwrap().to_string();
+            let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+            let only = |pk: &str| std::collections::BTreeSet::from([pk.to_ascii_lowercase()]);
+            let gate = |allowed: Option<&std::collections::BTreeSet<String>>| {
+                scope_gate(Scope::Private, "m", &member_peer, &[OWN], allowed, Some(&approved.credential), Some(&auth), 4_000)
+            };
+
+            // Unbound: any swarm this rig owns, as before.
+            assert!(gate(None).is_ok());
+            // Bound to the member's own swarm: served.
+            assert!(gate(Some(&only(&team_a.swarm_public_key))).is_ok());
+            // Bound to the other swarm: refused, and counted as a swarm refusal.
+            let err = gate(Some(&only(&team_b.swarm_public_key))).unwrap_err();
+            assert!(err.0.contains("not shared with your swarm") && err.1, "{err:?}");
+            // Bound to nothing anyone holds (an empty intersection): refused.
+            assert!(gate(Some(&std::collections::BTreeSet::new())).is_err());
+        }
+
+        #[test]
+        fn the_co_located_consumer_counts_as_this_machine() {
+            const CONSUMER: &str = "12D3KooWDesktopConsumer";
+            for scope in [Scope::Device, Scope::Private, Scope::Unknown] {
+                assert!(scope_gate(scope, "m", CONSUMER, &[OWN, CONSUMER], None, None, None, 0).is_ok(), "{scope:?}");
+                assert!(scope_gate(scope, "m", "12D3KooWOther", &[OWN, CONSUMER], None, None, None, 0).is_err(), "{scope:?}");
+            }
         }
     }
 
@@ -4958,6 +5090,56 @@ mod tests {
     }
 
     #[test]
+    fn a_serve_through_the_guard_reports_its_load_in_done_only() {
+        struct Two;
+        impl EngineAdapter for Two {
+            fn engine_name(&self) -> &'static str { "two" }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> { Ok(vec![]) }
+            fn serve_stream(&self, _req: &InferenceRequest, on_delta: &mut dyn FnMut(&str)) -> Result<ServeOutcome, AdapterError> {
+                on_delta("a");
+                on_delta("b");
+                Ok(ServeOutcome { tokens: 2, done: true, ..Default::default() })
+            }
+        }
+        let req = ServeRequest {
+            reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
+            max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+        };
+        let load = crate::serve::ProviderLoad { in_flight: 1, capacity: 2, decode_tok_s: 40 };
+        let calls = std::cell::Cell::new(0);
+        let load_now = || { calls.set(calls.get() + 1); load };
+        let mut frames = Vec::new();
+        let summary = generate_guarded(req, &Two, &mut |c| frames.push(c.to_vec()), &mut |_| true, None, Some(&load_now));
+        assert!(summary.ok);
+        let decoded: Vec<ServeChunk> = frames.iter().map(|f| ServeChunk::decode(f).unwrap()).collect();
+        assert!(matches!(&decoded[..], [ServeChunk::Delta(a), ServeChunk::Delta(b), ServeChunk::Done { tokens: 2, .. }] if a == "a" && b == "b"), "{decoded:?}");
+        assert!(matches!(decoded.last(), Some(ServeChunk::Done { metrics, .. }) if metrics.load == Some(load)));
+        assert_eq!(calls.get(), 1, "the load is read once, for the Done frame only");
+    }
+
+    #[test]
+    fn the_terminal_done_frame_carries_the_providers_load() {
+        let load = crate::serve::ProviderLoad { in_flight: 3, capacity: 4, decode_tok_s: 61 };
+        let done = ServeChunk::Done { tokens: 9, metrics: Default::default() }.encode();
+        match ServeChunk::decode(&stamp_load(&done, load)) {
+            Ok(ServeChunk::Done { tokens: 9, metrics }) => assert_eq!(metrics.load, Some(load)),
+            other => panic!("{other:?}"),
+        }
+        // Any other frame passes through untouched.
+        let delta = ServeChunk::Delta("hi".into()).encode();
+        assert_eq!(stamp_load(&delta, load), delta);
+        // The serve count drops when its slot does.
+        let running = std::sync::atomic::AtomicU32::new(0);
+        {
+            let _a = ServeSlot::start(&running);
+            let _b = ServeSlot::start(&running);
+            assert_eq!(running.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn generate_guarded_turns_a_panic_into_a_terminal_error() {
         // F5: a panicking engine must not propagate out of generation — for streaming it would
         // leave the buffer `done=false` (→ 120s consumer stall); for the buffered path it would
@@ -4984,7 +5166,7 @@ mod tests {
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.
-        let summary = generate_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()), &mut |_| true, None);
+        let summary = generate_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()), &mut |_| true, None, None);
         assert!(!summary.ok);
         assert_eq!(summary.tokens, 0, "no tokens → no commitment recorded");
         let last = frames.last().expect("a terminal frame was appended");
@@ -5326,7 +5508,7 @@ mod tests {
         let run = |nonce: [u8; 16]| {
             generate_guarded(req(nonce), &provider.adapter, &mut |c| provider.stream_append(nonce, c), &mut |_| {
                 provider.stream_wanted(&nonce)
-            }, None)
+            }, None, None)
         };
         // Polled recently: it runs to the end.
         let live = [1u8; 16];

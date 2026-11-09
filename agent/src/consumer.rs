@@ -740,6 +740,136 @@ fn rep_model_key<'a>(_canonical_model_id: &'a str, model_id: &'a str) -> &'a str
 /// per-`(peer, model)` keying). `Some(score)` wins; `None` falls back to the self-reported DHT
 /// value (neutral when absent). This is the closed loop that downranks a provider that has
 /// misbehaved with *this* consumer *on this model* — trust on another model does not carry over.
+/// How long a provider's reported load counts (unix ms). Older reports say little about now.
+const LOAD_REPORT_FRESH_MS: u64 = 60_000;
+/// At most this many providers' load reports are kept.
+const MAX_LOAD_REPORTS: usize = 4_096;
+/// How many of the leading, equally eligible candidates [`spread_load`] chooses among.
+const SPREAD_AMONG: usize = 4;
+/// How far below the first candidate's earned reputation (0–100), or below the neutral 50 when the
+/// first has earned more, another may be and still share its load. A failed serve multiplies
+/// reputation by 0.6 (20 points from the neutral 50), so a provider that just failed us isn't
+/// promoted; one we haven't tried yet (50) always is.
+const SPREAD_REPUTATION_MARGIN: f64 = 10.0;
+
+/// How many leading `candidates` are equally eligible to share load with the first: the same `lead`
+/// key (refusals, availability, connection) and an `earned` reputation within
+/// [`SPREAD_REPUTATION_MARGIN`] of the first's, or of the neutral reputation when the first has
+/// earned more. Stops at the first that isn't.
+///
+/// The floor is capped at neutral because honoured serves raise reputation: measured against the
+/// first's alone, a provider that served a few requests more would shut out every untried one, which
+/// would then never get the requests that could raise its own (seen live on 2026-11-09: one of two
+/// equal vLLM providers took 168 of 168).
+fn spread_eligible<T, K: PartialEq>(candidates: &[T], lead: &dyn Fn(&T) -> K, earned: &dyn Fn(&T) -> f64) -> usize {
+    let Some(first) = candidates.first() else { return 0 };
+    let floor = earned(first).min(NEUTRAL_REPUTATION) - SPREAD_REPUTATION_MARGIN;
+    let key = lead(first);
+    candidates.iter().take_while(|c| lead(c) == key && earned(c) >= floor).count()
+}
+
+/// How busy a provider looks: serves per serve slot from its fresh `report`, never less than the
+/// `open` serves this consumer has there; with no report, `open` against one slot.
+fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
+    match report {
+        Some(l) => f64::from(l.in_flight.max(open)) / f64::from(l.capacity.max(1)),
+        None => f64::from(open),
+    }
+}
+
+/// How long a conversation stays with the provider that served it last. Engines evict an idle
+/// prompt cache; after this the conversation is placed like any other request.
+const AFFINITY_TTL_MS: u64 = 10 * 60 * 1000;
+/// At most this many conversations are remembered.
+const MAX_AFFINITY: usize = 16_384;
+/// How much of each of the first messages goes into the conversation key.
+const AFFINITY_KEY_BYTES: usize = 4_096;
+
+/// A key for the conversation `messages` belong to: the model and the first two messages (in a chat
+/// or a coding agent, the system prompt and the first request), which every later turn of the same
+/// conversation repeats. Only a hash is kept, never the text.
+fn conversation_key(model: &str, messages: &[ChatMessage]) -> Option<[u8; 16]> {
+    use sha2::Digest;
+    // A single message has no history to reuse yet, but its key matches its own next turn, so it is
+    // keyed too; an empty request is not.
+    if messages.is_empty() {
+        return None;
+    }
+    let mut h = sha2::Sha256::new();
+    h.update(b"openhydra-affinity-v1\0");
+    h.update(model.as_bytes());
+    for m in messages.iter().take(2) {
+        h.update([0u8]);
+        h.update(m.role.as_bytes());
+        h.update([0u8]);
+        let c = m.content.as_bytes();
+        h.update(&c[..c.len().min(AFFINITY_KEY_BYTES)]);
+    }
+    let d = h.finalize();
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&d[..16]);
+    Some(k)
+}
+
+/// Put the conversation's previous provider first when it is among the first `eligible` candidates
+/// and has room (`has_room`); otherwise leave the order alone. Returns whether it moved.
+fn prefer_sticky<T>(candidates: &mut [T], eligible: usize, is_sticky: &dyn Fn(&T) -> bool, has_room: &dyn Fn(&T) -> bool) -> bool {
+    let n = eligible.min(candidates.len());
+    match candidates[..n].iter().position(|c| is_sticky(c)) {
+        Some(i) if has_room(&candidates[i]) => {
+            candidates[..=i].rotate_right(1);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// What [`spread_load`] compares: how busy a provider looks, plus its network distance (the latest
+/// ping round trip), so that between two about equally busy providers the closer one wins. 100 ms of
+/// round trip weighs like 5% more load; no measurement adds nothing.
+fn spread_cost(busy: f64, rtt: Option<std::time::Duration>) -> f64 {
+    busy + rtt.map_or(0.0, |r| r.as_secs_f64() * 0.5)
+}
+
+/// A serve open at a provider: counted in [`ConsumerNode::open_at`] until dropped.
+struct OpenServe<'a> {
+    consumer: &'a ConsumerNode,
+    provider: String,
+}
+
+impl Drop for OpenServe<'_> {
+    fn drop(&mut self) {
+        let mut m = self.consumer.open_at.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.provider) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.provider);
+            }
+        }
+    }
+}
+
+/// Spread requests across equally good providers: of the first `eligible` candidates (at most
+/// [`SPREAD_AMONG`]), take two at random and move the less busy one to the front ("the power of two
+/// choices"). The order behind it is kept for failover. Picking between two random candidates rather
+/// than always the least busy avoids every consumer piling onto the same provider at once.
+/// `pick(n)` returns a random index below `n`.
+fn spread_load<T>(candidates: &mut [T], eligible: usize, busy: &dyn Fn(&T) -> f64, pick: &mut dyn FnMut(usize) -> usize) {
+    let n = eligible.min(candidates.len()).min(SPREAD_AMONG);
+    if n < 2 {
+        return;
+    }
+    let a = pick(n);
+    let mut b = pick(n - 1);
+    if b >= a {
+        b += 1;
+    }
+    let (first, second) = (a.min(b), a.max(b));
+    // The less busy of the two; on a tie, the better ranked.
+    let chosen = if busy(&candidates[second]) < busy(&candidates[first]) { second } else { first };
+    candidates[..=chosen].rotate_right(1);
+}
+
 pub fn rank_providers_with_reputation(
     peers: &[DiscoveredPeer],
     request_canonical: &str,
@@ -1673,6 +1803,14 @@ pub struct ConsumerNode {
     /// not a real market transaction, so we skip receipt settlement, reputation, and give/take
     /// credit for it — no self-earning or self-deduction. `None` = consumer-only node.
     self_provider: Option<String>,
+    /// The load each provider last reported with a finished serve, and when (unix ms), keyed by
+    /// libp2p id: what [`spread_load`] compares.
+    reported_load: Mutex<HashMap<String, (crate::serve::ProviderLoad, u64)>>,
+    /// Serves this consumer has open at each provider right now, keyed by libp2p id.
+    open_at: Mutex<HashMap<String, u32>>,
+    /// Conversation → the provider that last served it and when (unix ms), so a conversation's next
+    /// turn goes back to the engine that holds its prompt in cache ([`conversation_key`]).
+    affinity: Mutex<HashMap<[u8; 16], (String, u64)>>,
     /// P1c streaming: providers observed to answer `SERVE_STREAM` with a legacy (non-streaming)
     /// reply, keyed by libp2p id. We skip re-probing these and go straight to the buffered path.
     /// Best-effort/advisory — a wrong entry only forfeits the streaming benefit, never correctness
@@ -2061,6 +2199,9 @@ impl ConsumerNode {
             credit: Mutex::new(HashMap::new()),
             stats: None,
             self_provider: None,
+            reported_load: Mutex::new(HashMap::new()),
+            open_at: Mutex::new(HashMap::new()),
+            affinity: Mutex::new(HashMap::new()),
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             seeds: None,
@@ -2468,6 +2609,9 @@ impl ConsumerNode {
             credit: Mutex::new(credit),
             stats: None,
             self_provider: None,
+            reported_load: Mutex::new(HashMap::new()),
+            open_at: Mutex::new(HashMap::new()),
+            affinity: Mutex::new(HashMap::new()),
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             seeds: None,
@@ -2900,6 +3044,59 @@ impl ConsumerNode {
 
     /// Whether `provider` shed or missed a request of ours for `model` within
     /// [`UNAVAILABLE_RANK_LAST_MS`] (it is then tried last).
+    /// Remember the load `provider` reported with a serve that just ended.
+    fn note_load(&self, provider: &str, load: crate::serve::ProviderLoad, now: u64) {
+        let mut m = self.reported_load.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() >= MAX_LOAD_REPORTS && !m.contains_key(provider) {
+            // Bounded: drop the stalest report rather than grow without limit.
+            if let Some(oldest) = m.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone()) {
+                m.remove(&oldest);
+            }
+        }
+        m.insert(provider.to_string(), (load, now));
+    }
+
+    /// How busy `provider` looks from here: its serves per serve slot, from its last report while that
+    /// is fresh, and never less than the serves this consumer has open there. A provider with no fresh
+    /// report counts this consumer's open serves against one slot.
+    fn load_estimate(&self, provider: &str, now: u64) -> f64 {
+        let open = self.open_at.lock().unwrap_or_else(|e| e.into_inner()).get(provider).copied().unwrap_or(0);
+        let report = self
+            .reported_load
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider)
+            .filter(|(_, at)| now.saturating_sub(*at) <= LOAD_REPORT_FRESH_MS)
+            .map(|(l, _)| *l);
+        busy_estimate(open, report)
+    }
+
+    /// The provider that last served this conversation, while that is recent.
+    fn sticky_provider(&self, key: &[u8; 16], now: u64) -> Option<String> {
+        let m = self.affinity.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(key).filter(|(_, at)| now.saturating_sub(*at) <= AFFINITY_TTL_MS).map(|(p, _)| p.clone())
+    }
+
+    /// Remember that `provider` served this conversation.
+    fn note_affinity(&self, key: [u8; 16], provider: &str, now: u64) {
+        let mut m = self.affinity.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() >= MAX_AFFINITY && !m.contains_key(&key) {
+            m.retain(|_, (_, at)| now.saturating_sub(*at) <= AFFINITY_TTL_MS);
+            if m.len() >= MAX_AFFINITY {
+                if let Some(oldest) = m.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) {
+                    m.remove(&oldest);
+                }
+            }
+        }
+        m.insert(key, (provider.to_string(), now));
+    }
+
+    /// Count a serve as open at `provider` until the returned guard drops.
+    fn open_serve(&self, provider: &str) -> OpenServe<'_> {
+        *self.open_at.lock().unwrap_or_else(|e| e.into_inner()).entry(provider.to_string()).or_insert(0) += 1;
+        OpenServe { consumer: self, provider: provider.to_string() }
+    }
+
     fn briefly_unavailable(&self, provider: &str, model: &str, now: u64) -> bool {
         self.unavailable
             .lock()
@@ -3225,6 +3422,14 @@ impl ConsumerNode {
                 let fresh: Vec<_> = pinned
                     .into_iter()
                     .filter(|p| !known.contains(p.libp2p_peer_id.as_str()) && allowed(p))
+                    .map(|mut p| {
+                        // A card is no discovery record, so nothing stamped whether we're connected.
+                        // A current ping round trip says so (it is dropped when the last connection
+                        // closes); without this a card's provider always ranks as a stale record and
+                        // never shares load with a discovered, connected one.
+                        p.connected = self.net.peer_rtt(&p.libp2p_peer_id).is_some();
+                        p
+                    })
                     .collect();
                 if !fresh.is_empty() {
                     tracing::info!(model, n = fresh.len(), "M2: added card-pinned providers");
@@ -3268,6 +3473,52 @@ impl ConsumerNode {
         candidates.sort_by_key(|c| {
             (self.refused_payment(&c.libp2p_peer_id, &c.model_id, now), self.briefly_unavailable(&c.libp2p_peer_id, &c.model_id, now))
         });
+        // Spread load among the leading candidates that are equally eligible: none just refused us or
+        // is briefly unavailable, all have the same connection state as the first (connected
+        // providers stay ahead of stale records), and none has earned well below the first's
+        // reputation here (a provider that failed us doesn't jump ahead because it is idle).
+        let connected: std::collections::HashSet<String> = peers
+            .iter()
+            .filter(|p| p.connected)
+            .map(|p| provider_state_id(&p.peer_id, &p.public_key))
+            .collect();
+        let earned = |c: &SelectedProvider| {
+            self.earned_reputation(&c.state_id, rep_model_key(&c.canonical_model_id, &c.model_id), now).unwrap_or(50.0)
+        };
+        let lead = |c: &SelectedProvider| {
+            (
+                self.refused_payment(&c.libp2p_peer_id, &c.model_id, now),
+                self.briefly_unavailable(&c.libp2p_peer_id, &c.model_id, now),
+                connected.contains(&c.state_id),
+            )
+        };
+        let eligible = spread_eligible(&candidates, &lead, &earned);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let order: Vec<_> = candidates
+                .iter()
+                .take(8)
+                .map(|c| (c.libp2p_peer_id.chars().rev().take(6).collect::<String>(), lead(c), earned(c)))
+                .collect();
+            tracing::debug!(model, eligible, ?order, "spread: candidates (peer, (refused payment, unavailable, connected), earned)");
+        }
+        if eligible >= 2 {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let at = now_unix_ms();
+            let cost = |c: &SelectedProvider| {
+                spread_cost(self.load_estimate(&c.libp2p_peer_id, at), self.net.peer_rtt(&c.libp2p_peer_id))
+            };
+            // A conversation goes back to the provider that served it last, which holds its prompt in
+            // cache, while that provider has room; otherwise the load decides.
+            let sticky = conversation_key(model, messages).and_then(|k| self.sticky_provider(&k, at));
+            let stuck = sticky.as_deref().is_some_and(|p| {
+                prefer_sticky(&mut candidates, eligible, &|c| c.libp2p_peer_id == p, &|c| self.load_estimate(&c.libp2p_peer_id, at) < 1.0)
+            });
+            tracing::debug!(model, has_sticky = sticky.is_some(), stuck, "spread: affinity");
+            if !stuck {
+                spread_load(&mut candidates, eligible, &cost, &mut |n| rng.gen_range(0..n));
+            }
+        }
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
@@ -3318,6 +3569,7 @@ impl ConsumerNode {
             // what it serves under it; the settlement receipt then reuses this exact nonce.
             let request = self.serve_request_for(&provider, messages, max_tokens, temperature, tools, think);
             let provider_libp2p = provider.libp2p_peer_id.clone();
+            let open = self.open_serve(&provider_libp2p);
             let t_serve = std::time::Instant::now();
             // P7/W4: when a tokenizer covers the model, keep the delivered text to count its tokens.
             let model_key_now = rep_model_key(&provider.canonical_model_id, &provider.model_id);
@@ -3384,6 +3636,17 @@ impl ConsumerNode {
             };
             let proxy_roundtrip_ns = exchange.proxy_roundtrip_ns;
             let streamed = opened;
+            drop(open);
+            if let Ok(summary) = &result {
+                if let Some(load) = summary.metrics.load {
+                    self.note_load(&provider_libp2p, load, now_unix_ms());
+                }
+                if summary.ok {
+                    if let Some(k) = conversation_key(model, messages) {
+                        self.note_affinity(k, &provider_libp2p, now_unix_ms());
+                    }
+                }
+            }
             match result {
                 Ok(mut summary) => {
                     summary.discover_ns = discover_ns;
@@ -7771,4 +8034,119 @@ mod tests {
             plain.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
         );
     }
+
+    #[test]
+    fn spreading_load_moves_the_less_busy_of_two_to_the_front() {
+        let busy = |c: &(&str, f64)| c.1;
+        // Picks 0 then 0 → candidates 0 and 1; the second is idle, so it goes first.
+        let mut c = vec![("a", 0.9), ("b", 0.1), ("c", 0.0)];
+        let mut seq = [0usize, 0].into_iter();
+        spread_load(&mut c, 3, &busy, &mut |_| seq.next().unwrap());
+        assert_eq!(c.iter().map(|x| x.0).collect::<Vec<_>>(), ["b", "a", "c"]);
+        // A tie keeps the better ranked one first.
+        let mut c = vec![("a", 0.5), ("b", 0.5)];
+        let mut seq = [1usize, 0].into_iter();
+        spread_load(&mut c, 2, &busy, &mut |_| seq.next().unwrap());
+        assert_eq!(c[0].0, "a");
+        // Only the eligible lead is considered: a busy first with one eligible stays first.
+        let mut c = vec![("a", 0.9), ("b", 0.0)];
+        spread_load(&mut c, 1, &busy, &mut |_| unreachable!("nothing to choose"));
+        assert_eq!(c[0].0, "a");
+    }
+
+    #[test]
+    fn a_conversation_keeps_its_key_as_it_grows() {
+        let m = |role: &str, c: &str| ChatMessage::new(role, c);
+        let turn1 = [m("system", "You are a coding agent."), m("user", "Fix the bug in main.rs")];
+        let mut turn2 = turn1.to_vec();
+        turn2.push(m("assistant", "Done."));
+        turn2.push(m("user", "Now add a test."));
+        let k1 = conversation_key("qwen", &turn1).unwrap();
+        assert_eq!(Some(k1), conversation_key("qwen", &turn2), "later turns repeat the first two messages");
+        assert_ne!(Some(k1), conversation_key("other-model", &turn1), "the model is part of the key");
+        assert_ne!(Some(k1), conversation_key("qwen", &[m("system", "You are a coding agent."), m("user", "Write docs")]));
+        assert_eq!(conversation_key("qwen", &[]), None);
+    }
+
+    #[test]
+    fn a_conversation_returns_to_its_provider_only_while_it_has_room() {
+        let mut c = vec!["a", "b", "c"];
+        // Sticky to b, eligible and with room: b first.
+        assert!(prefer_sticky(&mut c, 3, &|x| *x == "b", &|_| true));
+        assert_eq!(c, ["b", "a", "c"]);
+        // Full: no move (the caller spreads load instead).
+        let mut c = vec!["a", "b"];
+        assert!(!prefer_sticky(&mut c, 2, &|x| *x == "b", &|_| false));
+        assert_eq!(c, ["a", "b"]);
+        // Not among the eligible leaders (say, disconnected): no move.
+        let mut c = vec!["a", "b", "c"];
+        assert!(!prefer_sticky(&mut c, 1, &|x| *x == "c", &|_| true));
+        assert_eq!(c, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn distance_breaks_near_ties_but_not_real_load_differences() {
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        // Equally busy: the 20 ms provider beats the 180 ms one.
+        assert!(spread_cost(0.5, ms(20)) < spread_cost(0.5, ms(180)));
+        // A far but idle provider still beats a near one that is full.
+        assert!(spread_cost(0.0, ms(250)) < spread_cost(1.0, ms(5)));
+        assert_eq!(spread_cost(0.25, None), 0.25);
+    }
+
+    #[test]
+    fn only_equally_eligible_leaders_share_load() {
+        // (name, connected, earned reputation)
+        let lead = |c: &(&str, bool, f64)| c.1;
+        let earned = |c: &(&str, bool, f64)| c.2;
+        // A connected first never shares with a stale record behind it.
+        assert_eq!(spread_eligible(&[("a", true, 50.0), ("b", false, 50.0)], &lead, &earned), 1);
+        // Equal peers share; one that failed us (50 → 30) does not, and nothing past it does.
+        let c = [("a", true, 50.0), ("b", true, 53.0), ("c", true, 30.0), ("d", true, 50.0)];
+        assert_eq!(spread_eligible(&c, &lead, &earned), 2);
+        // A provider that has served us well doesn't shut out one we haven't tried yet.
+        assert_eq!(spread_eligible(&[("a", true, 74.0), ("b", true, 50.0)], &lead, &earned), 2);
+        // A failed one stays out however well the first has done.
+        assert_eq!(spread_eligible(&[("a", true, 74.0), ("b", true, 30.0)], &lead, &earned), 1);
+        assert_eq!(spread_eligible::<(&str, bool, f64), bool>(&[], &lead, &earned), 0);
+    }
+
+    #[test]
+    fn busy_estimates_use_fresh_reports_and_this_consumers_open_serves() {
+        let l = |in_flight, capacity| Some(crate::serve::ProviderLoad { in_flight, capacity, decode_tok_s: 0 });
+        assert_eq!(busy_estimate(0, None), 0.0);
+        assert_eq!(busy_estimate(2, None), 2.0, "no report: our open serves against one slot");
+        assert_eq!(busy_estimate(0, l(2, 4)), 0.5);
+        assert_eq!(busy_estimate(3, l(1, 4)), 0.75, "never less than what we have open there");
+        assert_eq!(busy_estimate(0, l(1, 0)), 1.0, "a zero capacity reads as one slot");
+    }
+
+    #[test]
+    fn the_power_of_two_choices_spreads_requests_evenly() {
+        // 4 equally eligible providers share 16 open requests that arrive and finish at random. The
+        // busiest one, averaged over time, stays within 1.5x the mean (4); always taking the
+        // top-ranked provider would put all 16 on one.
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut load = [0u32; 4];
+        let mut open: Vec<usize> = Vec::new();
+        let (mut busiest_sum, mut samples) = (0u64, 0u64);
+        for step in 0..20_000 {
+            let mut order: Vec<usize> = (0..4).collect();
+            spread_load(&mut order, 4, &|&p| f64::from(load[p]), &mut |n| rng.gen_range(0..n));
+            load[order[0]] += 1;
+            open.push(order[0]);
+            if open.len() > 16 {
+                let done = open.swap_remove(rng.gen_range(0..open.len()));
+                load[done] -= 1;
+            }
+            if step > 1_000 {
+                busiest_sum += u64::from(*load.iter().max().unwrap());
+                samples += 1;
+            }
+        }
+        let busiest = busiest_sum as f64 / samples as f64;
+        assert!(busiest <= 6.0, "the busiest provider averaged {busiest:.2} of 4 per provider");
+    }
+
 }

@@ -181,6 +181,12 @@ pub struct SharePolicy {
     /// entirely. A pre-M5 policy file (no field) reads as `true`.
     #[serde(default = "default_allow_remote_publish")]
     pub allow_remote_publish: bool,
+    /// Which swarms may reach each Private model: model handle → the hex group public keys of the
+    /// swarms it is shared with. A model with no entry (or an empty set) is open to a member of any
+    /// swarm this rig owns, which is how every Private model behaved before this field existed, so
+    /// an older file keeps its meaning. Keyed by clean handle, like [`Self::scopes`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub swarms: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Serde default for [`SharePolicy::allow_remote_publish`] — see that field.
@@ -209,6 +215,7 @@ impl SharePolicy {
             global_consent: BTreeMap::new(),
             default_global_consent: Some(consent_ts()),
             allow_remote_publish: default_allow_remote_publish(),
+            swarms: BTreeMap::new(),
         }
     }
 
@@ -224,6 +231,7 @@ impl SharePolicy {
             global_consent: BTreeMap::new(),
             default_global_consent: None,
             allow_remote_publish: default_allow_remote_publish(),
+            swarms: BTreeMap::new(),
         }
     }
 
@@ -242,6 +250,7 @@ impl SharePolicy {
             global_consent: BTreeMap::new(),
             default_global_consent: None,
             allow_remote_publish: default_allow_remote_publish(),
+            swarms: BTreeMap::new(),
         }
     }
 
@@ -272,6 +281,7 @@ impl SharePolicy {
                 global_consent: BTreeMap::new(),
                 default_global_consent: Some(consent_ts()),
             allow_remote_publish: default_allow_remote_publish(),
+            swarms: BTreeMap::new(),
             }
         }
     }
@@ -295,6 +305,13 @@ impl SharePolicy {
             self.global_consent =
                 self.global_consent.iter().map(|(k, v)| (migrate_key(k), *v)).collect();
         }
+        if !self.swarms.is_empty() {
+            self.swarms = self
+                .swarms
+                .iter()
+                .map(|(k, v)| (migrate_key(k), v.iter().map(|pk| pk.to_ascii_lowercase()).collect()))
+                .collect();
+        }
     }
 
     /// The reach of `engine_ref`: its explicit [`Self::scopes`] entry, or [`Self::default_scope`].
@@ -317,6 +334,22 @@ impl SharePolicy {
             strictest = stricter(strictest, *s);
         }
         strictest
+    }
+
+    /// The swarms `engine_ref` is bound to, or `None` when it is open to every swarm this rig owns
+    /// (no entry, or an empty set). Only meaningful for a Private model.
+    pub fn swarms_of(&self, engine_ref: &str) -> Option<&BTreeSet<String>> {
+        self.swarms.get(engine_ref).filter(|s| !s.is_empty())
+    }
+
+    /// The swarms that may reach a name the gate doesn't recognise (see [`Self::strictest_scope`]):
+    /// such a name could be an alias for any bound model, so only a swarm every binding allows may
+    /// pass. `None` when nothing is bound (any owned swarm, as before); `Some` of the intersection
+    /// otherwise, which may be empty (then no member passes, only this machine).
+    pub fn strictest_swarms(&self) -> Option<BTreeSet<String>> {
+        let mut bound = self.swarms.values().filter(|s| !s.is_empty());
+        let first = bound.next()?.clone();
+        Some(bound.fold(first, |acc, s| acc.intersection(s).cloned().collect()))
     }
 
     /// Whether `engine_ref` should be announced to the **global** discovery (DHT / marketplace).
@@ -581,6 +614,18 @@ impl PolicyWatcher {
     /// [`Scope::Private`] on a poisoned lock (require a credential, never open).
     pub fn strictest_scope(&self) -> Scope {
         self.policy.read().map(|p| p.strictest_scope()).unwrap_or(Scope::Private)
+    }
+
+    /// The swarms `engine_ref` is bound to under the current policy ([`SharePolicy::swarms_of`]).
+    /// Fail-closed on a poisoned lock: an empty set, which no member's credential satisfies.
+    pub fn swarms_of(&self, engine_ref: &str) -> Option<BTreeSet<String>> {
+        self.policy.read().map(|p| p.swarms_of(engine_ref).cloned()).unwrap_or_else(|_| Some(BTreeSet::new()))
+    }
+
+    /// The swarms that may reach an unrecognised name ([`SharePolicy::strictest_swarms`]).
+    /// Fail-closed to an empty set on a poisoned lock.
+    pub fn strictest_swarms(&self) -> Option<BTreeSet<String>> {
+        self.policy.read().map(|p| p.strictest_swarms()).unwrap_or_else(|_| Some(BTreeSet::new()))
     }
 
     /// A clone of the current policy (for the status API).
@@ -1164,5 +1209,29 @@ mod tests {
         let (r1, r2) = (h1.join().unwrap(), h2.join().unwrap());
         assert!(r1 ^ r2, "exactly one racing reload should observe the change (got {r1}, {r2})");
         assert!(w.is_shared("b") && !w.is_shared("a"), "policy applied after the race");
+    }
+    #[test]
+    fn swarm_bindings_read_back_and_unknown_names_get_the_intersection() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let mut p = SharePolicy::share_all();
+        assert_eq!(p.strictest_swarms(), None, "nothing bound: any owned swarm");
+        p.swarms.insert("coder".into(), BTreeSet::from([a.clone(), b.clone()]));
+        p.swarms.insert("chat".into(), BTreeSet::from([a.clone()]));
+        p.swarms.insert("open".into(), BTreeSet::new());
+        assert_eq!(p.swarms_of("chat"), Some(&BTreeSet::from([a.clone()])));
+        assert_eq!(p.swarms_of("open"), None, "an empty set means unbound");
+        assert_eq!(p.swarms_of("other"), None);
+        assert_eq!(p.strictest_swarms(), Some(BTreeSet::from([a.clone()])));
+        // An older file without the field reads as unbound, and the field round-trips.
+        let old: SharePolicy = serde_json::from_str(r#"{"version":3,"mode":"all"}"#).unwrap();
+        assert!(old.swarms.is_empty());
+        let back: SharePolicy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.swarms, p.swarms);
+        // Keys are normalised to lower case on load.
+        let mut upper = SharePolicy::share_all();
+        upper.swarms.insert("chat".into(), BTreeSet::from([a.to_ascii_uppercase()]));
+        upper.normalize_models();
+        assert_eq!(upper.swarms_of("chat"), Some(&BTreeSet::from([a])));
     }
 }

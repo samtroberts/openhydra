@@ -55,6 +55,32 @@ pub struct ServeMetrics {
     /// [`ServeOutcome::hit_token_limit`]: crate::adapter::ServeOutcome::hit_token_limit
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hit_token_limit: bool,
+    /// The provider's load as this serve ended ([`ProviderLoad`]), so consumers can spread work across
+    /// providers. Absent from providers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<ProviderLoad>,
+}
+
+/// How busy a provider is, reported with each serve it finishes: what consumers use to pick the less
+/// loaded of their candidates. Self-reported, so a consumer only ever uses it to order providers it
+/// would route to anyway, never to admit one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderLoad {
+    /// Serves still running on the provider, not counting the one this report ends.
+    pub in_flight: u32,
+    /// How many serves it runs at once (its worker count; 1 for an engine that takes one at a time).
+    pub capacity: u32,
+    /// Its recent decode speed, tokens a second (0 when unknown).
+    pub decode_tok_s: u32,
+}
+
+impl ProviderLoad {
+    /// Busy fraction: serves running per serve slot, 0 when idle, 1 when every slot is busy. Requests
+    /// waiting in the provider's queue aren't counted. A report with no capacity reads as one slot.
+    pub fn busy(&self) -> f64 {
+        f64::from(self.in_flight) / f64::from(self.capacity.max(1))
+    }
 }
 
 /// The billing rule this build follows: the reported count is [`billable_tokens`]. 3: whitespace
@@ -382,6 +408,11 @@ impl ServeRequest {
 
 const TAG_DELTA: u8 = 0x01;
 const TAG_DONE: u8 = 0x02;
+
+/// Whether `frame` is an encoded [`ServeChunk::Done`], without decoding it.
+pub fn is_done_frame(frame: &[u8]) -> bool {
+    frame.first() == Some(&TAG_DONE)
+}
 const TAG_ERROR: u8 = 0x03;
 const TAG_TOOLCALLS: u8 = 0x04;
 
@@ -652,6 +683,7 @@ pub fn handle_serve_request_watched(
                 billing: BILLING_VERSION,
                 stopped: stop.is_set(),
                 hit_token_limit: o.hit_token_limit && !stop.is_set(),
+                load: None,
             };
             // Tool calls (terminal, structured) go in their own frame just before `Done`, so
             // the consumer sees text deltas → tool_calls → done in order.
@@ -1272,6 +1304,7 @@ mod tests {
                     billing: BILLING_VERSION,
                     stopped: true,
                     hit_token_limit: true,
+                    load: Some(ProviderLoad { in_flight: 2, capacity: 4, decode_tok_s: 87 }),
                 },
             },
             ServeChunk::Error("boom".into()),
@@ -1359,6 +1392,19 @@ mod tests {
         assert!(matches!(ServeChunk::decode(&done), Ok(ServeChunk::Done { metrics, .. }) if metrics.hit_token_limit));
         let old: ServeMetrics = serde_json::from_str(r#"{"engine":{"total_duration_ns":0,"load_duration_ns":0,"prompt_eval_count":0,"prompt_eval_duration_ns":0,"eval_count":1,"eval_duration_ns":0},"provider_serve_ns":0,"billing":4}"#).unwrap();
         assert!(!old.hit_token_limit && !old.stopped);
+    }
+
+    #[test]
+    fn a_malformed_load_report_keeps_the_rest_of_the_metrics() {
+        // A newer or odd provider's `load` must not knock out billing, stopped or hit_token_limit.
+        let m: ServeMetrics = serde_json::from_str(
+            r#"{"engine":{"total_duration_ns":0,"load_duration_ns":0,"prompt_eval_count":0,"prompt_eval_duration_ns":0,"eval_count":3,"eval_duration_ns":0},"provider_serve_ns":5,"billing":4,"stopped":true,"hit_token_limit":true,"load":{"in_flight":2,"future_field":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!((m.billing, m.stopped, m.hit_token_limit), (4, true, true));
+        assert_eq!(m.load, Some(ProviderLoad { in_flight: 2, capacity: 0, decode_tok_s: 0 }));
+        assert!(is_done_frame(&ServeChunk::Done { tokens: 1, metrics: m }.encode()));
+        assert!(!is_done_frame(&ServeChunk::Delta("x".into()).encode()));
     }
 
     #[test]

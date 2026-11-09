@@ -7,6 +7,11 @@
 //! * [`FenceTransport`] refuses to dial an address that names one of them (its IP, a `*.openhydra.co`
 //!   name, or its peer id, a relay hop included), before any packet leaves;
 //! * [`Behaviour`] refuses a connection to or from their peer ids, whatever the address.
+//!
+//! The same behaviour enforces an optional **peer allowlist** ([`set_allowed_peers`], the agent's
+//! `--allow-peers-file`): when one is set, a connection with any peer not on it is refused, on every
+//! transport (TCP, QUIC, a relay circuit), so outsiders can't join a private deployment's network even
+//! if they know its addresses.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -110,6 +115,50 @@ impl Transport for FenceTransport {
     }
 }
 
+/// The process-wide peer allowlist ([`set_allowed_peers`]); unset = every peer may connect.
+static ALLOWED_PEERS: std::sync::OnceLock<HashSet<PeerId>> = std::sync::OnceLock::new();
+
+/// Allow connections with `peers` only, for every node this process starts afterwards. Set once,
+/// before the first node starts (like `node::disable_mdns`); a second call is an error.
+pub fn set_allowed_peers(peers: HashSet<PeerId>) -> Result<(), String> {
+    ALLOWED_PEERS.set(peers).map_err(|_| "the peer allowlist is already set".to_string())
+}
+
+/// The peer allowlist, if one is set.
+pub fn allowed_peers() -> Option<&'static HashSet<PeerId>> {
+    ALLOWED_PEERS.get()
+}
+
+/// Read an allowlist file: one base58 peer id per line; blank lines and `#` comments are ignored.
+/// Any line that isn't a peer id is an error, so a typo can't silently shut a peer out.
+pub fn parse_allowlist(text: &str) -> Result<HashSet<PeerId>, String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse::<PeerId>().map_err(|e| format!("not a peer id: {l:?} ({e})")))
+        .collect()
+}
+
+/// The peer id a multiaddr string names (its `/p2p/` part), if any.
+pub fn peer_id_in(addr: &str) -> Option<PeerId> {
+    addr.parse::<Multiaddr>().ok()?.iter().find_map(|p| match p {
+        Protocol::P2p(id) => Some(id),
+        _ => None,
+    })
+}
+
+/// Refused connection with a peer that isn't on the allowlist.
+#[derive(Debug)]
+pub struct NotAllowed;
+
+impl std::fmt::Display for NotAllowed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not on this node's peer allowlist")
+    }
+}
+
+impl std::error::Error for NotAllowed {}
+
 /// Refused connection to or from one of OpenHydra's own peers.
 #[derive(Debug)]
 pub struct FencedPeer;
@@ -122,21 +171,32 @@ impl std::fmt::Display for FencedPeer {
 
 impl std::error::Error for FencedPeer {}
 
-/// The behaviour: refuses connections with fenced peers (off: refuses nothing).
+/// The behaviour: refuses connections with fenced peers, and with peers off the allowlist when one is
+/// set (neither: refuses nothing).
 pub struct Behaviour {
     fenced: Option<Fenced>,
+    allowed: Option<HashSet<PeerId>>,
 }
 
 impl Behaviour {
+    /// The process's allowlist ([`set_allowed_peers`]) applies.
     pub fn new(fenced: Option<Fenced>) -> Self {
-        Self { fenced }
+        Self::with_allowlist(fenced, allowed_peers().cloned())
+    }
+
+    pub fn with_allowlist(fenced: Option<Fenced>, allowed: Option<HashSet<PeerId>>) -> Self {
+        Self { fenced, allowed }
     }
 
     fn check_peer(&self, peer: Option<PeerId>) -> Result<(), ConnectionDenied> {
-        match (&self.fenced, peer) {
-            (Some(f), Some(p)) if f.peer(&p) => Err(ConnectionDenied::new(FencedPeer)),
-            _ => Ok(()),
+        let Some(p) = peer else { return Ok(()) };
+        if self.fenced.as_ref().is_some_and(|f| f.peer(&p)) {
+            return Err(ConnectionDenied::new(FencedPeer));
         }
+        if self.allowed.as_ref().is_some_and(|a| !a.contains(&p)) {
+            return Err(ConnectionDenied::new(NotAllowed));
+        }
+        Ok(())
     }
 }
 
@@ -258,5 +318,32 @@ mod tests {
         }
         // Anything else goes to the inner transport as before (here: a local port nobody listens on).
         assert!(t.dial("/ip4/127.0.0.1/tcp/9".parse().unwrap(), opts).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn only_listed_peers_pass_when_an_allowlist_is_set() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let open = Behaviour::with_allowlist(None, None);
+        assert!(open.check_peer(Some(b)).is_ok(), "no allowlist: everyone");
+        let only_a = Behaviour::with_allowlist(None, Some(HashSet::from([a])));
+        assert!(only_a.check_peer(Some(a)).is_ok());
+        assert!(only_a.check_peer(Some(b)).is_err());
+        assert!(only_a.check_peer(None).is_ok(), "an unknown peer is checked once it is known");
+        // The fence still applies to a listed peer.
+        let fenced = Fenced { ips: HashSet::new(), peers: HashSet::from([a]) };
+        assert!(Behaviour::with_allowlist(Some(fenced), Some(HashSet::from([a]))).check_peer(Some(a)).is_err());
+    }
+
+    #[test]
+    fn allowlist_files_are_strict() {
+        let a = PeerId::random();
+        let text = format!("# the gateway\n{a}  # trailing note\n\n");
+        assert_eq!(parse_allowlist(&text).unwrap(), HashSet::from([a]));
+        assert!(parse_allowlist("12D3KooWnotapeer").is_err(), "a typo is an error, not a silent omission");
     }
 }

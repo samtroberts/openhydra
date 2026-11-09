@@ -32,6 +32,7 @@ pub mod pcp;
 pub mod registry;
 pub mod registry_proto;
 pub mod relay;
+pub mod rtt;
 pub mod routing_cache;
 pub mod swarm;
 pub mod transport;

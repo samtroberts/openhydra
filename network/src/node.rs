@@ -107,6 +107,8 @@ pub fn start_node(
         // so the handle (and the provider run-loop) can observe a network change
         // and re-announce.
         Arc<std::sync::atomic::AtomicU64>,
+        // The latest ping round trip to each peer, recorded by the event loop.
+        Arc<crate::rtt::PeerRtts>,
     ),
     String,
 > {
@@ -186,6 +188,8 @@ pub fn start_node(
     // (which bumps it on rebootstrap), one returned to the handle.
     let net_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let net_generation_loop = Arc::clone(&net_generation);
+    let peer_rtts = Arc::new(crate::rtt::PeerRtts::default());
+    let peer_rtts_loop = Arc::clone(&peer_rtts);
 
     // Use a oneshot to communicate any startup error from the background thread.
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -217,7 +221,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, pcp_bind).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, peer_rtts_loop, pcp_bind).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {}", crate::transport::error_chain(e.as_ref()))));
@@ -234,7 +238,7 @@ pub fn start_node(
         .map_err(|_| "background thread died during startup".to_string())?
         .map_err(|e| format!("startup failed: {e}"))?;
 
-    Ok((cmd_tx, proxy_queue, thread, net_generation))
+    Ok((cmd_tx, proxy_queue, thread, net_generation, peer_rtts))
 }
 
 /// Check one bootstrap multiaddr the way the node will parse it at startup (a valid multiaddr with a

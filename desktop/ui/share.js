@@ -72,7 +72,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
   // file has it — `global` for a legacy file, so upgrading NEVER silently un-shares (the agent's
   // migration materialises the matching consent record); a newly-shared model is set to `private`
   // explicitly (privacy-first), leaving already-global models on their existing reach.
-  let scope = { def: "global", byModel: new Map(), consent: new Map() };
+  let scope = { def: "global", byModel: new Map(), consent: new Map(), swarms: new Map() };
   let scopeLoaded = false, scopeLoadPromise = null;
   function loadScope(r) {
     scope = {
@@ -86,6 +86,9 @@ import { exportCardModal, ensureImportSection } from "./cards";
       // Carried verbatim too: a payload without it would read back as `true` (serde's default) and
       // silently re-allow remote publishing an owner had turned off.
       allowRemote: r?.allow_remote_publish ?? true,
+      // Which swarms each Private model is shared with (model → group public keys). A model with no
+      // entry is open to every swarm you own. Carried verbatim so a save never drops a binding.
+      swarms: new Map(Object.entries(r?.swarms || {}).map(([k, v]) => [k, [...(v || [])]])),
     };
     scopeLoaded = true;
   }
@@ -198,7 +201,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
   function isModelShared(m) { ensurePolicy(); return policy.mode === "all" || policy.models.has(m); }
   // A copy of the reach/consent state, taken BEFORE a caller changes it, so a declined or failed save
   // (e.g. the user cancels the native "Share with everyone?" dialog) puts it back exactly.
-  function snapScope() { return { def: scope.def, byModel: new Map(scope.byModel), consent: new Map(scope.consent), defConsent: scope.defConsent, allowRemote: scope.allowRemote }; }
+  function snapScope() { return { def: scope.def, byModel: new Map(scope.byModel), consent: new Map(scope.consent), defConsent: scope.defConsent, allowRemote: scope.allowRemote, swarms: new Map([...(scope.swarms || new Map())].map(([k, v]) => [k, [...v]])) }; }
   async function savePolicy(mode, models, scopeBefore = null) {
     const prev = policy;                                    // L2: rollback target on failure
     // Snapshot scope too so a failed save reverts reach/consent, not just mode/models (M1).
@@ -214,6 +217,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
       global_consent: Object.fromEntries(scope.consent),
       default_global_consent: scope.defConsent,   // preserve the policy-level consent verbatim
       allow_remote_publish: scope.allowRemote ?? true,
+      swarms: Object.fromEntries([...(scope.swarms || new Map())].filter(([, v]) => v.length)),
     };
     let ok = true;
     try { await call("save_share_policy", { policy: payload }); }
@@ -235,7 +239,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
       // have to stop the whole provider just because the last model was de-selected.
       if (mode === "all") { mode = "list"; models = new Set(shareActiveModels().filter((x) => x !== m)); }
       else models.delete(m);
-      scope.byModel.delete(m); scope.consent.delete(m);   // un-shared → forget its reach + consent
+      scope.byModel.delete(m); scope.consent.delete(m); scope.swarms?.delete(m);   // un-shared → forget its reach + consent
     } else if (mode === "list") {
       models.add(m);   // (in "all" mode it's already shared)
       // Privacy-first: a newly-shared model reaches only your trust domain until you opt it Global.
@@ -318,7 +322,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     if (!only) {
       // The dialog's selection replaces the old one.
       mode = "list";
-      for (const m of all) if (!picked.models.includes(m)) { models.delete(m); scope.byModel.delete(m); scope.consent.delete(m); }
+      for (const m of all) if (!picked.models.includes(m)) { models.delete(m); scope.byModel.delete(m); scope.consent.delete(m); scope.swarms?.delete(m); }
     }
     for (const m of picked.models) {
       models.add(m);
@@ -330,6 +334,48 @@ import { exportCardModal, ensureImportSection } from "./cards";
     if (state?.settings) state.settings.sharing_confirmed = true;   // until the next poll brings it
     toast(`Sharing ${picked.models.length} model${picked.models.length === 1 ? "" : "s"} with ${picked.reach === "global" ? "everyone" : "your swarms"}`);
     if (!running) await setSharing(true, true);
+  }
+  // Choose which of your swarms can use a Private model. "Every swarm I own" removes the binding
+  // (any owned swarm, including ones created later); otherwise only the ticked swarms are served.
+  async function chooseSwarms(m) {
+    ensurePolicy(); await reloadScope();
+    let owned = [];
+    try { owned = (await call("list_swarms")).filter((s) => s.role === "owner"); } catch {}
+    if (!owned.length) { toast("Create a swarm first (Swarms tab)"); return; }
+    const bound = new Set(scope.swarms?.get(m) || []);
+    const CHECKED = html` checked`;
+    const back = document.createElement("div");
+    back.className = "cmodal-back";
+    const rows = owned.map((sw) => html`<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer"><input type="checkbox" data-pk="${sw.swarm_public_key}"${bound.has(sw.swarm_public_key) ? CHECKED : ""}/><span><b>${sw.label || "Unnamed swarm"}</b> <span class="mut mono" style="font-size:10.5px">${sw.fingerprint}</span></span></label>`);
+    setHTML(back, html`<div class="cmodal"><div class="cmodal-h"><b>Which swarms can use ${displayModelName(m)}?</b></div>
+      <div class="cmodal-b">
+      <label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="swmode" value="all"${bound.size ? "" : CHECKED}/><span><b>Every swarm I own</b>, including ones I create later</span></label>
+      <label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="swmode" value="some"${bound.size ? CHECKED : ""}/><span><b>Only these swarms</b>; members of any other swarm are refused</span></label>
+      <div style="max-height:220px;overflow:auto;margin:6px 0 0 24px">${rows}</div>
+      </div>
+      <div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Save</button></div></div>`);
+    document.body.appendChild(back);
+    const picked = await new Promise((resolve) => {
+      const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(null); } };
+      const done = (v) => { document.removeEventListener("keydown", onKey, true); back.remove(); resolve(v); };
+      document.addEventListener("keydown", onKey, true);
+      $(".cx", back).onclick = () => done(null);
+      back.onclick = (e) => { if (e.target === back) done(null); };
+      $$("input[data-pk]", back).forEach((c) => c.onchange = () => { if (c.checked) $("input[name=swmode][value=some]", back).checked = true; });
+      $(".cok", back).onclick = () => {
+        if ($("input[name=swmode]:checked", back)?.value === "all") { done([]); return; }
+        const pks = $$("input[data-pk]", back).filter((c) => c.checked).map((c) => c.dataset.pk);
+        if (!pks.length) { toast("Tick at least one swarm, or choose every swarm you own"); return; }
+        done(pks);
+      };
+      $("input[name=swmode]:checked", back)?.focus();
+    });
+    if (!picked) return;
+    const before = snapScope();
+    if (picked.length) scope.swarms.set(m, picked); else scope.swarms.delete(m);
+    if (await savePolicy(policy.mode, [...policy.models], before)) {
+      toast(picked.length ? `${displayModelName(m)}: ${picked.length} swarm${picked.length === 1 ? "" : "s"}` : `${displayModelName(m)}: every swarm you own`);
+    }
   }
   export function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;
@@ -391,7 +437,12 @@ import { exportCardModal, ensureImportSection } from "./cards";
       else if (!sharedIntent) status = html`<span class="badge secondary">off</span>`;
       else if (gl) status = (announcedSet.has(m) || !hasShareView)
         ? html`<span class="badge ok">live</span>` : html`<span class="badge warn">pending</span>`;
-      else status = html`<span class="badge secondary" title="Not announced publicly. Only members of a swarm you own can use it (set up in Swarms).">swarms only</span>`;
+      else {
+        // Which swarms can use it: all you own, or the ones it is bound to. Click to choose.
+        const bound = scope.swarms?.get(m) || [];
+        const which = bound.length ? `${bound.length} swarm${bound.length === 1 ? "" : "s"}` : "all my swarms";
+        status = html`<button class="badge secondary swbadge" data-swarms="${m}" title="Not announced publicly. Choose which of your swarms can use it.">${which}</button>`;
+      }
       const swTitle = !running ? "Share this model when you start sharing"
         : sharedIntent ? "Sharing — toggle off to stop" : "Toggle on to share this model";
       // Reach control (binary), only for a shared model: a Private | Global segmented pill. Choosing
@@ -464,7 +515,8 @@ import { exportCardModal, ensureImportSection } from "./cards";
     $$("#servetable [data-reach]").forEach((b) => b.onclick = () => setModelScope(b.dataset.reach, b.dataset.to));
     // M2/M4: export a `.openhydra` card — public for a global model, or private (swarm-bound) for a
     // private one.
-    $$("#servetable [data-export-card]").forEach((b) => b.onclick = () => exportCardModal(b.dataset.exportCard, b.dataset.private === "1"));
+    $$("#servetable [data-export-card]").forEach((b) => b.onclick = () => exportCardModal(b.dataset.exportCard, b.dataset.private === "1", scope.swarms?.get(b.dataset.exportCard) || []));
+    $$("#servetable [data-swarms]").forEach((b) => b.onclick = () => chooseSwarms(b.dataset.swarms));
     // M2: build the "Add a model by card" import section once (persists across status refreshes).
     ensureImportSection();
     // incoming strip

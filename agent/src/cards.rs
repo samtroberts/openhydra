@@ -72,6 +72,23 @@ pub fn build_card(
 /// Private and the node to OWN that swarm (`--swarms-dir`), so the card names the swarm its provider
 /// gates on. `now_ms` is injected (no hidden clock).
 #[allow(clippy::too_many_arguments)]
+/// A model bound to some swarms is served only to them, so a card for any other swarm would point
+/// its members at a refusal.
+fn card_swarm_allowed(
+    policy: &crate::share_policy::SharePolicy,
+    engine_ref: &str,
+    model: &str,
+    swarm_public_key: &str,
+) -> Result<(), String> {
+    match policy.swarms_of(engine_ref) {
+        Some(bound) if !bound.contains(&swarm_public_key.to_ascii_lowercase()) => Err(format!(
+            "model {model:?} is not shared with swarm {swarm_public_key} — add that swarm to the model's \
+             sharing first, or export a card for one of the swarms it is shared with"
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub fn run_export(
     model: &str,
     share_policy_file: Option<PathBuf>,
@@ -87,6 +104,10 @@ pub fn run_export(
     // testable without a live engine). Review fix (MODERATE): previously `None` fell back to
     // `share_all()`, so `card export --model X` with the flag omitted would export a model the user
     // had marked private. A card carries reach, so refuse unless the policy confirms the model's reach.
+    // Name the model as detection and the share policy do: a llama.cpp `.gguf` path becomes its file
+    // stem, so `--model /models/x.gguf` (the engine's own id) finds the detected `x`.
+    let model = crate::adapter::normalize_engine_ref(model);
+    let model = model.as_str();
     let policy_file = share_policy_file.ok_or_else(|| {
         format!(
             "refusing to export {model:?} without --share-policy-file — pass the share-policy file to \
@@ -136,6 +157,7 @@ pub fn run_export(
                     ))
                 }
             }
+            card_swarm_allowed(&policy, &detected.engine_ref, model, &pk)?;
             Some(pk)
         }
         // PUBLIC card: only a globally-shared, consented model may become one.
@@ -478,5 +500,16 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&vec![b]).unwrap()).unwrap();
         assert!(store.providers_for("modelaaaa", 1_500).is_empty(), "old card must be gone");
         assert_eq!(store.providers_for("modelbbbb", 1_500).len(), 1, "new card must be served");
+    }
+
+    #[test]
+    fn a_private_card_must_name_a_swarm_the_model_is_shared_with() {
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let mut policy = crate::share_policy::SharePolicy::share_all();
+        assert!(card_swarm_allowed(&policy, "m", "m", &b).is_ok(), "unbound: any owned swarm");
+        policy.swarms.insert("m".into(), std::collections::BTreeSet::from([a.clone()]));
+        assert!(card_swarm_allowed(&policy, "m", "m", &a.to_ascii_uppercase()).is_ok());
+        let err = card_swarm_allowed(&policy, "m", "m", &b).unwrap_err();
+        assert!(err.contains("not shared with swarm"), "{err}");
     }
 }

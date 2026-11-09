@@ -26,6 +26,24 @@ use std::time::Duration;
 /// bucket). Spans sub-100ms cache hits up to multi-second cold generations.
 const LATENCY_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 
+/// Upper bounds (tokens a second) for the decode-speed histogram: a CPU model to a fast GPU.
+const SPEED_BUCKETS: &[f64] = &[5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0];
+
+/// At most this many models get their own series; the rest are counted under `model="other"`, so a
+/// client naming random models can't grow the registry without bound.
+const MAX_MODEL_SERIES: usize = 64;
+
+/// A Prometheus label value with `\`, `"` and line breaks escaped (model names come from clients).
+fn label_value(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+/// Per-model timings: time to first token, and the engine's decode speed.
+struct ModelTimings {
+    ttft: Histogram,
+    decode_speed: Histogram,
+}
+
 /// A fixed-bucket cumulative histogram backed by atomics. `counts[i]` holds the number of
 /// observations that fell in `(bounds[i-1], bounds[i]]`; the final slot is the `+Inf`
 /// overflow. Rendered cumulatively (Prometheus `_bucket` semantics).
@@ -64,16 +82,23 @@ impl Histogram {
 
     fn render(&self, name: &str, help: &str, out: &mut String) {
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+        self.render_series(name, "", out);
+    }
+
+    /// The series lines alone, with `labels` (already escaped, `k="v",` each) before `le`.
+    fn render_series(&self, name: &str, labels: &str, out: &mut String) {
         let mut cumulative = 0u64;
         for (i, &bound) in self.bounds.iter().enumerate() {
             cumulative += self.counts[i].load(Ordering::Relaxed);
-            out.push_str(&format!("{name}_bucket{{le=\"{bound}\"}} {cumulative}\n"));
+            out.push_str(&format!("{name}_bucket{{{labels}le=\"{bound}\"}} {cumulative}\n"));
         }
         cumulative += self.counts[self.bounds.len()].load(Ordering::Relaxed);
-        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cumulative}\n"));
+        out.push_str(&format!("{name}_bucket{{{labels}le=\"+Inf\"}} {cumulative}\n"));
         let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1e6;
-        out.push_str(&format!("{name}_sum {sum}\n"));
-        out.push_str(&format!("{name}_count {}\n", self.count.load(Ordering::Relaxed)));
+        let plain = labels.trim_end_matches(',');
+        let braces = if plain.is_empty() { String::new() } else { format!("{{{plain}}}") };
+        out.push_str(&format!("{name}_sum{braces} {sum}\n"));
+        out.push_str(&format!("{name}_count{braces} {}\n", self.count.load(Ordering::Relaxed)));
     }
 }
 
@@ -92,6 +117,8 @@ pub struct Metrics {
     /// Time to a streamed serve's first acknowledgement (a different quantity from a buffered
     /// serve's full round trip, so kept apart).
     stream_first_ack: Histogram,
+    /// Time to first token and decode speed, per model ([`MAX_MODEL_SERIES`] at most).
+    per_model: std::sync::Mutex<std::collections::BTreeMap<String, ModelTimings>>,
 }
 
 impl Default for Metrics {
@@ -113,6 +140,7 @@ impl Metrics {
             discover_duration: Histogram::new(LATENCY_BUCKETS),
             proxy_roundtrip: Histogram::new(LATENCY_BUCKETS),
             stream_first_ack: Histogram::new(LATENCY_BUCKETS),
+            per_model: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -141,6 +169,24 @@ impl Metrics {
             self.stream_first_ack.observe(proxy_ns as f64 / 1e9);
         } else {
             self.proxy_roundtrip.observe(proxy_ns as f64 / 1e9);
+        }
+    }
+
+    /// One completion's per-model timings: its time to first token (when the caller measured one) and
+    /// the engine's decode speed (when the engine reported enough tokens over enough time to mean
+    /// anything: at least 2 tokens over at least 1 ms).
+    pub fn record_model(&self, model: &str, ttft: Option<Duration>, eval_count: u64, eval_duration_ns: u64) {
+        let mut m = self.per_model.lock().unwrap_or_else(|e| e.into_inner());
+        let key = if m.contains_key(model) || m.len() < MAX_MODEL_SERIES { model } else { "other" };
+        let t = m.entry(key.to_string()).or_insert_with(|| ModelTimings {
+            ttft: Histogram::new(LATENCY_BUCKETS),
+            decode_speed: Histogram::new(SPEED_BUCKETS),
+        });
+        if let Some(ttft) = ttft {
+            t.ttft.observe(ttft.as_secs_f64());
+        }
+        if eval_count >= 2 && eval_duration_ns >= 1_000_000 {
+            t.decode_speed.observe(eval_count as f64 / (eval_duration_ns as f64 / 1e9));
         }
     }
 
@@ -173,6 +219,17 @@ impl Metrics {
         self.discover_duration.render("openhydra_discover_seconds", "Provider-discovery latency.", &mut out);
         self.proxy_roundtrip.render("openhydra_proxy_roundtrip_seconds", "Provider proxy round-trip latency (buffered serves).", &mut out);
         self.stream_first_ack.render("openhydra_stream_first_ack_seconds", "Time to a streamed serve's first acknowledgement.", &mut out);
+        let per_model = self.per_model.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, help, pick) in [
+            ("openhydra_time_to_first_token_seconds", "Time from the request to the first token reaching the client, per model.", 0),
+            ("openhydra_decode_tokens_per_second", "The engine's decode speed per completion, per model.", 1),
+        ] {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+            for (model, t) in per_model.iter() {
+                let h = if pick == 0 { &t.ttft } else { &t.decode_speed };
+                h.render_series(name, &format!("model=\"{}\",", label_value(model)), &mut out);
+            }
+        }
         out
     }
 }
@@ -225,5 +282,23 @@ mod tests {
         let out = m.render_prometheus();
         assert!(out.contains("openhydra_request_duration_seconds_bucket{le=\"30\"} 0"), "{out}");
         assert!(out.contains("openhydra_request_duration_seconds_bucket{le=\"+Inf\"} 1"), "{out}");
+    }
+
+    #[test]
+    fn per_model_timings_are_labelled_escaped_and_bounded() {
+        let m = Metrics::new();
+        m.record_model("qwen2.5:1.5b", Some(Duration::from_millis(300)), 48, 600_000_000);
+        m.record_model("qwen2.5:1.5b", None, 1, 1_000); // too little to be a speed
+        m.record_model("odd\"name\n", Some(Duration::from_millis(80)), 0, 0);
+        for i in 0..MAX_MODEL_SERIES + 5 {
+            m.record_model(&format!("m{i}"), Some(Duration::from_millis(10)), 0, 0);
+        }
+        let out = m.render_prometheus();
+        assert!(out.contains("openhydra_time_to_first_token_seconds_bucket{model=\"qwen2.5:1.5b\",le=\"0.5\"} 1"), "{out}");
+        assert!(out.contains("openhydra_decode_tokens_per_second_count{model=\"qwen2.5:1.5b\"} 1"), "{out}");
+        assert!(out.contains("model=\"odd\\\"name\\n\""), "escaped: {out}");
+        assert!(out.contains("model=\"other\""), "overflow goes to other");
+        let series = out.lines().filter(|l| l.starts_with("openhydra_time_to_first_token_seconds_count")).count();
+        assert_eq!(series, MAX_MODEL_SERIES + 1, "bounded: {series}");
     }
 }

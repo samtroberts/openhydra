@@ -897,6 +897,9 @@ struct LoopState {
     /// to trigger an immediate model re-announce so the DHT record carries the
     /// new relay addresses under the *same* pinned PeerId. Shared with the handle.
     net_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The latest ping round trip to each peer (shared with the handle, for consumers choosing
+    /// between providers).
+    peer_rtts: Arc<crate::rtt::PeerRtts>,
     /// Circuit listen-addrs we currently hold a live reservation for (inserted
     /// on NewListenAddr, removed on Expired/Closed). Lets `rebootstrap()`
     /// re-request only the *missing* reservations instead of blindly
@@ -1330,6 +1333,7 @@ impl LoopState {
             bootstrap_peers: Vec::new(),
             relays: Vec::new(),
             net_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            peer_rtts: Arc::new(crate::rtt::PeerRtts::default()),
             reserved_circuits: std::collections::HashSet::new(),
             last_rebootstrap: None,
             pending_rebootstrap_at: None,
@@ -1365,6 +1369,8 @@ pub async fn run_event_loop(
     // so the provider run-loop can re-announce its DHT record (fresh relay
     // addresses, same pinned PeerId) the moment connectivity is rebuilt.
     net_generation: Arc<std::sync::atomic::AtomicU64>,
+    // The latest ping round trip to each peer, shared with the handle.
+    peer_rtts: Arc<crate::rtt::PeerRtts>,
     // #43-W2: opt-in PCP v6 firewall-pinhole wiring (None = disabled).
     pcp_bind: Option<crate::pcp::PcpBind>,
 ) {
@@ -1377,6 +1383,7 @@ pub async fn run_event_loop(
     state.bootstrap_peers = bootstrap_peers.clone();
     state.relays = relays;
     state.net_generation = net_generation;
+    state.peer_rtts = peer_rtts;
     // Cover the startup window with the rebootstrap cooldown: the inline startup
     // sequence below IS a bootstrap, so a reactive trigger from the initial
     // NewListenAddr burst must not immediately re-run it.
@@ -4191,6 +4198,9 @@ fn handle_swarm_event(
         // Ping keepalive — log failures and evict unreachable peers
         // (Phase 1.6). Success is silent to avoid flooding logs.
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Ping(ping_event)) => {
+            if let Ok(rtt) = ping_event.result {
+                state.peer_rtts.record(&ping_event.peer.to_base58(), rtt);
+            }
             if ping_event.result.is_ok() {
                 state.relay_ping_failures.remove(&ping_event.connection);
                 state.relayed_ping_failures.remove(&ping_event.connection);
@@ -4588,6 +4598,8 @@ fn handle_swarm_event(
             // This is the PRIMARY ghost peer elimination path (Phase 1.1).
             if !swarm.is_connected(&peer_id) {
                 state.peer_connections.remove(&peer_id);
+                // A round trip stands for a live path; with no connection left there is none.
+                state.peer_rtts.forget(&peer_id.to_base58());
 
                 // Ghost-peer purge: Kademlia routing table
                 swarm.behaviour_mut().kademlia.remove_peer(&peer_id);

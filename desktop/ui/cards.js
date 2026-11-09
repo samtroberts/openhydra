@@ -12,7 +12,7 @@ const CARD_TTL_SECS = 30 * 24 * 3600; // 30 days
 
 // ── export: sign + show a card (magnet + JSON). Public for a global model; private (swarm-bound,
 // M4) for a private one — the caller passes `isPrivate` and we resolve which owned swarm to bind. ──
-export async function exportCardModal(model, isPrivate = false) {
+export async function exportCardModal(model, isPrivate = false, boundSwarms = []) {
   let swarm = null;
   if (isPrivate) {
     // A private card must name a swarm the user OWNS. Pick from owned swarms; guide them to Swarms if
@@ -23,6 +23,12 @@ export async function exportCardModal(model, isPrivate = false) {
     } catch {}
     if (!owned.length) {
       toast("Create a swarm first (Swarms tab) — a private card is bound to a swarm you own");
+      return;
+    }
+    // A model shared with only some swarms can only have cards for those.
+    if (boundSwarms.length) owned = owned.filter((s) => boundSwarms.includes(s.swarm_public_key));
+    if (!owned.length) {
+      toast("This model isn't shared with any swarm you own — choose its swarms first");
       return;
     }
     swarm = owned.length === 1 ? owned[0].swarm_public_key : await pickSwarm(owned);
