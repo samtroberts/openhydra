@@ -1775,6 +1775,26 @@ fn list_cards() -> Result<Vec<openhydra_agent::Card>, String> {
     Ok(store.valid_cards(now_unix_ms()))
 }
 
+/// The fallback choice saved for each imported card's model (`ask`, `same-version`, `never`); a
+/// model with none saved isn't listed.
+#[tauri::command]
+fn card_prefs() -> Result<serde_json::Value, String> {
+    let prefs = openhydra_agent::cards::read_card_prefs(&openhydra_agent::cards::prefs_path(&cards_file_path()));
+    serde_json::to_value(prefs.fallback).map_err(|e| e.to_string())
+}
+
+/// Save (or, with `None`, clear) what the gateway does for `model` when its card's provider can't
+/// serve. The running gateway reads it on the next request.
+#[tauri::command]
+fn set_card_fallback(model: String, choice: Option<String>) -> Result<(), String> {
+    let choice = match choice.as_deref() {
+        None | Some("") => None,
+        Some(c) => Some(openhydra_agent::cards::CardFallback::parse(c).ok_or_else(|| format!("unknown fallback choice {c:?}"))?),
+    };
+    let _guard = CARDS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::cards::set_card_fallback(&cards_file_path(), &model, choice).map(|_| ())
+}
+
 /// M2: remove an imported card by its `(libp2p_peer_id, model_id)`. Returns how many were removed.
 #[tauri::command]
 fn remove_imported_card(libp2p_peer_id: String, model_id: String) -> Result<usize, String> {
@@ -2146,6 +2166,18 @@ fn gateway_floor(setting: &str) -> Option<&'static str> {
 
 /// The chat view's error for a gateway reply with a non-success `status` and JSON `body`: the
 /// status, the error's type and its message, so the UI can say what to do (e.g. a floor refusal).
+/// The UI's error event for a gateway error object (`{ type, message, openhydra? }`). A card's
+/// provider that couldn't serve keeps its own message (it is written for people) and its details,
+/// which the chat acts on (asks whether to use another provider of the same version).
+fn error_event(status: u16, err: &serde_json::Value) -> serde_json::Value {
+    let kind = err["type"].as_str().unwrap_or("");
+    let msg = err["message"].as_str().unwrap_or("the provider stopped with an error");
+    match err.get("openhydra").filter(|d| d.is_object()) {
+        Some(details) => serde_json::json!({ "kind": "error", "message": msg, "code": kind, "details": details }),
+        None => serde_json::json!({ "kind": "error", "message": format!("gateway {status} {kind}: {msg}") }),
+    }
+}
+
 fn gateway_error(status: u16, body: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let kind = v["error"]["type"].as_str().unwrap_or("");
@@ -2631,6 +2663,7 @@ async fn chat_completion_stream(
     messages: Vec<ChatMsgIn>,
     max_tokens: Option<u32>,
     temperature: Option<f64>,
+    fallback: Option<String>,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<(), String> {
     let port = state.settings.lock().map_err(|e| e.to_string())?.gateway_port;
@@ -2641,6 +2674,10 @@ async fn chat_completion_stream(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    // What to do when a public card's provider can't serve (`ask` unless the user chose otherwise).
+    if let Some(f) = fallback.filter(|f| openhydra_agent::cards::CardFallback::parse(f).is_some()) {
+        body["openhydra"] = serde_json::json!({ "fallback": f });
+    }
     if let Some(t) = temperature.filter(|t| t.is_finite() && (0.0..=2.0).contains(t)) {
         body["temperature"] = serde_json::json!(t);
     }
@@ -2690,7 +2727,13 @@ async fn chat_completion_stream(
                 return Ok(());
             }
             Ok(Err((status, text))) => {
-                let _ = on_event.send(serde_json::json!({ "kind": "error", "message": gateway_error(status, &text) }));
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let event = if v["error"].get("openhydra").is_some() {
+                    error_event(status, &v["error"])
+                } else {
+                    serde_json::json!({ "kind": "error", "message": gateway_error(status, &text) })
+                };
+                let _ = on_event.send(event);
                 end(&on_event);
                 return Ok(());
             }
@@ -2759,9 +2802,7 @@ async fn chat_completion_stream(
 fn stream_events(chunk: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     if let Some(err) = chunk.get("error") {
-        let kind = err["type"].as_str().unwrap_or("");
-        let msg = err["message"].as_str().unwrap_or("the provider stopped with an error");
-        out.push(serde_json::json!({ "kind": "error", "message": format!("gateway 502 {kind}: {msg}") }));
+        out.push(error_event(502, err));
         return out;
     }
     let choice = &chunk["choices"][0];
@@ -3453,6 +3494,8 @@ fn main() {
             preview_card,
             import_card,
             list_cards,
+            card_prefs,
+            set_card_fallback,
             remove_imported_card,
             take_pending_card,
             list_swarms,
@@ -4056,6 +4099,16 @@ mod tests {
     fn stream_chunks_become_ui_events() {
         let delta = serde_json::json!({ "choices": [{ "delta": { "content": "Hel" }, "finish_reason": null }] });
         assert_eq!(stream_events(&delta), vec![serde_json::json!({ "kind": "delta", "text": "Hel" })]);
+        // A card's provider that couldn't serve: its own message and the details the chat acts on.
+        let card = serde_json::json!({ "error": { "type": "card_provider_unavailable", "message": "qwen: the card's provider is offline.",
+            "openhydra": { "private": false, "reason": "offline", "alternatives": 2, "fallback": "ask" } } });
+        let ev = &stream_events(&card)[0];
+        assert_eq!(ev["message"], "qwen: the card's provider is offline.");
+        assert_eq!(ev["code"], "card_provider_unavailable");
+        assert_eq!(ev["details"]["alternatives"], 2);
+        // Any other error reads as before.
+        let other = serde_json::json!({ "error": { "type": "upstream_error", "message": "boom" } });
+        assert_eq!(stream_events(&other)[0]["message"], "gateway 502 upstream_error: boom");
         let role = serde_json::json!({ "choices": [{ "delta": { "role": "assistant" }, "finish_reason": null }] });
         assert!(stream_events(&role).is_empty());
         let done = serde_json::json!({ "model": "m", "choices": [{ "delta": {}, "finish_reason": "stop" }],

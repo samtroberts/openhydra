@@ -20,6 +20,7 @@ import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tabl
 import { renderEngines } from "./installer";
 import { renderShare, setSharing, toggleSharing, ensureGateway, openShareDialog } from "./share";
 import { wireCardDeepLinks } from "./cards";
+import { fallbackToSend, shouldOfferFallback, offerText, fellBackNote } from "./cardfallback.js";
 import { renderSwarms } from "./swarms";
 import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
@@ -347,6 +348,12 @@ async function sendOne(text, fromHome) {
   if (!(await ensureGateway())) { wait.remove(); return; }
   const messages = s.m.map((x) => ({ role: x[0] === "me" ? "user" : "assistant", content: x[1] }));
   const t0 = Date.now();
+  // A card's model: "ask" unless the user saved a choice, so a person decides before another
+  // provider (another machine) gets the prompt.
+  let prefs = {};
+  try { prefs = await call("card_prefs"); } catch {}
+  let fallback = fallbackToSend(model, prefs);
+  for (let tries = 0; ; tries++) {
   try {
     // Tauri v2 maps camelCase JS args → snake_case Rust params, so `maxTokens` binds to the
     // command's `max_tokens`. Send the slider's current value; if it's somehow missing, omit it
@@ -357,7 +364,7 @@ async function sendOne(text, fromHome) {
     // default for the model applies.
     const tr = $("[data-label='tempk']"), tv = +(tr?.dataset.val);
     const temperature = tr?.dataset.touched && Number.isFinite(tv) ? Math.round(tv * 100) / 100 : undefined;
-    const resp = await completeChat({ model, messages, maxTokens: tokLimit, temperature }, th, wait, slow);
+    const resp = await completeChat({ model, messages, maxTokens: tokLimit, temperature, fallback }, th, wait, slow);
     if (resp?.stopped) { s.m.push(["ai", resp.text || "", { model, tok: "—", tps: "—", rtt: "—", tier: null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), stopped: resp.why || "stopped" }, resp.reasoning || null]); saveSessions(); renderChat(); return; }
     clearTimeout(slow); wait.remove();
     const msg = resp?.choices?.[0]?.message || {};
@@ -368,11 +375,24 @@ async function sendOne(text, fromHome) {
     const meta = { model: resp?.model || model, tok: resp?.usage?.completion_tokens ?? "—", claimed: Number.isFinite(oh.claimed_tokens) ? oh.claimed_tokens : null, tps: oh.engine?.native_tps ? Math.round(oh.engine.native_tps) : "—", rtt: oh.hops_ms?.network_rtt ?? "—", tier: oh.provider_authenticity || null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) };
     pushSample(tpsSamples, oh.engine?.native_tps, "oh_tps");   // rolling throughput for Activity
     pushSample(rttSamples, oh.hops_ms?.network_rtt, "oh_rtt"); // rolling latency for Activity
+    const note = fellBackNote(oh.card);
+    if (note) meta.note = note;
     s.m.push(["ai", reply, meta, reasoning || null]); saveSessions(); renderChat();
+    if (note) toast(note);
     // A reply from another machine counts as used; one from this Mac (no provider tier) doesn't.
     if (resp?.usage?.completion_tokens && oh.provider_authenticity) { setUsedTokens(usedTokens + resp.usage.completion_tokens); store.set("oh_used", usedTokens); renderStatusbar(); }
+    break;
   } catch (e) {
     clearTimeout(slow); wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
+    // A public card's provider couldn't serve and others of the same version can: ask, once.
+    if (tries === 0 && shouldOfferFallback(e?.details)) {
+      const q = offerText(displayModelName(model), e.details);
+      if (await confirmModal(q.title, q.body, q.ok)) {
+        fallback = "same-version";
+        wait.textContent = "Asking another provider of the same version…"; th.appendChild(wait);
+        continue;
+      }
+    }
     const err = document.createElement("div"); err.className = "msg ai"; err.style.color = "hsl(var(--danger))"; err.style.fontSize = "12.5px";
     // A gateway error reply arrives as "gateway <status> <type>: <message>"; anything else is ours.
     const es = String(e), gw = /^gateway (\d{3}) ([a-z_]*): ([\s\S]*)$/.exec(es);
@@ -383,6 +403,8 @@ async function sendOne(text, fromHome) {
       : /control character|expected value|invalid|parse|json/i.test(es) ? `The provider's response couldn't be read — some reasoning models emit raw formatting that breaks parsing. Try turning off thinking on the provider (e.g. /no_think).`
       : es;
     th.appendChild(err);
+    break;
+  }
   }
 }
 // Run one chat request. In the app it streams: the answer appears as it is generated and Send turns
@@ -406,7 +428,7 @@ async function completeChat(args, th, wait, slow) {
   const live = document.createElement("div"); live.className = "msg ai"; live.style.whiteSpace = "pre-wrap";
   const view = { chat: curChat, live, wait, started: false };
   liveView = view;
-  let text = "", reasoning = "", done = null, error = null, stopped = false, incomplete = false;
+  let text = "", reasoning = "", done = null, error = null, stopped = false, incomplete = false, errorDetails = null;
   // The last event is "end": large messages (an image as a data URL) can arrive after the command
   // itself has returned, so the reply is complete only once "end" is seen.
   let ended; const endSeen = new Promise((r) => (ended = r));
@@ -426,14 +448,14 @@ async function completeChat(args, th, wait, slow) {
       if (!view.started) { view.started = true; clearTimeout(slow); wait.remove(); }
       if (!frame) frame = requestAnimationFrame(paint);
     } else if (ev.kind === "done") done = ev;
-    else if (ev.kind === "error") error = ev.message;
+    else if (ev.kind === "error") { error = ev.message; errorDetails = ev.details || null; }
     else if (ev.kind === "stopped") stopped = true;
     else if (ev.kind === "incomplete") incomplete = true;
     else if (ev.kind === "end") ended();
   };
   activeStream = streamId; setSendMode(true);
   try {
-    await call("chat_completion_stream", { streamId, model: args.model, messages: args.messages, maxTokens: args.maxTokens, temperature: args.temperature, onEvent: ch });
+    await call("chat_completion_stream", { streamId, model: args.model, messages: args.messages, maxTokens: args.maxTokens, temperature: args.temperature, fallback: args.fallback, onEvent: ch });
     await Promise.race([endSeen, new Promise((r) => setTimeout(r, 30000))]);
   } finally {
     if (frame) cancelAnimationFrame(frame);
@@ -446,7 +468,8 @@ async function completeChat(args, th, wait, slow) {
   if (stopped || ((error || incomplete) && (sp.answer || sp.reasoning || reasoning))) {
     return { stopped: true, why: stopped ? "stopped" : error ? `ended with an error: ${error}` : "ended early", text: sp.answer, reasoning: [reasoning, sp.reasoning].filter(Boolean).join("\n") };
   }
-  if (error) throw error;
+  // The details (a card's provider that couldn't serve) ride along: String(e) is still the message.
+  if (error) throw errorDetails ? Object.assign(new String(error), { details: errorDetails }) : error;
   return {
     choices: [{ message: { content: text, reasoning_content: reasoning || undefined } }],
     usage: done?.usage || {}, openhydra: done?.openhydra || {}, model: done?.model || args.model,

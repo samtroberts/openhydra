@@ -51,7 +51,9 @@ export function metaRow(m) {
   const charged = m.claimed != null && known(m.tok)
     ? html`<span class="num" title="The provider billed more tokens than its answer holds; your gateway pays only what was delivered">Charged ${m.tok} tokens (provider asked for ${m.claimed}, corrected)</span>`
     : "";
-  return html`<div class="msgmeta"><span>${m.model}</span>${known(m.at) ? html`<span>${m.at}</span>` : ""}${m.tier ? html`<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${charged}${details ? html`<span class="num det">${details}</span>` : ""}</div>`;
+  // A card's model another provider served (its card's provider couldn't): said under the reply.
+  const note = m.note ? html`<span class="mut" title="The card you imported names another provider">${m.note}</span>` : "";
+  return html`<div class="msgmeta"><span>${m.model}</span>${known(m.at) ? html`<span>${m.at}</span>` : ""}${m.tier ? html`<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${charged}${details ? html`<span class="num det">${details}</span>` : ""}${note}</div>`;
 }
 // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as
 // <think>…</think> inside content; some engines (LM Studio serving MLX) strip it and hand

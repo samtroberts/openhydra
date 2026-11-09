@@ -7,6 +7,9 @@ import { call } from "./bridge";
 import { toast } from "./chrome";
 import { emit } from "./bus";
 import { displayModelName } from "./models";
+import { trustByPeerModel, repKey } from "./econ";
+import { tierBadge } from "./format";
+import { cardVersionLine, FALLBACK_CHOICES } from "./cardfallback.js";
 
 const CARD_TTL_SECS = 30 * 24 * 3600; // 30 days
 
@@ -167,7 +170,9 @@ export async function ensureImportSection() {
     previewed = null;
     try {
       const c = await call("preview_card", { input: text });
-      setHTML(previewOut, cardPreviewHtml(c));
+      const prefs = await call("card_prefs").catch(() => ({}));
+      setHTML(previewOut, cardPreviewHtml(c, prefs));
+      wireFallbackSelects(previewOut);
       // Your own card adds nothing: your gateway already reaches your own models.
       const ids = await call("identity_info").catch(() => null);
       if (ids?.sharing?.peer_id && ids.sharing.peer_id === c.libp2p_peer_id) {
@@ -207,7 +212,23 @@ export async function ensureImportSection() {
   await renderImportedList();
 }
 
-function cardPreviewHtml(c) {
+// The choice for a public card's model when its provider can't serve, as words.
+const FALLBACK_LABELS = { "ask": "Ask me", "same-version": "Use another provider of the same version", "never": "Don't use another provider" };
+function fallbackSelect(model, current) {
+  const opts = FALLBACK_CHOICES.map((v) => html`<option value="${v}"${v === current ? html` selected` : ""}>${FALLBACK_LABELS[v]}</option>`);
+  return html`<label class="mut" style="font-size:11.5px;display:flex;gap:6px;align-items:center">If its provider is offline or busy: <select class="input cardfb" data-model="${model}" style="font-size:11.5px;padding:2px 4px">${opts}</select></label>`;
+}
+// Saving a choice (preview or imported list): every select with data-model in `root`.
+function wireFallbackSelects(root) {
+  $$("select.cardfb", root).forEach((sel) => {
+    sel.onchange = async () => {
+      try { await call("set_card_fallback", { model: sel.dataset.model, choice: sel.value }); toast(`${displayModelName(sel.dataset.model)}: ${FALLBACK_LABELS[sel.value].toLowerCase()}`); }
+      catch (e) { toast(`Couldn't save: ${e}`); }
+    };
+  });
+}
+
+function cardPreviewHtml(c, prefs) {
   const exp = new Date(Number(c.expires_at)).toLocaleDateString();
   const price =
     c.pricing_mode === "paid" ? "paid" : c.pricing_mode === "ad_supported" ? "ad-supported" : "free (reciprocal)";
@@ -216,11 +237,16 @@ function cardPreviewHtml(c) {
   const priv = c.swarm_public_key
     ? html` <span class="badge secondary" title="Private — you must be a member of this swarm to serve from it">🔒 private</span>`
     : "";
+  // Trust: what your gateway knows of this provider for this model (usually New at import).
+  const t = trustByPeerModel()[repKey(c.openhydra_peer_id, c.model_id)] || {};
+  const version = cardVersionLine(c.canonical_id);
   return html`<div class="card pad" style="font-size:11.5px">
-    <div><b>${displayModelName(c.model_id)}</b> <span class="badge ok">✔ signature valid</span>${priv}</div>
-    <div class="mut" style="margin-top:4px">provider ${peerShort(c.libp2p_peer_id)} · ${price} · ${region}expires ${exp}</div>
-    ${c.swarm_public_key ? html`<div class="mut" style="margin-top:2px">swarm ${peerShort(c.swarm_public_key)} — you'll serve from it only if you're a member</div>` : ""}
-    ${c.canonical_id ? html`<div class="mut" style="margin-top:2px">${c.canonical_id}</div>` : ""}
+    <div><b>${displayModelName(c.model_id)}</b> <span class="badge ok">✔ signature valid</span> ${tierBadge(t.tier)}${priv}</div>
+    <div class="mut" style="margin-top:4px">${version ? html`${version} · ` : html`version not stated · `}provider ${peerShort(c.libp2p_peer_id)} · ${price} · ${region}expires ${exp}</div>
+    <div style="margin-top:6px">The provider runs the model on its own machine and can read your prompts and the replies.</div>
+    ${c.swarm_public_key
+      ? html`<div class="mut" style="margin-top:4px">Private to swarm ${peerShort(c.swarm_public_key)}: requests stay inside the swarm (you need to be a member). If its provider is offline, requests fail rather than going anywhere else.</div>`
+      : html`<div style="margin-top:6px">${fallbackSelect(c.model_id, (prefs || {})[c.model_id] || "ask")}</div>${version ? "" : html`<div class="mut" style="margin-top:2px">With no version stated, no other provider can stand in for it.</div>`}`}
     </div>`;
 }
 
@@ -230,6 +256,7 @@ async function renderImportedList() {
   let cards = [];
   try { cards = await call("list_cards"); } catch {}
   if (!cards.length) { host.replaceChildren(); return; }
+  const prefs = await call("card_prefs").catch(() => ({}));
   const rows = cards
     .map((c) => {
       const exp = new Date(Number(c.expires_at)).toLocaleDateString();
@@ -238,10 +265,12 @@ async function renderImportedList() {
         <td><b>${displayModelName(c.model_id)}</b> <span class="badge secondary" title="Added by importing a signed card">via card</span></td>
         <td class="mut">${peerShort(c.libp2p_peer_id)}</td>
         <td class="mut">expires ${exp}</td>
+        <td>${c.swarm_public_key ? html`<span class="mut" style="font-size:11px" title="A private card's requests never leave its swarm">stays in swarm</span>` : fallbackSelect(c.model_id, prefs[c.model_id] || "ask")}</td>
         <td style="text-align:right"><button class="btn ghost sm cardrm" data-lib="${c.libp2p_peer_id}" data-model="${c.model_id}">Remove</button></td>
         </tr>`;
     });
   setHTML(host, html`<div class="row" style="padding:8px 16px 4px"><div class="ctitle" style="font-size:12px">Added via card</div></div><table style="margin:0 6px 8px"><tbody>${rows}</tbody></table>`);
+  wireFallbackSelects(host);
   $$(".cardrm", host).forEach((b) => {
     b.onclick = async () => {
       try {

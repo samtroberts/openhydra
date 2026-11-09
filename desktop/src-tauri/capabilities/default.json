@@ -30,6 +30,8 @@
     "allow-preview-card",
     "allow-import-card",
     "allow-list-cards",
+    "allow-card-prefs",
+    "allow-set-card-fallback",
     "allow-remove-imported-card",
     "allow-take-pending-card",
     "allow-list-swarms",

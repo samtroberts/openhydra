@@ -20,6 +20,8 @@ const COMMANDS: &[&str] = &[
     "preview_card",
     "import_card",
     "list_cards",
+    "card_prefs",
+    "set_card_fallback",
     "remove_imported_card",
     "take_pending_card",
     "list_swarms",
