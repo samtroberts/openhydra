@@ -246,6 +246,23 @@ const MAX_WARM_UP_MODELS: usize = 2;
 /// second, the first generation didn't come for 100 s; later ones in 36 ms), past a consumer's
 /// 90 s timeout. Never a hosted API (it would bill the operator), and never an image or video
 /// workflow (one "request" there is a whole generation).
+/// Whether the serve loop re-announces now, and whether that is the regular announcement (which
+/// alone sets the time of the next one). A re-announce because the policy or the network changed
+/// goes out at once but leaves the regular schedule where it was: the network layer re-announces
+/// at a provider's first relay reservation and its first gossip peer, a few seconds after start,
+/// and when that also restarted the 2-minute wait, a gateway that joined after them heard of the
+/// provider ~30-40 s later than it had in 0.3.24 (live, 11 Nov: 65 s → 95 s after the gateway
+/// started).
+fn reannounce_due(
+    policy_changed: bool,
+    network_changed: bool,
+    since_regular: std::time::Duration,
+    every: std::time::Duration,
+) -> (bool, bool) {
+    let regular = since_regular >= every;
+    (regular || policy_changed || network_changed, regular)
+}
+
 fn warm_up_worthwhile(engine: &str, model: &DetectedModel) -> bool {
     let name = model.engine_ref.to_ascii_lowercase();
     matches!(engine, "ollama" | "llama.cpp" | "auto")
@@ -3367,6 +3384,7 @@ impl<A: EngineAdapter> Provider<A> {
             let watcher = Arc::clone(&self);
             std::thread::spawn(move || watcher.watch_policy_file());
         }
+        // When the last *regular* announcement went out (see `reannounce_due`).
         let mut last_announce = std::time::Instant::now();
         // #42: track the network generation. The event loop bumps it whenever it
         // rebuilds connectivity after a network change (roam / wake / interface
@@ -3526,7 +3544,8 @@ impl<A: EngineAdapter> Provider<A> {
                     "openhydra-agent: network change (generation {generation}) — re-announcing"
                 );
             }
-            if policy_changed || network_changed || last_announce.elapsed() >= reannounce_every {
+            let (announce, regular) = reannounce_due(policy_changed, network_changed, last_announce.elapsed(), reannounce_every);
+            if announce {
                 // Non-blocking: if the watcher thread is mid-announce, skip this tick (it's already
                 // publishing the fresh policy) rather than stall the serve loop on its blocking `detect`.
                 match self.announce_models_polled() {
@@ -3534,7 +3553,9 @@ impl<A: EngineAdapter> Provider<A> {
                     Some(Err(e)) => eprintln!("openhydra-agent: re-announce failed: {e}"),
                     None => {} // an announce is already in flight (watcher) — nothing to add
                 }
-                last_announce = std::time::Instant::now();
+                if regular {
+                    last_announce = std::time::Instant::now();
+                }
             }
         }
     }
@@ -3960,6 +3981,18 @@ mod tests {
     /// less than this provider's own count of the serve builds a cumulative step below the floor the
     /// provider holds it to (its own count, at weight 1), so the receipt is refused and nothing is
     /// co-signed. Shown with the real functions both sides use.
+    #[test]
+    fn an_early_re_announce_leaves_the_regular_schedule_where_it_was() {
+        let (s, every) = (std::time::Duration::from_secs, std::time::Duration::from_secs(120));
+        // The network changed 20 s after the last regular announcement: announce now, but the next
+        // regular one is still due 120 s after the last regular one, not after this one.
+        assert_eq!(reannounce_due(false, true, s(20), every), (true, false));
+        assert_eq!(reannounce_due(true, false, s(20), every), (true, false), "a policy change too");
+        assert_eq!(reannounce_due(false, false, s(119), every), (false, false));
+        assert_eq!(reannounce_due(false, false, s(120), every), (true, true));
+        assert_eq!(reannounce_due(false, true, s(121), every), (true, true), "due anyway: one announcement, regular");
+    }
+
     #[test]
     fn m9_a_recount_below_the_providers_own_count_falls_below_its_settlement_floor() {
         use openhydra_protocol::payout::{check_cumulative, gated_accrual_asset, CumulativeError};

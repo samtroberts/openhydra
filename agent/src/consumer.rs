@@ -790,10 +790,6 @@ fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
     }
 }
 
-/// The model a request for `requested` (a weight file's name) should go to, given the models this
-/// gateway knows: none when the name is known as it is (or isn't a weight file's name), else its stem
-/// ([`openhydra_protocol::model_id::public_model_id`]) when that is known. A stem a provider had to
-/// suffix (two checkpoints sharing it) can't be derived from the file name, so that stays unknown.
 /// Whether a private card's model is pooled with the other providers of its name instead of pinned
 /// to its swarm: on a keyed private network (`keyed`), where every node holds the organisation's
 /// network key, yes; on the public network, where anyone can announce the name, never.
@@ -861,17 +857,7 @@ fn card_unavailable(
     alternatives_failed: bool,
 ) -> AdapterError {
     use crate::cards::CardFallback;
-    let who = if private { "the swarm's provider" } else { "the card's provider" };
-    let what = match reason {
-        "overloaded" => format!("{who} is busy (it turned the request away)"),
-        // The provider's own words aren't passed on (they could say anything); they are logged.
-        "refused" => {
-            tracing::info!(provider_error = %err.message().chars().take(300).collect::<String>(), "a card's provider refused the request");
-            format!("{who} refused the request")
-        }
-        "expired" => "the private card for it has expired; renew or remove it".to_string(),
-        _ => format!("{who} is offline (it couldn't be reached)"),
-    };
+    let what = card_failure_what(private, reason, err);
     let others = if alternatives == 1 { "1 other provider announces".to_string() } else { format!("{alternatives} other providers announce") };
     let message = if private {
         format!("{model}: {what}. This private model is never sent outside its swarm, so nothing else was tried.")
@@ -899,6 +885,49 @@ fn card_unavailable(
     }))
 }
 
+/// What happened to a card's provider, as [`card_unavailable`] says it (`reason` from
+/// [`card_failure_reason`], or `"expired"`).
+fn card_failure_what(private: bool, reason: &str, err: &AdapterError) -> String {
+    let who = if private { "the swarm's provider" } else { "the card's provider" };
+    match reason {
+        "overloaded" => format!("{who} is busy (it turned the request away)"),
+        // The provider's own words aren't passed on (they could say anything); they are logged.
+        "refused" => {
+            tracing::info!(provider_error = %err.message().chars().take(300).collect::<String>(), "a card's provider refused the request");
+            format!("{who} refused the request")
+        }
+        "expired" => "the private card for it has expired; renew or remove it".to_string(),
+        _ => format!("{who} is offline (it couldn't be reached)"),
+    }
+}
+
+/// The error for a private card's model on a keyed private network ([`pooled_in_private_network`]),
+/// where it was pooled with the deployment's other providers of the name and none could serve it.
+/// Said as a card failure (503 `card_provider_unavailable`, private, no fallback offered) so the app
+/// tells a member what happened, as it does on the public network, but without the public network's
+/// "nothing else was tried": here the others were asked.
+fn pooled_card_unavailable(model: &str, reason: &str, err: &AdapterError, providers: Vec<String>) -> AdapterError {
+    let mut e = card_unavailable(model, true, reason, err, providers, 0, crate::cards::CardFallback::Never, false);
+    if let AdapterError::CardUnavailable(c) = &mut e {
+        c.message = format!(
+            "{model}: {}, and no other provider of it in this private network could serve it either.",
+            card_failure_what(true, reason, err)
+        );
+    }
+    e
+}
+
+/// Whether every one of a card's providers failed us within the last minute (`down`), so a
+/// request asks once instead of retrying patiently (~30 s) on providers known to be down. No
+/// providers (every card expired): no.
+fn card_providers_known_down(card_peers: &[DiscoveredPeer], down: &dyn Fn(&str) -> bool) -> bool {
+    !card_peers.is_empty() && card_peers.iter().all(|p| down(&p.libp2p_peer_id))
+}
+
+/// The model a request for `requested` (a weight file's name) should go to, given the models this
+/// gateway knows: none when the name is known as it is (or isn't a weight file's name), else its stem
+/// ([`openhydra_protocol::model_id::public_model_id`]) when that is known. A stem a provider had to
+/// suffix (two checkpoints sharing it) can't be derived from the file name, so that stays unknown.
 fn weight_file_alias(requested: &str, known: &[String]) -> Option<String> {
     if known.iter().any(|m| m == requested) {
         return None;
@@ -3657,8 +3686,37 @@ impl ConsumerNode {
             // deployment's others that serve the name (Sam, 11 Nov, option C). The private card's
             // provider still serves only its swarm's members (it checks the credential). On the
             // public network a private card pins its model to its swarm, as below.
-            crate::cards::CardPin::Private { .. } if pooled_in_private_network(openhydra_network::transport::private_network_key().is_some()) => {
-                return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
+            crate::cards::CardPin::Private { peers, swarms } if pooled_in_private_network(openhydra_network::transport::private_network_key().is_some()) => {
+                let now = now_unix_ms();
+                let member = self.creds.as_ref().is_some_and(|c| swarms.iter().any(|s| c.credential_for_swarm(s, now).is_some()));
+                // As on the public network: every card provider just failed for us, so one look (the
+                // deployment's other providers are still asked, and a healthy one still serves)
+                // instead of ~30 s of retries per request (live, 11 Nov: 40 s, then 26 s, each time).
+                let known_down = card_providers_known_down(peers, &|p| self.briefly_unavailable(p, model, now));
+                let delivered = std::cell::Cell::new(false);
+                let result = {
+                    let mut track = |d: &str| {
+                        delivered.set(true);
+                        on_delta(d)
+                    };
+                    if known_down {
+                        self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, &mut track)
+                    } else {
+                        self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, &mut track)
+                    }
+                };
+                return match result {
+                    Ok(summary) => Ok(summary),
+                    // A non-member is served by whoever may serve it; its errors are theirs.
+                    Err(e) if !member || delivered.get() || cancel() || matches!(e, AdapterError::Cancelled(_)) => Err(e),
+                    // A member is told what happened to its swarm's model, as on the public network
+                    // (the generic "dial failed" said nothing, live 11 Nov).
+                    Err(e) => {
+                        let reason = card_failure_reason(&e);
+                        tracing::warn!(model, reason, "nobody in this private network could serve a private card's model");
+                        Err(pooled_card_unavailable(model, reason, &e, peers.iter().map(|p| short_peer(&p.libp2p_peer_id)).collect()))
+                    }
+                };
             }
             crate::cards::CardPin::Private { peers, .. } => (peers.clone(), true),
             crate::cards::CardPin::Public { peers, .. } => (peers.clone(), false),
@@ -3700,7 +3758,7 @@ impl ConsumerNode {
         // patient retries for a provider that only just joined. Otherwise each request would wait
         // ~30 s on a provider known to be down before saying so (live, 10 Nov).
         let now = now_unix_ms();
-        let known_down = !card_peers.is_empty() && card_peers.iter().all(|p| self.briefly_unavailable(&p.libp2p_peer_id, model, now));
+        let known_down = card_providers_known_down(&card_peers, &|p| self.briefly_unavailable(p, model, now));
         let first = {
             let mut track = |d: &str| {
                 delivered.set(true);
@@ -7845,6 +7903,29 @@ mod tests {
     fn a_private_card_is_pooled_only_inside_a_keyed_private_network() {
         assert!(pooled_in_private_network(true), "every node holds the organisation's key");
         assert!(!pooled_in_private_network(false), "the public network: pinned to the swarm");
+    }
+
+    #[test]
+    fn a_pooled_private_cards_failure_is_a_card_error_that_says_the_others_were_asked() {
+        let e = pooled_card_unavailable("qwen", "offline", &AdapterError::Network("dial failed".into()), vec!["…swarm".into()]);
+        let AdapterError::CardUnavailable(c) = &e else { panic!("{e:?}") };
+        assert!(c.private && c.alternatives == 0 && c.fallback == "never" && c.reason == "offline", "{c:?}");
+        assert_eq!(c.providers, vec!["…swarm".to_string()]);
+        assert!(c.message.contains("the swarm's provider is offline"), "{}", c.message);
+        assert!(c.message.contains("no other provider of it in this private network"), "{}", c.message);
+        assert!(!c.message.contains("nothing else was tried"), "the others were asked: {}", c.message);
+        assert_eq!(crate::gateway::error_class(&e), (axum::http::StatusCode::SERVICE_UNAVAILABLE, "card_provider_unavailable"));
+        let busy = pooled_card_unavailable("qwen", "overloaded", &AdapterError::Overloaded("x".into()), vec![]);
+        assert!(busy.to_string().contains("is busy"), "{busy}");
+    }
+
+    #[test]
+    fn requests_ask_once_only_when_every_card_provider_just_failed() {
+        let card = vec![peer("12D3a", "q"), peer("12D3b", "q")];
+        assert!(card_providers_known_down(&card, &|_| true));
+        assert!(!card_providers_known_down(&card, &|p| p == "12D3a"), "one may still serve: retry patiently");
+        assert!(!card_providers_known_down(&card, &|_| false));
+        assert!(!card_providers_known_down(&[], &|_| true), "no provider (every card expired) is not 'known down'");
     }
 
     #[test]
