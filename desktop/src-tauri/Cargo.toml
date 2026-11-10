@@ -32,18 +32,19 @@ libp2p-gossipsub = { path = "../../network/patched-deps/libp2p-gossipsub" }
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# ~2.11.6: 2.11.6 fixes GHSA-w28w-mhc8-qvjv (Channel fetch queue readable across webviews); stays on
-# the 2.11 line (2.12 is a larger upgrade, planned separately).
-tauri = { version = "~2.11.6", features = ["tray-icon", "image-png"] }
-tauri-plugin-updater = "2"
+# ~2.12.5: the 2.12 line (2.11.6 fixed GHSA-w28w-mhc8-qvjv). 2.12 is what tauri-plugin-updater 2.14.1
+# needs, whose zip 9 fixes RUSTSEC-2026-0429 (zip 4.6.1 aborted the process on a crafted archive).
+tauri = { version = "~2.12.5", features = ["tray-icon", "image-png"] }
+# 2.14.1+: zip 9 (RUSTSEC-2026-0429).
+tauri-plugin-updater = "2.14.1"
 tauri-plugin-process = "2"
 # M2.1: launch OpenHydra when a `.openhydra` file (fileAssociations) or an `openhydra:` magnet link
 # (deep-link scheme) is opened, and route it into the card import flow.
 tauri-plugin-deep-link = "2"
 # Native confirmation dialogs for actions that widen exposure (sharing globally, approving swarm
 # members, …): drawn by the OS, outside the webview, so page script can't click through them.
-# ~2.7.3: the newest line compatible with tauri 2.11 (2.8 needs tauri 2.12).
-tauri-plugin-dialog = "~2.7.3"
+# ~2.8.4: the line for tauri 2.12.
+tauri-plugin-dialog = "~2.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # M2.1: parse opened file:/openhydra: URLs (same version Tauri surfaces in RunEvent::Opened).

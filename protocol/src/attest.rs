@@ -435,7 +435,7 @@ mod tests {
     }
 
     fn sec1(sk: &SigningKey) -> [u8; P256_SEC1_UNCOMPRESSED_LEN] {
-        sk.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap()
+        sk.verifying_key().to_sec1_point(false).as_bytes().try_into().unwrap()
     }
 
     fn claim() -> AttestationClaim {
@@ -704,8 +704,9 @@ mod tests {
         let sig = Signature::from_der(&att.signature_der).unwrap();
         let (r, s) = sig.split_scalars();
         let high = Signature::from_scalars(r, -*s).unwrap();
-        let (low, high) = if sig.normalize_s().is_none() { (sig, high) } else { (high, sig) };
-        assert!(low.normalize_s().is_none() && high.normalize_s().is_some());
+        // `normalize_s` changes a signature only when its `s` is high.
+        let (low, high) = if sig.normalize_s() == sig { (sig, high) } else { (high, sig) };
+        assert!(low.normalize_s() == low && high.normalize_s() != high);
         for s in [low, high] {
             let mut a = att.clone();
             a.signature_der = s.to_der().as_bytes().to_vec();

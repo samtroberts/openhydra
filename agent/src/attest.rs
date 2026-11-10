@@ -568,7 +568,7 @@ mod tests {
     /// is tested on every platform).
     fn software_attestor() -> Attestor {
         let sk = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
-        let public: [u8; 65] = sk.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap();
+        let public: [u8; 65] = sk.verifying_key().to_sec1_point(false).as_bytes().try_into().unwrap();
         let facts = DeviceFacts {
             chip: "Apple M1".into(),
             os_build: "25G76".into(),
@@ -799,7 +799,7 @@ mod tests {
     /// An attestor over a software key seeded with `seed` (a different seed = a rotated key).
     fn attestor_with_key(seed: u8) -> Attestor {
         let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
-        let public: [u8; 65] = sk.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap();
+        let public: [u8; 65] = sk.verifying_key().to_sec1_point(false).as_bytes().try_into().unwrap();
         let facts = software_attestor().facts;
         Attestor::new(
             facts,

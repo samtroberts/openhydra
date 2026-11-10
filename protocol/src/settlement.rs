@@ -354,7 +354,7 @@ pub const EVM_PAYOUT_BINDING_DOMAIN: &[u8] = b"openhydra/base-payout/v1";
 
 /// The 20-byte EVM address for a secp256k1 verifying key: `keccak256(uncompressed_pubkey[1..])[12..]`.
 pub fn evm_address(pubkey: &EcdsaVerifyingKey) -> [u8; 20] {
-    let point = pubkey.to_encoded_point(false); // uncompressed: 0x04 ‖ x(32) ‖ y(32)
+    let point = pubkey.to_sec1_point(false); // uncompressed: 0x04 ‖ x(32) ‖ y(32)
     let hash = keccak256(&point.as_bytes()[1..]);
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&hash[12..]);
@@ -437,12 +437,10 @@ impl Eip712Domain {
 /// over its EIP-712 digest — what the contract's `ECDSA.recover` accepts.
 pub fn sign_evm_claim(wallet: &EcdsaSigningKey, domain: &Eip712Domain, claim: &SettlementClaim) -> [u8; 65] {
     let digest = claim.eip712_digest(domain);
-    let (sig, rec) = wallet.sign_prehash_recoverable(&digest).expect("a 32-byte prehash always signs");
+    let (sig, rec) = wallet.sign_prehash_recoverable(&digest);
     // k256 signs with low `s` already; normalize anyway (flipping the recovery parity with it).
-    let (sig, rec) = match sig.normalize_s() {
-        Some(low) => (low, RecoveryId::from_byte(rec.to_byte() ^ 1).expect("0 or 1")),
-        None => (sig, rec),
-    };
+    let low = sig.normalize_s();
+    let (sig, rec) = if low != sig { (low, RecoveryId::from_byte(rec.to_byte() ^ 1).expect("0 or 1")) } else { (sig, rec) };
     let mut out = [0u8; 65];
     out[..64].copy_from_slice(&sig.to_bytes());
     out[64] = rec.to_byte() + 27;
@@ -453,12 +451,12 @@ pub fn sign_evm_claim(wallet: &EcdsaSigningKey, domain: &Eip712Domain, claim: &S
 /// over an EIP-712 `digest` — the on-chain `ecrecover`. `None` on any malformed input.
 pub fn recover_evm_signer(digest: &[u8; 32], sig_65: &[u8; 65]) -> Option<[u8; 20]> {
     let signature = EcdsaSignature::from_slice(&sig_65[..64]).ok()?;
-    // Reject high-`s` signatures (EIP-2 low-`s` requirement, review F5): `normalize_s` returns
-    // `Some` only when `s` was in the upper half-order (non-canonical). A high-`s` and its low-`s`
+    // Reject high-`s` signatures (EIP-2 low-`s` requirement, review F5): `normalize_s` changes the
+    // signature only when `s` was in the upper half-order (non-canonical). A high-`s` and its low-`s`
     // twin recover the same address, so this is not a forgery guard — it matches an on-chain
     // contract (OpenZeppelin `ECDSA.recover`) that rejects the malleable encoding, so the off-chain
     // mirror and the contract agree on exactly which signatures are valid.
-    if signature.normalize_s().is_some() {
+    if signature.normalize_s() != signature {
         return None;
     }
     // Exactly Ethereum's `27/28`: the contract's `ecrecover` rejects every other `v` (the raw `0/1`
@@ -684,6 +682,29 @@ mod tests {
         let domain = Eip712Domain { chain_id: 8453, verifying_contract: [0xCCu8; 20] };
         let hex = claim.eip712_digest(&domain).iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(hex, "4e46f39f79c49fdc540cc2be0d73aea9384df29e2fc7b7fb2ccd630e1f2b4fa6", "EIP-712 digest drift — off-chain/on-chain parity broken (or a deliberate bump)");
+    }
+
+    /// Golden values: the EVM address of private key 1 (Ethereum's well-known
+    /// `0x7e5f…5bdf`) and a claim signature computed with k256 0.13 before the move to 0.14. RFC 6979
+    /// signing is deterministic, so any drift means the off-chain signer no longer signs what the
+    /// contract (and older nodes) expect.
+    #[test]
+    fn evm_address_and_claim_signature_are_unchanged() {
+        let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let w1 = EcdsaSigningKey::from_slice(&one).unwrap();
+        assert_eq!(hx(&evm_address(w1.verifying_key())), "7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+        let domain = Eip712Domain { chain_id: 8453, verifying_contract: [1u8; 20] };
+        let w = EcdsaSigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        assert_eq!(hx(&evm_address(w.verifying_key())), "19e7e376e7c213b7e7e7e46cc70a5dd086daff2a");
+        let sig = sign_evm_claim(&w, &domain, &a_claim());
+        assert_eq!(
+            hx(&sig),
+            "7bee99ff52414daa24a208c382d7ee31718fa3fe6621ca976f2029812b92fa05\
+             75e6ddb3c43f50162f626cda09e2f027dfd876bce4d8500256dd36acebab64031b"
+        );
+        assert_eq!(recover_evm_signer(&a_claim().eip712_digest(&domain), &sig), Some(evm_address(w.verifying_key())));
     }
 
     #[test]
