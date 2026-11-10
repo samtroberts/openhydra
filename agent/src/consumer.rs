@@ -794,6 +794,13 @@ fn busy_estimate(open: u32, report: Option<crate::serve::ProviderLoad>) -> f64 {
 /// gateway knows: none when the name is known as it is (or isn't a weight file's name), else its stem
 /// ([`openhydra_protocol::model_id::public_model_id`]) when that is known. A stem a provider had to
 /// suffix (two checkpoints sharing it) can't be derived from the file name, so that stays unknown.
+/// Whether a private card's model is pooled with the other providers of its name instead of pinned
+/// to its swarm: on a keyed private network (`keyed`), where every node holds the organisation's
+/// network key, yes; on the public network, where anyone can announce the name, never.
+fn pooled_in_private_network(keyed: bool) -> bool {
+    keyed
+}
+
 /// The providers a card pins a model to: its cards' providers and this machine's own (which joins
 /// only when it shares the model: `serve_once` adds it from its own list).
 fn card_peer_ids(card_peers: &[DiscoveredPeer], own: Option<&str>) -> std::collections::HashSet<String> {
@@ -955,10 +962,17 @@ fn prefer_sticky<T>(candidates: &mut [T], eligible: usize, is_sticky: &dyn Fn(&T
 
 /// What [`spread_load`] compares: how busy a provider looks, plus its network distance (the latest
 /// ping round trip), so that between two about equally busy providers the closer one wins. 100 ms of
-/// round trip weighs like 5% more load; no measurement adds nothing.
+/// round trip weighs like 5% more load; no measurement adds nothing. Distance counts in
+/// [`SPREAD_RTT_STEP_MS`] steps: providers that are about as near (the same data centre, a fraction
+/// of a millisecond apart) tie, and a tie is broken at random, rather than the one a hair nearer
+/// taking every request while it is idle (live, 11 Nov: 12 of 12).
 fn spread_cost(busy: f64, rtt: Option<std::time::Duration>) -> f64 {
-    busy + rtt.map_or(0.0, |r| r.as_secs_f64() * 0.5)
+    let step = SPREAD_RTT_STEP_MS as f64 / 1000.0;
+    busy + rtt.map_or(0.0, |r| (r.as_secs_f64() / step).floor() * step * 0.5)
 }
+
+/// The granularity distance counts in when spreading load (see [`spread_cost`]).
+const SPREAD_RTT_STEP_MS: u64 = 10;
 
 /// A serve open at a provider: counted in [`ConsumerNode::open_at`] until dropped.
 struct OpenServe<'a> {
@@ -995,8 +1009,12 @@ fn spread_load<T>(candidates: &mut [T], eligible: usize, busy: &dyn Fn(&T) -> f6
         b += 1;
     }
     let (first, second) = (a.min(b), a.max(b));
-    // The less busy of the two; on a tie, the better ranked.
-    let chosen = if busy(&candidates[second]) < busy(&candidates[first]) { second } else { first };
+    // The less busy of the two (load, then distance: see `spread_cost`). An exact tie (both idle at
+    // the same distance) goes either way at random: given to the better ranked, light traffic sent
+    // one request at a time would all go to whichever provider served first, whose reputation then
+    // keeps it first, and the other would never be used (live, 11 Nov: 14 of 14 with two providers).
+    let (bf, bs) = (busy(&candidates[first]), busy(&candidates[second]));
+    let chosen = if bs < bf || (bs == bf && pick(2) == 1) { second } else { first };
     candidates[..=chosen].rotate_right(1);
 }
 
@@ -3632,6 +3650,14 @@ impl ConsumerNode {
         let pin = self.cards.as_ref().map(|c| c.pin_for(model, now_unix_ms())).unwrap_or(crate::cards::CardPin::None);
         let (card_peers, private) = match &pin {
             crate::cards::CardPin::None => {
+                return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
+            }
+            // Inside a keyed private network every node holds the organisation's network key, so
+            // there is no stranger to keep a private model from: its providers are pooled with the
+            // deployment's others that serve the name (Sam, 11 Nov, option C). The private card's
+            // provider still serves only its swarm's members (it checks the credential). On the
+            // public network a private card pins its model to its swarm, as below.
+            crate::cards::CardPin::Private { .. } if pooled_in_private_network(openhydra_network::transport::private_network_key().is_some()) => {
                 return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
             }
             crate::cards::CardPin::Private { peers, .. } => (peers.clone(), true),
@@ -7816,6 +7842,12 @@ mod tests {
     }
 
     #[test]
+    fn a_private_card_is_pooled_only_inside_a_keyed_private_network() {
+        assert!(pooled_in_private_network(true), "every node holds the organisation's key");
+        assert!(!pooled_in_private_network(false), "the public network: pinned to the swarm");
+    }
+
+    #[test]
     fn a_public_card_falls_back_only_to_the_same_exact_version() {
         let pinned: std::collections::HashSet<String> = ["12D3card".to_string()].into();
         let found = vec![
@@ -8710,11 +8742,16 @@ mod tests {
         let mut seq = [0usize, 0].into_iter();
         spread_load(&mut c, 3, &busy, &mut |_| seq.next().unwrap());
         assert_eq!(c.iter().map(|x| x.0).collect::<Vec<_>>(), ["b", "a", "c"]);
-        // A tie keeps the better ranked one first.
+        // An exact tie goes either way, at random (a third pick decides): given always to the
+        // better ranked, light traffic would never reach the other.
         let mut c = vec![("a", 0.5), ("b", 0.5)];
-        let mut seq = [1usize, 0].into_iter();
+        let mut seq = [1usize, 0, 0].into_iter();
         spread_load(&mut c, 2, &busy, &mut |_| seq.next().unwrap());
-        assert_eq!(c[0].0, "a");
+        assert_eq!(c[0].0, "a", "the tie-break picked the first");
+        let mut c = vec![("a", 0.5), ("b", 0.5)];
+        let mut seq = [1usize, 0, 1].into_iter();
+        spread_load(&mut c, 2, &busy, &mut |_| seq.next().unwrap());
+        assert_eq!(c[0].0, "b", "the tie-break picked the second");
         // Only the eligible lead is considered: a busy first with one eligible stays first.
         let mut c = vec![("a", 0.9), ("b", 0.0)];
         spread_load(&mut c, 1, &busy, &mut |_| unreachable!("nothing to choose"));
@@ -8759,6 +8796,9 @@ mod tests {
         // A far but idle provider still beats a near one that is full.
         assert!(spread_cost(0.0, ms(250)) < spread_cost(1.0, ms(5)));
         assert_eq!(spread_cost(0.25, None), 0.25);
+        // About as near ties (a fraction of a millisecond apart); a clearly nearer one wins.
+        assert_eq!(spread_cost(0.0, ms(1)), spread_cost(0.0, ms(4)));
+        assert!(spread_cost(0.0, ms(5)) < spread_cost(0.0, ms(25)));
     }
 
     #[test]

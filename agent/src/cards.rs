@@ -330,7 +330,8 @@ pub enum CardPin {
     /// No imported card names it: routed as any model is.
     None,
     /// A private card names it: only these providers (and this machine's own), never anyone found
-    /// on the network, and the network isn't asked about it.
+    /// on the network, and the network isn't asked about it. Not on a keyed private network, where
+    /// every node is the organisation's: there its providers are pooled with the others of the name.
     Private {
         /// Its unexpired private cards' providers (none once every such card has expired).
         peers: Vec<DiscoveredPeer>,
