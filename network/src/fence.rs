@@ -155,6 +155,19 @@ pub fn set_credential_peer_ids<'a>(peers: impl IntoIterator<Item = &'a str>) {
     set_credential_peers(peers.into_iter().filter_map(|p| p.parse().ok()).collect());
 }
 
+/// Whether `s` is a peer id (base58).
+pub fn is_peer_id(s: &str) -> bool {
+    s.parse::<PeerId>().is_ok()
+}
+
+/// Whether this process's fence would let `peer` (base58) connect: no allowlist, or on the fixed
+/// list or the credential-allowed set. A peer id that doesn't parse isn't allowed when there is one.
+pub fn peer_allowed(peer: &str) -> bool {
+    let Some(fixed) = allowed_peers() else { return true };
+    let Ok(p) = peer.parse::<PeerId>() else { return false };
+    fixed.contains(&p) || credential_peer(&p)
+}
+
 /// Whether the node's credentials allow `peer` ([`set_credential_peers`]).
 fn credential_peer(peer: &PeerId) -> bool {
     CREDENTIAL_PEERS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(peer))

@@ -6,6 +6,21 @@
 
 export const FALLBACK_CHOICES = ["ask", "same-version", "never"];
 
+// The choices a card's selector offers: "" is no saved choice (the default: the app asks; other
+// apps on the gateway, which can't be asked, use another provider of the same version).
+export const FALLBACK_OPTIONS = [
+  ["", "Default: ask me here; other apps use another provider of the same version"],
+  ["ask", "Ask me here; other apps get an error"],
+  ["same-version", "Use another provider of the same version, everywhere"],
+  ["never", "Never use another provider"],
+];
+
+// The selector's value for a model's saved choice ("" when none, or one this app doesn't know).
+export function selectedFallback(model, prefs) {
+  const saved = prefs && prefs[model];
+  return FALLBACK_CHOICES.includes(saved) ? saved : "";
+}
+
 // The choice the app sends for `model`: the one saved for it, else "ask" (a person is here to ask).
 export function fallbackToSend(model, prefs) {
   const saved = prefs && prefs[model];
@@ -26,10 +41,16 @@ export function offerText(model, details) {
   const n = Number(details?.alternatives) || 0;
   return {
     title: "Use another provider?",
-    body: `${model}: the provider from your card ${why}.\n\n${n === 1 ? "1 other provider serves" : `${n} other providers serve`} the same model and version. ` +
-      "It is a different machine, which can read your prompt and the reply.",
+    body: `${model}: the provider from your card ${why}.\n\n${n === 1 ? "1 other provider announces" : `${n} other providers announce`} the same model and version ` +
+      "(their own claim). It is a different machine, which can read your prompt and the reply.",
     ok: "Use another provider",
   };
+}
+
+// What the chat says when the user said no: nothing was sent anywhere else.
+export function declinedText(model, details) {
+  const why = REASON[details?.reason] || "couldn't serve it";
+  return `${model}: the provider from your card ${why}. Not sent to another provider.`;
 }
 
 // The note under a reply another provider served, from its `openhydra.card` block; "" if none.

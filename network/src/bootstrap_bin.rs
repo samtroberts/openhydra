@@ -23,20 +23,31 @@
 //!   `pnet`: `/key/swarm/psk/1.0.0/`, `/base16/`, 64 hex digits; make one with
 //!   `openhydra-agent network-key --out <file>`). Every TCP connection, and every circuit through
 //!   its relay, is keyed, so a node without the key can't connect to it or relay through it. QUIC is
-//!   off. The file must be readable by its owner only (`chmod 600`), or the bootstrap won't start;
-//!   only the key's fingerprint is ever printed. A keyed bootstrap refuses to run under one of
+//!   off. Only the key's fingerprint is ever printed. A keyed bootstrap refuses to run under one of
 //!   OpenHydra's own public bootstrap identities, and never connects to OpenHydra's public network.
+//!   The file's permissions: if other users (not its owner or group) can read it, the bootstrap
+//!   won't start (`chmod 600`, or `640` with a group), unless `--allow-readable-key-file` says that
+//!   is intended (a Docker or Kubernetes secret, mounted `0444`/`0644` where only this container
+//!   sees it); if other users can write it, it never starts (they could swap the key). A file its
+//!   group can read starts with a warning: everyone in the group can join the network.
 //! * `--allow-peers-file <path>`: connections only with the peers listed (one peer id per line, `#`
-//!   comments), on every transport; the `--peer` bootstraps are always allowed.
+//!   comments), on every transport; the `--peer` bootstraps are always allowed. The file is re-read
+//!   every few seconds, so an operator approves or revokes a member by editing it, with no restart:
+//!   a peer taken off it has its connections closed (and with them its relay reservation, gossip
+//!   and DHT access). A change takes effect once two reads in a row agree, so a file caught
+//!   half-written isn't applied; a file that can't be read or doesn't parse keeps the peers it last
+//!   listed (with a warning), never none.
 //! * `--private-network-quic`: keep QUIC on with the key. QUIC can't carry the key, so it is guarded
 //!   by the allowlist instead; needs both of the above.
 //!
 //! Every flag: `--identity <path>`, `--listen <multiaddr>` (repeatable), `--peer <multiaddr>`
 //! (repeatable), `--external <multiaddr>` (repeatable), `--gossip-mesh-max <n>`, `--metrics-bind
-//! <loopback addr:port>`, and the three above. Anything else is an error (exit 2): a misspelt flag
-//! used to be ignored, so `--private-netwrok-key-file` would have started an open bootstrap.
+//! <loopback addr:port>`, `--allow-readable-key-file`, and the three above. A value can follow its
+//! flag (`--identity <path>`) or be joined to it (`--identity=<path>`). Anything else is an error
+//! (exit 2): a misspelt flag used to be ignored, so `--private-netwrok-key-file` would have started
+//! an open bootstrap; and so is giving a flag that isn't repeatable twice (only the first was used).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -136,69 +147,205 @@ const VALUE_FLAGS: &[&str] = &[
     "--private-network-key-file",
     "--allow-peers-file",
 ];
+/// The value flags that may be given more than once (each adds a value); every other flag once.
+const REPEATABLE_FLAGS: &[&str] = &["--listen", "--peer", "--external"];
 /// The flags that take none.
-const SWITCH_FLAGS: &[&str] = &["--private-network-quic"];
+const SWITCH_FLAGS: &[&str] = &["--private-network-quic", "--allow-readable-key-file"];
 
 const USAGE: &str = "usage: openhydra-bootstrap [--identity <path>] [--listen <multiaddr>]... [--peer <multiaddr>]... \
 [--external <multiaddr>]... [--gossip-mesh-max <n>] [--metrics-bind <127.0.0.1:port>] \
-[--private-network-key-file <path>] [--allow-peers-file <path>] [--private-network-quic]";
+[--private-network-key-file <path>] [--allow-readable-key-file] [--allow-peers-file <path>] [--private-network-quic]\n\
+(a value may also be joined to its flag: --identity=<path>)";
 
-/// Check the command line: every argument is a known flag, or the value right after one that takes
-/// a value. A misspelt flag is an error rather than ignored: ignoring it started a bootstrap without
-/// what the flag asked for, say an open one where a keyed one was meant.
-fn check_args(args: &[String]) -> Result<(), String> {
-    let mut i = 1; // args[0] is the program
+/// Check the command line, and return it with every `--flag=value` split into `--flag value`, the
+/// one form the rest of the parsing reads (so what is checked here is what is used). Every argument
+/// must be a known flag, or the value right after one that takes a value. A misspelt flag is an
+/// error rather than ignored: ignoring it started a bootstrap without what the flag asked for, say
+/// an open one where a keyed one was meant. A flag that isn't repeatable given twice is an error
+/// too: only the first value was used, so a second `--private-network-key-file` (or an edited unit
+/// file's override) was silently ignored.
+fn check_args(args: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = args.iter().take(1).cloned().collect(); // args[0] is the program
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
-        if SWITCH_FLAGS.contains(&a) {
-            i += 1;
-        } else if VALUE_FLAGS.contains(&a) {
-            match args.get(i + 1) {
-                Some(v) if !v.starts_with("--") => i += 2,
-                _ => return Err(format!("{a} needs a value")),
+        // `--flag=value`: split on the first `=` (a value may itself contain one).
+        let (flag, joined) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v)),
+            _ => (a, None),
+        };
+        if SWITCH_FLAGS.contains(&flag) {
+            if joined.is_some() {
+                return Err(format!("{flag} takes no value"));
             }
+            if !seen.insert(flag) {
+                return Err(format!("{flag} is given twice"));
+            }
+            out.push(flag.to_string());
+            i += 1;
+        } else if VALUE_FLAGS.contains(&flag) {
+            let value = match joined {
+                Some(v) => {
+                    i += 1;
+                    v
+                }
+                None => match args.get(i + 1) {
+                    Some(v) if !v.starts_with("--") => {
+                        i += 2;
+                        v.as_str()
+                    }
+                    _ => return Err(format!("{flag} needs a value")),
+                },
+            };
+            if value.is_empty() || value.starts_with("--") {
+                return Err(format!("{flag} needs a value"));
+            }
+            if !REPEATABLE_FLAGS.contains(&flag) && !seen.insert(flag) {
+                return Err(format!("{flag} is given twice; it takes one value"));
+            }
+            out.push(flag.to_string());
+            out.push(value.to_string());
         } else if a.starts_with('-') {
-            return Err(format!("unknown flag {a}"));
+            return Err(format!("unknown flag {flag}"));
         } else {
             return Err(format!("unexpected argument {a:?} (not the value of a flag)"));
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// What `--private-network-key-file` / `--allow-peers-file` / `--private-network-quic` set up.
 struct PrivateNetwork {
     /// The key's fingerprint, when keyed (never the key).
     fingerprint: Option<String>,
-    /// Peers on the allowlist, when one is set.
-    allowed: Option<usize>,
+    /// The allowlist file, when one is set, for the event loop to re-read.
+    allowlist: Option<AllowlistFile>,
 }
 
+/// The `--allow-peers-file`, re-read while the bootstrap runs so an operator can approve or revoke a
+/// member by editing it. The fixed allowlist (`fence::set_allowed_peers`, which can't change once
+/// the transport is built) holds only the `--peer` bootstraps; the file's peers go in the fence's
+/// changeable set (`fence::set_credential_peers`), whose dropped peers have their connections closed.
+struct AllowlistFile {
+    path: String,
+    /// The `--peer` bootstraps: always allowed, whatever the file says.
+    fixed: HashSet<libp2p::PeerId>,
+    /// What the fence allows now: the file's peers as last applied, and `fixed`.
+    current: HashSet<libp2p::PeerId>,
+    /// A changed set read once; applied when the next read agrees, so a file caught half-written
+    /// (an editor that truncates before writing) doesn't briefly shut everyone out.
+    pending: Option<HashSet<libp2p::PeerId>>,
+    /// The last read error warned about, so one that lasts is warned about once, not every read.
+    last_error: Option<String>,
+}
+
+/// What one re-read of the allowlist file found.
+#[derive(Debug, PartialEq)]
+enum AllowlistCheck {
+    /// The same peers as applied (or a failure already warned about).
+    Unchanged,
+    /// Different peers, read once: applied if the next read agrees.
+    Settling,
+    /// Different peers, now in `current`.
+    Changed { added: usize, removed: usize },
+    /// The file couldn't be read or parsed (a new error); the peers last applied stay.
+    Failed(String),
+}
+
+impl AllowlistFile {
+    /// Read the file at startup; failing to is an error, as before (there is no last good set yet).
+    fn open(path: String, fixed: HashSet<libp2p::PeerId>) -> Result<Self, String> {
+        let mut current = Self::read(&path).map_err(|e| format!("--allow-peers-file {path}: {e}"))?;
+        current.extend(fixed.iter().copied());
+        Ok(Self { path, fixed, current, pending: None, last_error: None })
+    }
+
+    fn read(path: &str) -> Result<HashSet<libp2p::PeerId>, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        openhydra_network::fence::parse_allowlist(&text)
+    }
+
+    /// Re-read the file; on a settled change, `current` is the new set (the caller hands it to the
+    /// fence). A read that fails changes nothing: never an empty set because of a bad edit.
+    fn check(&mut self) -> AllowlistCheck {
+        let mut next = match Self::read(&self.path) {
+            Ok(peers) => peers,
+            Err(e) => {
+                self.pending = None;
+                if self.last_error.as_ref() == Some(&e) {
+                    return AllowlistCheck::Unchanged;
+                }
+                self.last_error = Some(e.clone());
+                return AllowlistCheck::Failed(e);
+            }
+        };
+        self.last_error = None;
+        next.extend(self.fixed.iter().copied());
+        if next == self.current {
+            self.pending = None;
+            return AllowlistCheck::Unchanged;
+        }
+        if self.pending.as_ref() != Some(&next) {
+            self.pending = Some(next);
+            return AllowlistCheck::Settling;
+        }
+        self.pending = None;
+        let added = next.difference(&self.current).count();
+        let removed = self.current.difference(&next).count();
+        self.current = next;
+        AllowlistCheck::Changed { added, removed }
+    }
+}
+
+/// How often the allowlist file is re-read; a change applies within two of these.
+const ALLOWLIST_REREAD: Duration = Duration::from_secs(5);
+
 /// Read the network key and the peer allowlist and set them for this process, before any transport
-/// is built (they can't change once one is: `transport::freeze_network_settings`). `peers`: the
-/// `--peer` bootstraps, always allowed (a bootstrap cut off from the rest of its mesh is no use).
+/// is built (the key and the fixed allowlist can't change once one is:
+/// `transport::freeze_network_settings`; the allowlist file's peers can, see [`AllowlistFile`]).
+/// `peers`: the `--peer` bootstraps, always allowed (a bootstrap cut off from the rest of its mesh
+/// is no use).
 fn set_up_private_network(args: &[String], peers: &[Multiaddr]) -> Result<PrivateNetwork, String> {
-    let mut allowed = None;
+    let mut allowlist = None;
     if let Some(path) = parse_flag(args, "--allow-peers-file") {
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("--allow-peers-file {path}: {e}"))?;
-        let mut list = openhydra_network::fence::parse_allowlist(&text).map_err(|e| format!("--allow-peers-file {path}: {e}"))?;
-        list.extend(peers.iter().filter_map(|a| openhydra_network::fence::peer_id_in(&a.to_string())));
-        allowed = Some(list.len());
-        openhydra_network::fence::set_allowed_peers(list)?;
+        let fixed: HashSet<libp2p::PeerId> =
+            peers.iter().filter_map(|a| openhydra_network::fence::peer_id_in(&a.to_string())).collect();
+        let file = AllowlistFile::open(path, fixed.clone())?;
+        openhydra_network::fence::set_allowed_peers(fixed)?;
+        openhydra_network::fence::set_credential_peers(file.current.clone());
+        allowlist = Some(file);
     }
     let mut fingerprint = None;
     if let Some(path) = parse_flag(args, "--private-network-key-file") {
-        // Refused rather than warned about (the agent warns): a bootstrap is a long-running server,
-        // usually on a shared machine, and anyone who can read the file can join the network.
+        // Refused rather than warned about (the agent warns) when other users can read it: a
+        // bootstrap is a long-running server, usually on a shared machine, and anyone who can read
+        // the file can join the network. Its group only warns: a `root:openhydra 0640` file is a
+        // normal way to hand a service its secret. A read-only secret mount (Docker, Kubernetes:
+        // 0444/0644, but only this container sees it) is let through by `--allow-readable-key-file`.
+        // Other users able to write it is refused always: they could swap the key.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).map_err(|e| format!("--private-network-key-file {path}: {e}"))?.permissions().mode();
-            if mode & 0o077 != 0 {
+            if mode & 0o002 != 0 {
                 return Err(format!(
-                    "--private-network-key-file {path}: can be read by other users (mode {:o}); anyone with it can join the network. chmod 600 it",
+                    "--private-network-key-file {path}: can be written by other users (mode {:o}); anyone could replace the key. chmod o-w it (600 is best)",
                     mode & 0o777
                 ));
+            }
+            if mode & 0o007 != 0 && !args.iter().any(|a| a == "--allow-readable-key-file") {
+                return Err(format!(
+                    "--private-network-key-file {path}: can be read by other users (mode {:o}); anyone with it can join the network. \
+chmod 600 it (or 640 for a group), or pass --allow-readable-key-file if it is a secret mount only this container sees",
+                    mode & 0o777
+                ));
+            }
+            if mode & 0o077 != 0 {
+                warn!(
+                    mode = format!("{:o}", mode & 0o777),
+                    "--private-network-key-file {path}: readable beyond its owner; anyone who can read it can join the network"
+                );
             }
         }
         // Errors never quote the file: it is the key.
@@ -209,21 +356,24 @@ fn set_up_private_network(args: &[String], peers: &[Multiaddr]) -> Result<Privat
         fingerprint = Some(openhydra_network::transport::private_network_fingerprint(&key));
     }
     if args.iter().any(|a| a == "--private-network-quic") {
-        if fingerprint.is_none() || allowed.is_none() {
+        if fingerprint.is_none() || allowlist.is_none() {
             return Err("--private-network-quic needs --private-network-key-file and --allow-peers-file".into());
         }
         openhydra_network::transport::allow_quic_on_private_network().map_err(|e| format!("--private-network-quic: {e}"))?;
     }
-    Ok(PrivateNetwork { fingerprint, allowed })
+    Ok(PrivateNetwork { fingerprint, allowlist })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    if let Err(e) = check_args(&args) {
-        eprintln!("openhydra-bootstrap: {e}\n{USAGE}");
-        std::process::exit(2);
-    }
+    // Checked, and with `--flag=value` split, before anything reads it.
+    let args: Vec<String> = match check_args(&std::env::args().collect::<Vec<_>>()) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("openhydra-bootstrap: {e}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
 
     // Init tracing.
     tracing_subscriber::fmt()
@@ -264,7 +414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A private deployment's network key and peer allowlist, set before the transport is built.
     let bootstrap_peers: Vec<Multiaddr> = parse_flag_multi(&args, "--peer")?.unwrap_or_default();
-    let private = set_up_private_network(&args, &bootstrap_peers).unwrap_or_else(|e| {
+    let mut private = set_up_private_network(&args, &bootstrap_peers).unwrap_or_else(|e| {
         eprintln!("openhydra-bootstrap: {e}");
         std::process::exit(2);
     });
@@ -281,8 +431,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(fingerprint) = &private.fingerprint {
         info!(%fingerprint, quic, "private network: TCP and relay circuits keyed; no OpenHydra public bootstraps or relays");
     }
-    if let Some(n) = private.allowed {
-        info!(peers = n, "peer allowlist: only these peers (and the --peer bootstraps) may connect");
+    // Re-read in the event loop below (`AllowlistFile`).
+    let mut allowlist_file = private.allowlist.take();
+    if let Some(file) = &allowlist_file {
+        info!(
+            peers = file.current.len(),
+            file = %file.path,
+            "peer allowlist: only these peers (and the --peer bootstraps) may connect; the file is re-read every few seconds, edit it to add or remove one"
+        );
     }
 
     // The gossip mesh's upper bound (load tests A/B it; production keeps BOOTSTRAP_GOSSIP_MESH_MAX).
@@ -642,6 +798,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gone_watch: std::collections::HashMap<libp2p::PeerId, std::time::Instant> = Default::default();
     let mut gone_ticker = tokio::time::interval(Duration::from_secs(5));
     gone_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut allowlist_ticker = tokio::time::interval(ALLOWLIST_REREAD);
+    allowlist_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Event loop — Phase 4.4: graceful shutdown via signal handling.
     loop {
@@ -649,6 +807,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => {
                 info!("received SIGTERM/SIGINT, shutting down gracefully");
                 break;
+            }
+            _ = allowlist_ticker.tick(), if allowlist_file.is_some() => {
+                let Some(file) = allowlist_file.as_mut() else { continue };
+                match file.check() {
+                    AllowlistCheck::Changed { added, removed } => {
+                        // The fence closes the connections of every peer no longer on it (and with
+                        // them its relay reservation and circuits, gossip and DHT access).
+                        openhydra_network::fence::set_credential_peers(file.current.clone());
+                        info!(added, removed, peers = file.current.len(), file = %file.path, "peer allowlist changed");
+                    }
+                    AllowlistCheck::Failed(error) => {
+                        warn!(%error, file = %file.path, peers = file.current.len(), "--allow-peers-file can't be read or parsed; keeping the peers it last listed");
+                    }
+                    AllowlistCheck::Settling | AllowlistCheck::Unchanged => {}
+                }
             }
             _ = metrics_tick.tick(), if metrics_bind.is_some() => {
                 let topic = gossipsub::IdentTopic::new(openhydra_network::swarm::GOSSIPSUB_TOPIC).hash();
@@ -2259,8 +2432,8 @@ mod tests {
             "--external", "/ip4/10.0.0.5/tcp/4001", "--gossip-mesh-max", "6", "--metrics-bind", "127.0.0.1:9100",
             "--private-network-key-file", "swarm.key", "--allow-peers-file", "peers.txt", "--private-network-quic",
         ]);
-        assert_eq!(check_args(&all), Ok(()));
-        assert_eq!(check_args(&args(&[])), Ok(()));
+        assert_eq!(check_args(&all).as_ref(), Ok(&all), "nothing to split: unchanged");
+        assert_eq!(check_args(&args(&[])), Ok(args(&[])));
         // A misspelt key flag must not start an open bootstrap.
         let typo = check_args(&args(&["--private-netwrok-key-file", "swarm.key"])).unwrap_err();
         assert!(typo.contains("--private-netwrok-key-file"), "{typo}");
@@ -2268,6 +2441,64 @@ mod tests {
         assert!(check_args(&args(&["stray"])).is_err(), "a value with no flag");
         assert!(check_args(&args(&["--identity"])).is_err(), "a missing value");
         assert!(check_args(&args(&["--identity", "--private-network-quic"])).is_err(), "a flag isn't a value");
+    }
+
+    #[test]
+    fn joined_values_are_split_and_single_value_flags_given_twice_are_errors() {
+        let args = |v: &[&str]| std::iter::once("openhydra-bootstrap").chain(v.iter().copied()).map(String::from).collect::<Vec<_>>();
+        // `--flag=value` is the same as `--flag value`, split on the first `=` only.
+        let joined = check_args(&args(&["--identity=/k/id.key", "--listen=/ip4/0.0.0.0/tcp/4001", "--allow-peers-file=/etc/a=b.txt"])).unwrap();
+        assert_eq!(joined, args(&["--identity", "/k/id.key", "--listen", "/ip4/0.0.0.0/tcp/4001", "--allow-peers-file", "/etc/a=b.txt"]));
+        assert_eq!(parse_flag(&joined, "--allow-peers-file").as_deref(), Some("/etc/a=b.txt"), "parsing reads what was checked");
+        assert!(check_args(&args(&["--identity="])).is_err(), "an empty joined value");
+        assert!(check_args(&args(&["--private-network-quic=yes"])).unwrap_err().contains("takes no value"));
+        assert!(check_args(&args(&["--private-netwrok-key-file=swarm.key"])).unwrap_err().contains("--private-netwrok-key-file"));
+        // A second value of a one-value flag was silently ignored; now it is refused, in either form.
+        for twice in [
+            &["--private-network-key-file", "a.key", "--private-network-key-file", "b.key"][..],
+            &["--identity", "a", "--identity=b"][..],
+            &["--private-network-quic", "--private-network-quic"][..],
+        ] {
+            assert!(check_args(&args(twice)).unwrap_err().contains("twice"), "{twice:?}");
+        }
+        // The repeatable ones stay repeatable.
+        let many = args(&["--listen", "/ip4/0.0.0.0/tcp/4001", "--listen=/ip6/::/tcp/4001", "--peer", "/ip4/10.0.0.6/tcp/4001",
+            "--peer", "/ip4/10.0.0.7/tcp/4001", "--external", "/ip4/10.0.0.5/tcp/4001", "--external", "/ip4/10.0.0.8/tcp/4001"]);
+        let checked = check_args(&many).unwrap();
+        assert_eq!(parse_flag_multi(&checked, "--listen").unwrap().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_allowlist_file_is_reread_and_a_bad_read_keeps_the_last_good_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.txt");
+        let (bootstrap, a, b) = (libp2p::PeerId::random(), libp2p::PeerId::random(), libp2p::PeerId::random());
+        std::fs::write(&path, format!("{a}\n")).unwrap();
+        let mut file = AllowlistFile::open(path.to_string_lossy().into_owned(), HashSet::from([bootstrap])).unwrap();
+        assert_eq!(file.current, HashSet::from([a, bootstrap]), "the --peer bootstraps are always on it");
+        assert_eq!(file.check(), AllowlistCheck::Unchanged);
+        // Approve b, revoke a: applied once two reads agree.
+        std::fs::write(&path, format!("# members\n{b}\n")).unwrap();
+        assert_eq!(file.check(), AllowlistCheck::Settling);
+        assert_eq!(file.current, HashSet::from([a, bootstrap]), "not yet");
+        assert_eq!(file.check(), AllowlistCheck::Changed { added: 1, removed: 1 });
+        assert_eq!(file.current, HashSet::from([b, bootstrap]));
+        // A file caught half-written (here: truncated) and then completed changes nothing.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(file.check(), AllowlistCheck::Settling);
+        std::fs::write(&path, format!("{b}\n")).unwrap();
+        assert_eq!(file.check(), AllowlistCheck::Unchanged);
+        assert_eq!(file.current, HashSet::from([b, bootstrap]));
+        // A typo, then a missing file: warned about once each, the last good set kept.
+        std::fs::write(&path, "12D3KooWnotapeer\n").unwrap();
+        let typo = file.check();
+        assert!(matches!(&typo, AllowlistCheck::Failed(e) if e.contains("not a peer id")), "{typo:?}");
+        assert_eq!(file.check(), AllowlistCheck::Unchanged, "the same error isn't repeated");
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(file.check(), AllowlistCheck::Failed(_)));
+        assert_eq!(file.current, HashSet::from([b, bootstrap]), "never emptied by a bad read");
+        // At startup there is no last good set: a file that can't be read is an error.
+        assert!(AllowlistFile::open(path.to_string_lossy().into_owned(), HashSet::new()).is_err());
     }
 
     #[test]
@@ -2282,8 +2513,14 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             let args = vec!["x".to_string(), "--private-network-key-file".into(), path.to_string_lossy().into_owned()];
             let e = set_up_private_network(&args, &[]).err().expect("a 0644 key file is refused");
-            assert!(e.contains("chmod 600"), "{e}");
+            assert!(e.contains("chmod 600") && e.contains("--allow-readable-key-file"), "{e}");
             assert!(!e.contains(&std::fs::read_to_string(&path).unwrap().lines().nth(2).unwrap().to_string()), "never the key");
+            // Writable by others: refused even with the flag (they could swap the key).
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o646)).unwrap();
+            let mut with_flag = args.clone();
+            with_flag.push("--allow-readable-key-file".into());
+            let e = set_up_private_network(&with_flag, &[]).err().expect("a key file others can write is refused");
+            assert!(e.contains("written"), "{e}");
             assert!(openhydra_network::transport::private_network_key().is_none());
         }
         let e = set_up_private_network(&["x".into(), "--private-network-quic".into()], &[]).err().expect("QUIC alone is refused");

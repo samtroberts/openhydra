@@ -72,12 +72,38 @@ pub fn private_scope(network_id: &str, key_fingerprint: Option<&str>) -> String 
             format!("private-key-{short}")
         }
         // Network ids are hex or a checked name (letters, digits, `.`, `_`, `-`) already; anything
-        // else is replaced, so no id can name another directory (with no `/`, `..` can't).
-        None => network_id
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
-            .collect(),
+        // else is replaced, so no id can name another directory (with no `/`, `..` can't). Lowercase,
+        // because on a case-insensitive file system (macOS, Windows) `--network-id Lab` and `lab`
+        // would otherwise open the same file while being different networks. Whenever the name had
+        // to change for either reason, a short hash of the exact id keeps such ids apart everywhere.
+        None => {
+            let safe: String = network_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c.to_ascii_lowercase() } else { '_' })
+                .collect();
+            if safe == network_id {
+                safe
+            } else {
+                format!("{safe}-{}", short_hash(network_id))
+            }
+        }
     }
+}
+
+/// The scope of a node with no network key, no bootstraps and no network name, but a peer
+/// allowlist: its network id is the same for every such node (a hash of no bootstraps), so it is
+/// told apart by the peers it allows instead, and two unrelated deployments don't share a cache.
+/// Peer ids are public; nothing secret goes into the name.
+pub fn allowlist_scope(allowed: &std::collections::HashSet<PeerId>) -> String {
+    let mut ids: Vec<String> = allowed.iter().map(|p| p.to_base58()).collect();
+    ids.sort();
+    format!("private-allow-{}", short_hash(&ids.join(",")))
+}
+
+/// The first 16 hex digits of the SHA-256 of `text`.
+fn short_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.as_bytes()))[..16].to_string()
 }
 
 /// Load persisted contacts as flat `(PeerId, Multiaddr)` pairs ready for
@@ -186,9 +212,26 @@ mod tests {
         assert_ne!(private_scope("private-0123456789abcdef", None), private_scope("private-fedcba9876543210", None));
         assert_eq!(private_scope("private-name-acme-lab.1", None), "private-name-acme-lab.1");
         // Never a path, whatever it is given.
-        assert_eq!(private_scope("../x/y", None), ".._x_y");
+        assert!(private_scope("../x/y", None).starts_with(".._x_y-"));
+        assert_ne!(private_scope("../x/y", None), private_scope(".._x_y", None));
+        // Names differing only in case get different files, also where the file system ignores case.
+        let (upper, lower) = (private_scope("private-name-Lab", None), private_scope("private-name-lab", None));
+        assert_eq!(lower, "private-name-lab");
+        assert_ne!(upper.to_ascii_lowercase(), lower);
+        assert_eq!(upper, upper.to_ascii_lowercase());
         let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), Some(&private_scope("../../etc", None)));
         assert_eq!(p.parent(), Some(Path::new("/opt/openhydra")));
+    }
+
+    #[test]
+    fn allowlist_only_nodes_are_told_apart_by_their_allowlist() {
+        use std::collections::HashSet;
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let ab = allowlist_scope(&HashSet::from([a, b]));
+        assert!(ab.starts_with("private-allow-") && ab.len() == "private-allow-".len() + 16, "{ab}");
+        assert_eq!(ab, allowlist_scope(&HashSet::from([b, a])), "order doesn't matter");
+        assert_ne!(ab, allowlist_scope(&HashSet::from([a, c])));
+        assert_eq!(private_scope(&ab, None), ab, "already safe as a file name");
     }
 
     #[test]

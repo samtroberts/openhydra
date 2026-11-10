@@ -20,7 +20,7 @@ import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tabl
 import { renderEngines } from "./installer";
 import { renderShare, setSharing, toggleSharing, ensureGateway, openShareDialog } from "./share";
 import { wireCardDeepLinks } from "./cards";
-import { fallbackToSend, shouldOfferFallback, offerText, fellBackNote } from "./cardfallback.js";
+import { fallbackToSend, shouldOfferFallback, offerText, fellBackNote, declinedText } from "./cardfallback.js";
 import { renderSwarms } from "./swarms";
 import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
@@ -385,6 +385,7 @@ async function sendOne(text, fromHome) {
   } catch (e) {
     clearTimeout(slow); wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
     // A public card's provider couldn't serve and others of the same version can: ask, once.
+    let declined = false;
     if (tries === 0 && shouldOfferFallback(e?.details)) {
       const q = offerText(displayModelName(model), e.details);
       if (await confirmModal(q.title, q.body, q.ok)) {
@@ -392,8 +393,16 @@ async function sendOne(text, fromHome) {
         wait.textContent = "Asking another provider of the same version…"; th.appendChild(wait);
         continue;
       }
+      declined = true;
     }
     const err = document.createElement("div"); err.className = "msg ai"; err.style.color = "hsl(var(--danger))"; err.style.fontSize = "12.5px";
+    // A card's provider that couldn't serve: the gateway's own sentence (written for people),
+    // never reworded by the patterns below, which its text could otherwise steer.
+    if (e?.details) {
+      err.textContent = declined ? declinedText(displayModelName(model), e.details) : String(e);
+      th.appendChild(err);
+      break;
+    }
     // A gateway error reply arrives as "gateway <status> <type>: <message>"; anything else is ours.
     const es = String(e), gw = /^gateway (\d{3}) ([a-z_]*): ([\s\S]*)$/.exec(es);
     err.textContent = /is verified at A\d/.test(es) ? "No provider meets your \u2018Only use trusted providers\u2019 setting yet. Lower it in Settings, or keep using providers so they build a track record."

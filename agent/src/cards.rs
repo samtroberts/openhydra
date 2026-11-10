@@ -331,7 +331,12 @@ pub enum CardPin {
     None,
     /// A private card names it: only these providers (and this machine's own), never anyone found
     /// on the network, and the network isn't asked about it.
-    Private { peers: Vec<DiscoveredPeer> },
+    Private {
+        /// Its unexpired private cards' providers (none once every such card has expired).
+        peers: Vec<DiscoveredPeer>,
+        /// The swarms its private cards (expired ones too) name.
+        swarms: Vec<String>,
+    },
     /// Public cards name it: these providers first; another provider only as a fallback, and only
     /// one announcing one of these exact versions (canonical ids; empty when the cards state none).
     Public { peers: Vec<DiscoveredPeer>, canonicals: Vec<String> },
@@ -388,9 +393,21 @@ pub fn read_card_prefs(path: &Path) -> CardPrefs {
 }
 
 /// Save (or, with `None`, clear) the fallback choice for `model` beside the cards file `cards`.
+///
+/// The CLI and the app can both write it, so a write holds a lock file beside it (two at once would
+/// otherwise lose one's choice), and a file that doesn't parse is refused rather than replaced
+/// (that would wipe the other models' choices). The new file is written under a fresh name, never
+/// through a link, then renamed into place.
 pub fn set_card_fallback(cards: &Path, model: &str, choice: Option<CardFallback>) -> Result<CardPrefs, String> {
     let path = prefs_path(cards);
-    let mut prefs = read_card_prefs(&path);
+    let _lock = PrefsLock::acquire(&path)?;
+    let mut prefs = match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => CardPrefs::default(),
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| format!("{} doesn't parse ({e}); fix or remove it first", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CardPrefs::default(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
     match choice {
         Some(c) => {
             prefs.fallback.insert(model.to_string(), c);
@@ -400,12 +417,57 @@ pub fn set_card_fallback(cards: &Path, model: &str, choice: Option<CardFallback>
         }
     }
     let json = serde_json::to_string_pretty(&prefs).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let mut tmp_name = path.file_name().unwrap_or_default().to_owned();
+    tmp_name.push(format!(".{}-{nanos}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let written = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()
+    });
+    if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, &path)) {
         let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })?;
+        return Err(format!("{}: {e}", path.display()));
+    }
     Ok(prefs)
+}
+
+/// A lock file beside the saved choices, held while they are rewritten ([`set_card_fallback`]).
+struct PrefsLock(PathBuf);
+
+impl PrefsLock {
+    /// Wait (up to ~2 s) for the lock. One older than 30 s is a writer that died holding it: taken over.
+    fn acquire(prefs: &Path) -> Result<Self, String> {
+        let mut name = prefs.file_name().unwrap_or_default().to_owned();
+        name.push(".lock");
+        let lock = prefs.with_file_name(name);
+        for _ in 0..100 {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => return Ok(PrefsLock(lock)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(30));
+                    if stale {
+                        let _ = std::fs::remove_file(&lock);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(format!("{}: {e}", lock.display())),
+            }
+        }
+        Err(format!("{} is held by another writer; try again", lock.display()))
+    }
+}
+
+impl Drop for PrefsLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Read a cards file (a JSON array of [`Card`]). Missing/empty → `[]`; a parse error is surfaced.
@@ -475,10 +537,21 @@ impl CardStore {
         Arc::new(Self { path, cache: Mutex::new(CardCache::default()) })
     }
 
-    /// Re-read + re-verify iff the file's CONTENT changed. Best-effort: a missing/unreadable file →
-    /// empty content → no cards (never errors the serve path). Poison-tolerant lock.
-    fn refresh(&self, now_ms: u64) {
-        let raw = std::fs::read_to_string(&self.path).unwrap_or_default();
+    /// Re-read + re-verify iff the file's CONTENT changed. A missing file means no cards. A file
+    /// that can't be read or parsed keeps the cards last read (and says so): an empty list would
+    /// drop every private card's pin at once, and its model would then be routed to anyone
+    /// announcing the name. Cards are kept when their signature is good even once expired: queries
+    /// leave them out, but a private one still pins its model ([`pin_for`](Self::pin_for)).
+    /// Poison-tolerant lock.
+    fn refresh(&self, _now_ms: u64) {
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                tracing::warn!(path = %self.path.display(), error = %e, "can't read the imported cards; keeping the ones last read");
+                return;
+            }
+        };
         let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if c.raw.as_deref() == Some(raw.as_str()) {
             return;
@@ -486,9 +559,16 @@ impl CardStore {
         let parsed: Vec<Card> = if raw.trim().is_empty() {
             Vec::new()
         } else {
-            serde_json::from_str(&raw).unwrap_or_default()
+            match serde_json::from_str(&raw) {
+                Ok(cards) => cards,
+                Err(e) => {
+                    tracing::warn!(path = %self.path.display(), error = %e, "the imported cards file doesn't parse; keeping the cards last read");
+                    return;
+                }
+            }
         };
-        c.cards = parsed.into_iter().filter(|card| verify_card(card, now_ms).is_ok()).collect();
+        // Signature checked as of a moment the card was valid, so an expired card is kept.
+        c.cards = parsed.into_iter().filter(|card| verify_card(card, card.expires_at.saturating_sub(1)).is_ok()).collect();
         c.raw = Some(raw);
     }
 
@@ -515,13 +595,25 @@ impl CardStore {
     pub fn pin_for(&self, model_id: &str, now_ms: u64) -> CardPin {
         self.refresh(now_ms);
         let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // A private card pins its model even once it has expired: the model then fails (no
+        // provider) until the card is renewed or removed, rather than going to anyone announcing
+        // the name. Its expired providers aren't used.
+        let private_named = c.cards.iter().any(|card| card.model_id == model_id && !card.swarm_public_key.is_empty());
         let cards: Vec<&Card> = c.cards.iter().filter(|card| card.model_id == model_id && now_ms < card.expires_at).collect();
+        if private_named {
+            let peers = cards.iter().filter(|c| !c.swarm_public_key.is_empty()).map(|c| card_to_discovered(c)).collect();
+            let mut swarms: Vec<String> = c
+                .cards
+                .iter()
+                .filter(|card| card.model_id == model_id && !card.swarm_public_key.is_empty())
+                .map(|card| card.swarm_public_key.to_ascii_lowercase())
+                .collect();
+            swarms.sort();
+            swarms.dedup();
+            return CardPin::Private { peers, swarms };
+        }
         if cards.is_empty() {
             return CardPin::None;
-        }
-        let private: Vec<DiscoveredPeer> = cards.iter().filter(|c| !c.swarm_public_key.is_empty()).map(|c| card_to_discovered(c)).collect();
-        if !private.is_empty() {
-            return CardPin::Private { peers: private };
         }
         let mut canonicals: Vec<String> = cards.iter().map(|c| c.canonical_id.clone()).filter(|c| !c.is_empty()).collect();
         canonicals.sort();
@@ -655,12 +747,52 @@ mod tests {
         // A private card for the same name: only its provider, never the public cards' too.
         add_card(&path, &card_with(&p, "qwen", v, &"ab".repeat(32), 9_999_999_999_999)).unwrap();
         match store.pin_for("qwen", 2_000) {
-            CardPin::Private { peers } => {
+            CardPin::Private { peers, .. } => {
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].libp2p_peer_id, p.libp2p_peer_id.to_string());
             }
             other => panic!("a private card must win: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_private_card_fails_closed_when_it_expires_or_the_file_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cards.json");
+        let (p, q) = (an_identity(), an_identity());
+        let swarm = "ab".repeat(32);
+        add_card(&path, &card_with(&p, "secret", "", &swarm, 5_000)).unwrap();
+        add_card(&path, &card_with(&q, "open", "", "", 9_999_999_999_999)).unwrap();
+        let store = CardStore::new(path.clone());
+        // Expired: still pinned (no providers left), never `None` (which would route it publicly).
+        match store.pin_for("secret", 6_000) {
+            CardPin::Private { peers, swarms } => {
+                assert!(peers.is_empty());
+                assert_eq!(swarms, vec![swarm.clone()]);
+            }
+            other => panic!("an expired private card must still pin: {other:?}"),
+        }
+        // A file that stops parsing (a bad hand edit) keeps the cards last read.
+        std::fs::write(&path, "[{ broken").unwrap();
+        assert!(matches!(store.pin_for("secret", 6_000), CardPin::Private { .. }), "still pinned");
+        assert!(matches!(store.pin_for("open", 6_000), CardPin::Public { .. }));
+        // Removing the file is removing the cards.
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(store.pin_for("secret", 6_000), CardPin::None));
+    }
+
+    #[test]
+    fn a_gateways_cards_name_the_providers_it_may_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cards.json");
+        let (a, b) = (an_identity(), an_identity());
+        add_card(&path, &card_with(&a, "m1", "", "", 9_999_999_999_999)).unwrap();
+        add_card(&path, &card_with(&b, "m2", "", &"cd".repeat(32), 5_000)).unwrap();
+        let store = CardStore::new(path);
+        let peers = store.provider_peer_ids(1_000);
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&a.libp2p_peer_id.to_string()));
+        assert_eq!(store.provider_peer_ids(6_000), [a.libp2p_peer_id.to_string()].into(), "an expired card's provider no longer");
     }
 
     #[test]
@@ -681,6 +813,19 @@ mod tests {
             assert_eq!(CardFallback::parse(c.as_str()), Some(c));
         }
         assert_eq!(CardFallback::parse("always"), None);
+        // Two writers at once: neither loses the other's choice.
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || set_card_fallback(&path, &format!("m{i}"), Some(CardFallback::Never)).unwrap())
+            })
+            .collect();
+        handles.into_iter().for_each(|h| { h.join().unwrap(); });
+        assert_eq!(read_card_prefs(&prefs_path(&path)).fallback.len(), 9, "8 new + `other`");
+        // A file that doesn't parse is refused, not replaced (the other choices would be lost).
+        std::fs::write(prefs_path(&path), "{ not json").unwrap();
+        assert!(set_card_fallback(&path, "qwen", Some(CardFallback::Ask)).unwrap_err().contains("doesn't parse"));
+        assert_eq!(std::fs::read_to_string(prefs_path(&path)).unwrap(), "{ not json");
     }
 
     #[test]

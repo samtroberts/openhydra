@@ -752,8 +752,8 @@ const SPREAD_REPUTATION_MARGIN: f64 = 10.0;
 
 /// How many `candidates` are equally eligible to share load with the first: the same `lead` key
 /// (refusals, availability, connection) and an `earned` reputation within
-/// [`SPREAD_REPUTATION_MARGIN`] of the first's, or of the neutral reputation when the first has
-/// earned more. They are moved to the front (in their order), ahead of any of the same lead that
+/// [`SPREAD_REPUTATION_MARGIN`] of the best among them, or of the neutral reputation when the best
+/// has earned more. They are moved to the front (in their order), ahead of any of the same lead that
 /// fell short: one provider that failed us, ranked high on its own advertised figures, must not
 /// shut every provider behind it out of the spread.
 ///
@@ -763,9 +763,12 @@ const SPREAD_REPUTATION_MARGIN: f64 = 10.0;
 /// equal vLLM providers took 168 of 168).
 fn spread_eligible<T, K: PartialEq>(candidates: &mut Vec<T>, lead: &dyn Fn(&T) -> K, earned: &dyn Fn(&T) -> f64) -> usize {
     let Some(first) = candidates.first() else { return 0 };
-    let floor = earned(first).min(NEUTRAL_REPUTATION) - SPREAD_REPUTATION_MARGIN;
     let key = lead(first);
     let same_lead = candidates.iter().take_while(|c| lead(c) == key).count();
+    // The floor comes from the best reputation among them, not the first's: a provider that failed
+    // us but ranks first (it is near, say) must not lower the bar to let itself in (review 2).
+    let best = candidates[..same_lead].iter().map(|c| earned(c)).fold(f64::NEG_INFINITY, f64::max);
+    let floor = best.min(NEUTRAL_REPUTATION) - SPREAD_REPUTATION_MARGIN;
     let (mut eligible, mut short): (Vec<T>, Vec<T>) = candidates.drain(..same_lead).partition(|c| earned(c) >= floor);
     let n = eligible.len();
     eligible.append(&mut short);
@@ -854,19 +857,21 @@ fn card_unavailable(
     let who = if private { "the swarm's provider" } else { "the card's provider" };
     let what = match reason {
         "overloaded" => format!("{who} is busy (it turned the request away)"),
+        // The provider's own words aren't passed on (they could say anything); they are logged.
         "refused" => {
-            let detail: String = err.message().chars().take(160).collect();
-            format!("{who} refused the request ({detail})")
+            tracing::info!(provider_error = %err.message().chars().take(300).collect::<String>(), "a card's provider refused the request");
+            format!("{who} refused the request")
         }
+        "expired" => "the private card for it has expired; renew or remove it".to_string(),
         _ => format!("{who} is offline (it couldn't be reached)"),
     };
-    let others = if alternatives == 1 { "1 other provider serves".to_string() } else { format!("{alternatives} other providers serve") };
+    let others = if alternatives == 1 { "1 other provider announces".to_string() } else { format!("{alternatives} other providers announce") };
     let message = if private {
         format!("{model}: {what}. This private model is never sent outside its swarm, so nothing else was tried.")
     } else if alternatives_failed {
-        format!("{model}: {what}, and the {others} the same version couldn't serve it either.")
+        format!("{model}: {what}, and the {others} the same version but couldn't serve it either.")
     } else if alternatives == 0 {
-        format!("{model}: {what}, and no other provider serves the same version.")
+        format!("{model}: {what}, and no other provider announces the same version.")
     } else {
         match choice {
             CardFallback::Never => format!("{model}: {what}. {others} the same version, but falling back is off for this model."),
@@ -1033,6 +1038,11 @@ pub fn rank_providers_with_reputation(
 /// gains nothing over providers that were measured.
 const UNMEASURED_RTT_MS: f64 = 150.0;
 
+/// Round trips below this rank alike. The router weighs latency as `1/ms`, so a provider a
+/// millisecond away (the same data centre as a gateway) would otherwise score far above any
+/// reputation it has earned (review 2, 11 Nov): from here on latency is a tie-break.
+const MIN_RANKED_RTT_MS: f64 = 20.0;
+
 pub fn rank_providers_with_assurance(
     peers: &[DiscoveredPeer],
     request_canonical: &str,
@@ -1095,8 +1105,12 @@ pub fn rank_providers_measured(
             // The round trip this node measured (libp2p ping), or [`UNMEASURED_RTT_MS`] when there
             // is none yet (an unconnected provider, a card not yet dialled): no measurement must
             // not look like the nearest provider there is.
-            latency_ms: rtt(&p.libp2p_peer_id).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(UNMEASURED_RTT_MS),
-            load_pct: p.load_pct,
+            latency_ms: rtt(&p.libp2p_peer_id).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(UNMEASURED_RTT_MS).max(MIN_RANKED_RTT_MS),
+            // A provider's advertised load, queue and speed are its own unchecked claims: ranked on,
+            // a provider claiming to be idle and fast would outrank honest ones with a better earned
+            // reputation (review 2, 11 Nov). They are left neutral here; load is spread on what this
+            // gateway measures itself (its open serves, each serve's reported load, capped).
+            load_pct: 0.0,
             // Earned reputation (local tracker, per (peer, model)) wins; else neutral. Never the
             // record's own `reputation_score`: it isn't signed, so any provider could claim the top
             // and take the audit slots (review T2). A provider that failed *us* on this model ranks
@@ -1105,8 +1119,8 @@ pub fn rank_providers_measured(
                 .unwrap_or(50.0),
             bandwidth_mbps: 0.0,
             s2s_rtt_ms: 0.0,
-            throughput_tok_s: p.throughput_tok_s,
-            queue_depth: p.queue_depth,
+            throughput_tok_s: 0.0,
+            queue_depth: 0,
         })
         .collect();
     let mut ranked: Vec<SelectedProvider> = rank_peers(&inputs, tier)
@@ -1977,7 +1991,7 @@ pub struct ConsumerNode {
     own_models: Mutex<Option<(u64, crate::provider::OwnModels)>>,
     /// Held while one request asks our own provider what it shares, so a burst of requests on an
     /// expired list makes one ask (the rest use the last answer) instead of each waiting on it.
-    own_models_asking: Mutex<()>,
+    own_models_asking: std::sync::atomic::AtomicBool,
     /// Whether this gateway lists and routes its own provider's Device and Private models. Off on a
     /// gateway other machines can reach: those models are "this machine only", and its callers
     /// aren't this machine.
@@ -2368,7 +2382,7 @@ impl ConsumerNode {
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             own_models: Mutex::new(None),
-            own_models_asking: Mutex::new(()),
+            own_models_asking: std::sync::atomic::AtomicBool::new(false),
             own_models_allowed: true,
             seeds: None,
             creds: None,
@@ -2788,7 +2802,7 @@ impl ConsumerNode {
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             own_models: Mutex::new(None),
-            own_models_asking: Mutex::new(()),
+            own_models_asking: std::sync::atomic::AtomicBool::new(false),
             own_models_allowed: true,
             seeds: None,
             creds: None,
@@ -3542,10 +3556,22 @@ impl ConsumerNode {
                 return Some(models);
             }
         }
-        // One ask at a time: while another request is asking, use the last answer (or nothing yet).
-        let Ok(_asking) = self.own_models_asking.try_lock() else {
-            return Some(cached().map(|(_, m)| m).unwrap_or_default());
-        };
+        // One ask at a time while there is an earlier answer to fall back on: the rest use it. With
+        // none yet, every request asks (an empty answer would hide this machine's models).
+        let stale = cached();
+        let asking = stale.is_some()
+            && self.own_models_asking.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err();
+        if asking {
+            return stale.map(|(_, m)| m);
+        }
+        // Cleared however this returns (a flag, not a lock: nothing to poison).
+        struct Clear<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Clear<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _clear = stale.is_some().then(|| Clear(&self.own_models_asking));
         let fresh = self
             .net
             .proxy_forward_timeout(own, vec![crate::provider::OWN_MODELS_REQUEST], std::time::Duration::from_secs(3))
@@ -3608,10 +3634,38 @@ impl ConsumerNode {
             crate::cards::CardPin::None => {
                 return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
             }
-            crate::cards::CardPin::Private { peers } => (peers.clone(), true),
+            crate::cards::CardPin::Private { peers, .. } => (peers.clone(), true),
             crate::cards::CardPin::Public { peers, .. } => (peers.clone(), false),
         };
         let pinned = restrict_to(only, card_peer_ids(&card_peers, self.self_provider.as_deref()));
+        if let crate::cards::CardPin::Private { swarms, .. } = &pin {
+            let now = now_unix_ms();
+            // Who may learn that this gateway holds a private card for the name: a member of its
+            // swarm. Anyone else (an API key holder on a shared gateway) gets the answer an
+            // unknown model gets, so the card's existence isn't revealed.
+            let member = self.creds.as_ref().is_some_and(|c| swarms.iter().any(|s| c.credential_for_swarm(s, now).is_some()));
+            let own_shares = self.own_models(now).is_some_and(|m| m.models.iter().any(|x| x == model));
+            if card_peers.is_empty() && !own_shares {
+                // Every private card for it has expired: fail at once, never route elsewhere.
+                tracing::warn!(model, "every private card for this model has expired; not routing it");
+                return Err(if member {
+                    card_unavailable(model, true, "expired", &AdapterError::Route(String::new()), Vec::new(), 0, crate::cards::CardFallback::Never, false)
+                } else {
+                    AdapterError::Route(format!("no provider for model '{model}'"))
+                });
+            }
+            if !member {
+                // Still pinned (the card's providers refuse a non-member, and nobody else is
+                // asked), with a failure worded as for an unknown model.
+                let mut track = |d: &str| on_delta(d);
+                return self
+                    .serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), true, None, cancel, &mut track)
+                    .map_err(|e| match e {
+                        AdapterError::Cancelled(_) => e,
+                        _ => AdapterError::Route(format!("no provider for model '{model}'")),
+                    });
+            }
+        }
         // Whether any of the answer reached the client: then nothing else may be tried.
         let delivered = std::cell::Cell::new(false);
         // The providers the lookups for this request found (a public card's possible fallbacks).
@@ -3647,10 +3701,12 @@ impl ConsumerNode {
         }
         let crate::cards::CardPin::Public { canonicals, .. } = &pin else { unreachable!("matched above") };
         // Another provider only for the same exact version, never just the same name.
-        let alternatives = self.same_version_alternatives(model, &pinned, canonicals, only, seen.into_inner());
         let choice = fallback
             .or_else(|| self.cards.as_ref().and_then(|c| c.fallback_pref(model)))
             .unwrap_or(crate::cards::CardFallback::SameVersion);
+        // Only counted for `ask` / `never` (what was found already, no further lookups); looked
+        // for harder when it will be used.
+        let alternatives = self.same_version_alternatives(model, &pinned, canonicals, only, seen.into_inner(), choice == crate::cards::CardFallback::SameVersion);
         if choice != crate::cards::CardFallback::SameVersion || alternatives.is_empty() {
             tracing::info!(model, reason, alternatives = alternatives.len(), choice = choice.as_str(), "a card's provider couldn't serve; not falling back");
             return Err(card_unavailable(model, false, reason, &err, shown, alternatives.len(), choice, false));
@@ -3685,15 +3741,21 @@ impl ConsumerNode {
         canonicals: &[String],
         only: Option<&std::collections::HashSet<String>>,
         seen: Vec<DiscoveredPeer>,
+        look_harder: bool,
     ) -> std::collections::HashSet<String> {
         if canonicals.is_empty() {
             return Default::default();
         }
+        // Within `only`, and only peers this node's allowlist lets connect: offering one it would
+        // refuse asks the user a question that can't work (review 2).
         let pick = |found: Vec<DiscoveredPeer>| -> std::collections::HashSet<String> {
-            card_alternatives(&found, pinned, canonicals).into_iter().filter(|p| only.is_none_or(|o| o.contains(p))).collect()
+            card_alternatives(&found, pinned, canonicals)
+                .into_iter()
+                .filter(|p| only.is_none_or(|o| o.contains(p)) && openhydra_network::fence::peer_allowed(p))
+                .collect()
         };
         let found = pick(seen);
-        if !found.is_empty() {
+        if !found.is_empty() || !look_harder {
             return found;
         }
         let found = pick(self.net.discover(model).unwrap_or_default());
@@ -7355,7 +7417,10 @@ mod tests {
 
     #[test]
     fn selects_highest_ranked_compatible_provider() {
-        let peers = vec![discovered("slow", TPL_A, 5.0), discovered("fast", TPL_A, 45.0)];
+        // The connected one is picked (advertised speed is an unchecked claim and doesn't rank).
+        let mut fast = discovered("fast", TPL_A, 45.0);
+        fast.connected = true;
+        let peers = vec![discovered("slow", TPL_A, 5.0), fast];
         let sel = select_provider(&peers, "qwen3.5/2b/*/*", 2).unwrap();
         assert_eq!(sel.peer_id, "fast");
         assert_eq!(sel.libp2p_peer_id, "fast-libp2p"); // dial target
@@ -7412,7 +7477,9 @@ mod tests {
         ];
         let ranked = rank_providers(&peers, TPL_A, 2);
         let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
-        assert_eq!(ids, vec!["fast", "slow"]); // best first, incompatible excluded
+        // Every compatible one, incompatible excluded. Advertised throughput is the provider's own
+        // claim and doesn't reorder them (review 2): equal otherwise, they keep their order.
+        assert_eq!(ids, vec!["slow", "fast"]);
         assert!(rank_providers(&[], TPL_A, 2).is_empty());
     }
 
@@ -7434,14 +7501,19 @@ mod tests {
 
     #[test]
     fn rank_providers_score_order_within_connected_group() {
-        // Within the connected group, capability score still decides order.
-        let mut fast = discovered("fast", TPL_A, 45.0);
-        fast.connected = true;
-        let mut slow = discovered("slow", TPL_A, 5.0);
-        slow.connected = true;
-        let ranked = rank_providers(&[slow, fast], TPL_A, 2);
+        // Within the connected group, a claim of being idle and fast doesn't jump the queue: a
+        // provider's advertised load, queue and speed are unchecked (review 2, 11 Nov).
+        let mut liar = discovered("liar", TPL_A, 999.0);
+        liar.connected = true;
+        liar.load_pct = 0.0;
+        liar.queue_depth = 0;
+        let mut honest = discovered("honest", TPL_A, 5.0);
+        honest.connected = true;
+        honest.load_pct = 90.0;
+        honest.queue_depth = 7;
+        let ranked = rank_providers(&[honest, liar], TPL_A, 2);
         let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
-        assert_eq!(ids, vec!["fast", "slow"]);
+        assert_eq!(ids, vec!["honest", "liar"]);
     }
 
     // ── M2.2(a): earned-reputation-aware ranking ──
@@ -7772,10 +7844,10 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let (m, n, f) = msg(2, CardFallback::Ask, false);
-        assert!(m.contains("is offline") && m.contains("2 other providers serve the same version") && m.contains("x-openhydra-fallback"), "{m}");
+        assert!(m.contains("is offline") && m.contains("2 other providers announce the same version") && m.contains("x-openhydra-fallback"), "{m}");
         assert_eq!((n, f.as_str()), (2, "ask"));
         assert!(msg(1, CardFallback::Never, false).0.contains("falling back is off"));
-        assert!(msg(0, CardFallback::SameVersion, false).0.contains("no other provider serves the same version"));
+        assert!(msg(0, CardFallback::SameVersion, false).0.contains("no other provider announces the same version"));
         assert!(msg(2, CardFallback::SameVersion, true).0.contains("couldn't serve it either"));
         let busy = card_unavailable("qwen", false, "overloaded", &AdapterError::Overloaded("x".into()), vec![], 0, CardFallback::Ask, false);
         assert!(busy.to_string().contains("is busy"), "{busy}");
@@ -8705,6 +8777,10 @@ mod tests {
         assert_eq!(spread_eligible(&mut vec![("a", true, 74.0), ("b", true, 50.0)], &lead, &earned), 2);
         // A failed one stays out however well the first has done.
         assert_eq!(spread_eligible(&mut vec![("a", true, 74.0), ("b", true, 30.0)], &lead, &earned), 1);
+        // One that failed us ranked first (near, say): it doesn't set the bar, and goes behind.
+        let mut c = vec![("near", true, 20.0), ("far", true, 50.0), ("other", true, 48.0)];
+        assert_eq!(spread_eligible(&mut c, &lead, &earned), 2);
+        assert_eq!(c.iter().map(|c| c.0).collect::<Vec<_>>(), ["far", "other", "near"]);
         // Nothing of another lead joins, and the order past the leading group is kept.
         let mut c = vec![("a", true, 50.0), ("b", true, 20.0), ("c", false, 50.0), ("d", true, 50.0)];
         assert_eq!(spread_eligible(&mut c, &lead, &earned), 1);

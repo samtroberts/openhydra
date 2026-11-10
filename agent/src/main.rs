@@ -70,7 +70,8 @@ struct NodeArgs {
     listen: Vec<String>,
 
     /// Bootstrap peer multiaddr to dial on start (repeatable). On a LAN, mDNS discovers
-    /// peers without this; across networks, point at a known peer/relay.
+    /// peers without this (not on a private network: see `--no-mdns`); across networks, point at a
+    /// known peer/relay.
     #[arg(long = "bootstrap")]
     bootstrap: Vec<String>,
 
@@ -101,6 +102,8 @@ struct NodeArgs {
 
     /// Turn LAN discovery (mDNS) off. On by default: peers on the same network find each other and
     /// connect directly, with or without internet. An off switch in case it misbehaves somewhere.
+    /// Always off with `--private-network-key-file`: mDNS tells everyone on the LAN a node's peer id
+    /// and addresses, and a private deployment's nodes find each other through its bootstraps.
     #[arg(long = "no-mdns")]
     no_mdns: bool,
 
@@ -174,12 +177,39 @@ fn keep_credential_peers(what: &'static str, peers: impl Fn(u64) -> std::collect
     let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     let first = peers(now());
     eprintln!("openhydra-agent: --allow-swarm-peers: {} peer(s) allowed by {what}, kept current", first.len());
+    for p in first.iter().filter(|p| !openhydra_network::fence::is_peer_id(p)) {
+        eprintln!("openhydra-agent: --allow-swarm-peers: {p:?} is not a peer id; ignored");
+    }
     openhydra_network::fence::set_credential_peer_ids(first.iter().map(String::as_str));
-    std::thread::spawn(move || loop {
-        std::thread::sleep(CREDENTIAL_PEERS_EVERY);
-        let now_peers = peers(now());
-        openhydra_network::fence::set_credential_peer_ids(now_peers.iter().map(String::as_str));
+    std::thread::spawn(move || {
+        let mut last = first;
+        loop {
+            std::thread::sleep(CREDENTIAL_PEERS_EVERY);
+            // A panic working the set out must not leave it frozen (revocations would stop
+            // applying, silently): it is logged and the next round tries again.
+            let next = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| peers(now()))) {
+                Ok(next) => next,
+                Err(_) => {
+                    eprintln!("openhydra-agent: --allow-swarm-peers: working out the allowed peers failed; keeping the last set");
+                    continue;
+                }
+            };
+            if next != last {
+                let added = next.difference(&last).count();
+                let removed = last.difference(&next).count();
+                eprintln!("openhydra-agent: --allow-swarm-peers: {} peer(s) allowed by {what} ({added} added, {removed} removed)", next.len());
+                openhydra_network::fence::set_credential_peer_ids(next.iter().map(String::as_str));
+                last = next;
+            }
+        }
     });
+}
+
+/// The cards file the desktop app's gateway reads: `~/.openhydra/cards.json` (the home folder from
+/// `HOME`, or `USERPROFILE` on Windows, as the app finds it).
+fn default_cards_file() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_else(|| ".".into());
+    std::path::PathBuf::from(home).join(".openhydra").join("cards.json")
 }
 
 impl NodeArgs {
@@ -1162,6 +1192,9 @@ fn seed_list(url: &str) -> Result<Option<std::sync::Arc<openhydra_agent::seed_li
 /// when it found problems.
 fn probe(net: NetworkHandle, args: ProbeArgs) -> Result<(), String> {
     use openhydra_agent::{probe, seed_list, tokenizer_index};
+    if ALLOW_SWARM_PEERS.load(std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("openhydra-agent: --allow-swarm-peers names no peers for a probe: it reaches only the --bootstrap peers (and --allow-peers-file)");
+    }
     if !openhydra_agent::registry_client::registry_url_allowed(&args.seed_list_url) {
         return Err(format!("--seed-list-url {}: HTTPS, or http:// to localhost", args.seed_list_url));
     }
@@ -1371,10 +1404,7 @@ fn run() -> Result<(), String> {
                         })?),
                         None => None,
                     };
-                    let path = a.cards_file.unwrap_or_else(|| {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                        std::path::PathBuf::from(home).join(".openhydra").join("cards.json")
-                    });
+                    let path = a.cards_file.unwrap_or_else(default_cards_file);
                     let prefs = openhydra_agent::cards::set_card_fallback(&path, a.model.trim(), choice)?;
                     match choice {
                         Some(c) => println!("{}: fallback {}", a.model.trim(), c.as_str()),
@@ -1397,10 +1427,7 @@ fn run() -> Result<(), String> {
                         }
                     };
                     let v = openhydra_agent::cards::parse_and_verify(&input, now_ms)?;
-                    let path = a.cards_file.unwrap_or_else(|| {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                        std::path::PathBuf::from(home).join(".openhydra").join("cards.json")
-                    });
+                    let path = a.cards_file.unwrap_or_else(default_cards_file);
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
                     }
@@ -1544,7 +1571,13 @@ fn run() -> Result<(), String> {
                         let bound: Vec<String> = a
                             .share_policy_file
                             .as_deref()
-                            .and_then(|p| openhydra_agent::share_policy::SharePolicy::load(p).ok())
+                            .and_then(|p| match openhydra_agent::share_policy::SharePolicy::load(p) {
+                                Ok(policy) => Some(policy),
+                                Err(e) => {
+                                    eprintln!("openhydra-agent: --share-policy-file {}: {e}; can't say which models are still bound", p.display());
+                                    None
+                                }
+                            })
                             .map(|p| p.swarms.iter().filter(|(_, s)| s.contains(&key)).map(|(m, _)| m.clone()).collect())
                             .unwrap_or_default();
                         if !bound.is_empty() {
@@ -1593,6 +1626,11 @@ fn run() -> Result<(), String> {
                         &identity.keypair,
                     )
                     .map_err(|e| format!("sign command: {e}"))?;
+                    // With `--allow-swarm-peers` this one-shot node is fenced like the others: the rig
+                    // it was told to command is a peer it means to reach.
+                    if ALLOW_SWARM_PEERS.load(std::sync::atomic::Ordering::SeqCst) {
+                        openhydra_network::fence::set_credential_peer_ids([a.provider.trim()]);
+                    }
                     // Bring up a live node and dial the rig (via relay if needed).
                     let net = NetworkHandle::start(config)?;
                     eprintln!(

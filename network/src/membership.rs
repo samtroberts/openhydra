@@ -446,7 +446,9 @@ pub fn verify_credential(
     ed_pubkey_from_hex(&cred.member_public_key)?;
     // Revocation (owner-local list of member keys). Checked before expiry: a revoked member is out
     // regardless of the clock.
-    if revoked.contains(&cred.member_public_key) {
+    // Keys are hex: compared without regard to case, so a revocation typed in capitals still counts.
+    let member = cred.member_public_key.to_ascii_lowercase();
+    if revoked.iter().any(|r| r.to_ascii_lowercase() == member) {
         return Err(MembershipError::Revoked(cred.member_public_key.clone()));
     }
     // Signature is good → the timestamps are now trustworthy.

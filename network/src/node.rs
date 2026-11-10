@@ -112,6 +112,12 @@ pub fn start_node(
     ),
     String,
 > {
+    // Freeze the process's network settings (key, allowlist, QUIC) before reading any of them below:
+    // `build_swarm` freezes them too, but only after this function has already decided relays,
+    // bootstraps and the routing-cache scope from them, so a setter called in between would leave
+    // this node half on the old settings and half on the new.
+    crate::transport::freeze_network_settings();
+
     // Load or generate identity.
     let identity = Identity::load_or_create(&config.identity_path)
         .map_err(|e| format!("identity: {e}"))?;
@@ -194,7 +200,14 @@ pub fn start_node(
     // moved from one to another doesn't dial the first one's peers.
     let private_scope = (!public_network).then(|| {
         let fingerprint = crate::transport::private_network_key().map(|k| crate::transport::private_network_fingerprint(&k));
-        crate::routing_cache::private_scope(&network_id, fingerprint.as_deref())
+        // An unkeyed node with no bootstraps and no network name has the network id every such node
+        // has (a hash of no bootstraps); with an allowlist, its allowed peers tell it apart instead.
+        // (A named network's id is `private-name-…`; a hash id is hex, so never starts that way.)
+        let unnamed_without_bootstraps = bootstrap_peers.is_empty() && !network_id.starts_with("private-name-");
+        match crate::fence::allowed_peers() {
+            Some(allowed) if fingerprint.is_none() && unnamed_without_bootstraps => crate::routing_cache::allowlist_scope(allowed),
+            _ => crate::routing_cache::private_scope(&network_id, fingerprint.as_deref()),
+        }
     });
     let routing_cache_path = Some(crate::routing_cache::cache_path_for(&config.identity_path, private_scope.as_deref()));
 

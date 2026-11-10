@@ -9,7 +9,7 @@ import { emit } from "./bus";
 import { displayModelName } from "./models";
 import { trustByPeerModel, repKey } from "./econ";
 import { tierBadge } from "./format";
-import { cardVersionLine, FALLBACK_CHOICES } from "./cardfallback.js";
+import { cardVersionLine, FALLBACK_OPTIONS, selectedFallback } from "./cardfallback.js";
 
 const CARD_TTL_SECS = 30 * 24 * 3600; // 30 days
 
@@ -213,16 +213,19 @@ export async function ensureImportSection() {
 }
 
 // The choice for a public card's model when its provider can't serve, as words.
-const FALLBACK_LABELS = { "ask": "Ask me", "same-version": "Use another provider of the same version", "never": "Don't use another provider" };
 function fallbackSelect(model, current) {
-  const opts = FALLBACK_CHOICES.map((v) => html`<option value="${v}"${v === current ? html` selected` : ""}>${FALLBACK_LABELS[v]}</option>`);
+  const opts = FALLBACK_OPTIONS.map(([v, label]) => html`<option value="${v}"${v === current ? html` selected` : ""}>${label}</option>`);
   return html`<label class="mut" style="font-size:11.5px;display:flex;gap:6px;align-items:center">If its provider is offline or busy: <select class="input cardfb" data-model="${model}" style="font-size:11.5px;padding:2px 4px">${opts}</select></label>`;
 }
 // Saving a choice (preview or imported list): every select with data-model in `root`.
 function wireFallbackSelects(root) {
   $$("select.cardfb", root).forEach((sel) => {
     sel.onchange = async () => {
-      try { await call("set_card_fallback", { model: sel.dataset.model, choice: sel.value }); toast(`${displayModelName(sel.dataset.model)}: ${FALLBACK_LABELS[sel.value].toLowerCase()}`); }
+      // "" clears the saved choice (back to the default).
+      try {
+        await call("set_card_fallback", { model: sel.dataset.model, choice: sel.value || null });
+        toast(`${displayModelName(sel.dataset.model)}: ${(FALLBACK_OPTIONS.find(([v]) => v === sel.value) || ["", "saved"])[1].toLowerCase()}`);
+      }
       catch (e) { toast(`Couldn't save: ${e}`); }
     };
   });
@@ -246,7 +249,7 @@ function cardPreviewHtml(c, prefs) {
     <div style="margin-top:6px">The provider runs the model on its own machine and can read your prompts and the replies.</div>
     ${c.swarm_public_key
       ? html`<div class="mut" style="margin-top:4px">Private to swarm ${peerShort(c.swarm_public_key)}: requests stay inside the swarm (you need to be a member). If its provider is offline, requests fail rather than going anywhere else.</div>`
-      : html`<div style="margin-top:6px">${fallbackSelect(c.model_id, (prefs || {})[c.model_id] || "ask")}</div>${version ? "" : html`<div class="mut" style="margin-top:2px">With no version stated, no other provider can stand in for it.</div>`}`}
+      : html`<div style="margin-top:6px">${fallbackSelect(c.model_id, selectedFallback(c.model_id, prefs))}</div>${version ? "" : html`<div class="mut" style="margin-top:2px">With no version stated, no other provider can stand in for it.</div>`}`}
     </div>`;
 }
 
@@ -265,7 +268,7 @@ async function renderImportedList() {
         <td><b>${displayModelName(c.model_id)}</b> <span class="badge secondary" title="Added by importing a signed card">via card</span></td>
         <td class="mut">${peerShort(c.libp2p_peer_id)}</td>
         <td class="mut">expires ${exp}</td>
-        <td>${c.swarm_public_key ? html`<span class="mut" style="font-size:11px" title="A private card's requests never leave its swarm">stays in swarm</span>` : fallbackSelect(c.model_id, prefs[c.model_id] || "ask")}</td>
+        <td>${c.swarm_public_key ? html`<span class="mut" style="font-size:11px" title="A private card's requests never leave its swarm">stays in swarm</span>` : fallbackSelect(c.model_id, selectedFallback(c.model_id, prefs))}</td>
         <td style="text-align:right"><button class="btn ghost sm cardrm" data-lib="${c.libp2p_peer_id}" data-model="${c.model_id}">Remove</button></td>
         </tr>`;
     });

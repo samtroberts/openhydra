@@ -377,7 +377,7 @@ pub fn approve_member_with_caps(
 
     let req = parse_enrollment_request(request_str)?;
     let verified = verify_enrollment_request(&req).map_err(|e| format!("bad enrollment request: {e}"))?;
-    let member_pk = verified.request.member_public_key.clone();
+    let member_pk = verified.request.member_public_key.to_ascii_lowercase();
     // If the request names a swarm, it must be THIS one (defends against approving into the wrong group).
     if !verified.request.swarm_public_key.is_empty()
         && !verified.request.swarm_public_key.eq_ignore_ascii_case(swarm_public_key)
@@ -387,7 +387,7 @@ pub fn approve_member_with_caps(
             verified.request.swarm_public_key
         ));
     }
-    if record.revoked.contains(&member_pk) {
+    if is_revoked(&record, &member_pk) {
         return Err("this member is revoked; un-revoke before re-approving".to_string());
     }
 
@@ -424,9 +424,26 @@ pub fn revoke_member(dir: &Path, swarm_public_key: &str, member_public_key: &str
     if record.role != SwarmRole::Owner {
         return Err("only the swarm owner can revoke members".to_string());
     }
-    record.revoked.insert(member_public_key.to_string());
-    record.members.retain(|m| m.member_public_key != member_public_key);
-    write_swarm(dir, &record)
+    // A member key is 64 hex characters, stored in lower case: a revocation typed in capitals, or
+    // mistyped, must not report success while changing nothing (review 2, 11 Nov).
+    let key = member_public_key.trim().to_ascii_lowercase();
+    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{member_public_key:?} is not a member public key (64 hex characters)"));
+    }
+    let known = record.members.iter().any(|m| m.member_public_key.eq_ignore_ascii_case(&key));
+    record.revoked.insert(key.clone());
+    record.members.retain(|m| !m.member_public_key.eq_ignore_ascii_case(&key));
+    write_swarm(dir, &record)?;
+    if !known {
+        tracing::warn!(member = %key, "not an approved member of this swarm; revoked anyway, so it can't be approved later");
+    }
+    Ok(())
+}
+
+/// Whether `member_public_key` is on `record`'s revoked list (hex keys, compared without regard to
+/// case: older lists may hold a key as it was typed).
+fn is_revoked(record: &SwarmRecord, member_public_key: &str) -> bool {
+    record.revoked.iter().any(|r| r.eq_ignore_ascii_case(member_public_key))
 }
 
 // ── member operations ──
@@ -529,8 +546,6 @@ pub fn accept_credential(
     Ok(record.to_view())
 }
 
-/// Forget a swarm entirely (owner or member): delete its file. For an owner this destroys the group
-/// key, so no further credentials can be issued.
 /// The peer ids of every member of a swarm this node owns, as of `now_ms`: approved, not revoked,
 /// not expired. These are the peers an owner's credentials let in (`--allow-swarm-peers`). A record
 /// that can't be read, or a member key that isn't one, is skipped.
@@ -547,7 +562,7 @@ pub fn owned_member_peer_ids(dir: &Path, now_ms: u64) -> std::collections::HashS
             continue;
         }
         for m in &rec.members {
-            if now_ms >= m.expires_at || rec.revoked.contains(&m.member_public_key) {
+            if now_ms >= m.expires_at || is_revoked(&rec, &m.member_public_key) {
                 continue;
             }
             if let Ok(p) = openhydra_network::membership::peer_id_of_public_key_hex(&m.member_public_key) {
@@ -558,6 +573,8 @@ pub fn owned_member_peer_ids(dir: &Path, now_ms: u64) -> std::collections::HashS
     peers
 }
 
+/// Forget a swarm entirely (owner or member): delete its file. For an owner this destroys the group
+/// key, so no further credentials can be issued.
 pub fn forget_swarm(dir: &Path, swarm_public_key: &str) -> Result<(), String> {
     let path = swarm_file_path(dir, swarm_public_key)?;
     match std::fs::remove_file(&path) {
@@ -941,6 +958,29 @@ mod tests {
     }
 
     const HOUR: u64 = 3600;
+
+    #[test]
+    fn the_members_an_owner_lets_in_and_a_revocation_in_capitals_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = create_swarm(dir.path(), "Team", 1_000).unwrap();
+        let member = an_identity();
+        let req = build_enrollment_request(&member, &swarm.swarm_public_key, "m", 1_000).unwrap();
+        approve_member(dir.path(), &swarm.swarm_public_key, &req.magnet, "m", HOUR, 1_000).unwrap();
+        let peer = member.libp2p_peer_id.to_string();
+        assert!(owned_member_peer_ids(dir.path(), 2_000).contains(&peer), "an approved member is let in");
+        assert!(owned_member_peer_ids(dir.path(), 1_000 + HOUR * 1000 + 1).is_empty(), "an expired one isn't");
+        // A swarm this node is only a member of lends nobody entry.
+        let other = tempfile::tempdir().unwrap();
+        assert!(owned_member_peer_ids(other.path(), 2_000).is_empty());
+        // Revoked with the key typed in capitals: it counts, and the member is out.
+        revoke_member(dir.path(), &swarm.swarm_public_key, &our_pk(&member).to_ascii_uppercase()).unwrap();
+        assert!(!owned_member_peer_ids(dir.path(), 2_000).contains(&peer));
+        // And it can't come back with a fresh request.
+        let again = build_enrollment_request(&member, &swarm.swarm_public_key, "m", 3_000).unwrap();
+        assert!(approve_member(dir.path(), &swarm.swarm_public_key, &again.magnet, "m", HOUR, 3_000).is_err());
+        // A key that isn't one is refused rather than "revoked".
+        assert!(revoke_member(dir.path(), &swarm.swarm_public_key, "not-a-key").is_err());
+    }
 
     #[test]
     fn create_swarm_persists_owner_record_and_view_hides_secret() {

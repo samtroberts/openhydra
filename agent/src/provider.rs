@@ -3208,9 +3208,8 @@ impl<A: EngineAdapter> Provider<A> {
                 continue;
             }
             // Load rides each serve's final frame (fresh, for the consumers it served) and the
-            // advert (for the ones it hasn't served yet, up to one re-announce old). Ranking bounds
-            // what a self-reported figure can do (`compute_routing_score` clamps it; earned
-            // reputation and the spread's own count of open serves outweigh a claim).
+            // advert (up to one re-announce old), for operators and the app to see. Gateways don't
+            // rank on the advert's figures: they are the provider's own unchecked claims.
             let mut record = build_peer_record(
                 model,
                 names.public(&model.engine_ref),
