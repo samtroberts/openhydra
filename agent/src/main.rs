@@ -152,6 +152,11 @@ struct NodeArgs {
     status_bind: Option<String>,
 }
 
+/// How many times the first announcement is retried when the engine fails the request, and how long
+/// apart (an engine that has just started can fail one or two).
+const FIRST_ANNOUNCE_RETRIES: u32 = 6;
+const FIRST_ANNOUNCE_RETRY_WAIT: Duration = Duration::from_secs(5);
+
 /// `--allow-swarm-peers` was given: the provider or gateway keeps the peers its credentials name
 /// allowed ([`keep_credential_peers`]).
 static ALLOW_SWARM_PEERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2185,9 +2190,22 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         // The policy may have changed while we waited (the watcher starts with the serve loop).
         provider.reload_share_policy();
     }
-    let announced = provider
-        .announce_models()
-        .map_err(|e| format!("announce models from {engine_url}: {e}"))?;
+    // The first announcement asks the engine for its models. An engine that has just started (or
+    // just finished warming up) can fail a request or two, which used to stop the provider at once
+    // (live, 10 Nov: llama.cpp's /props, answered fine seconds later). Retry for ~30 s; a wrong
+    // engine URL still stops it, just a little later.
+    let mut tries = 0;
+    let announced = loop {
+        match provider.announce_models() {
+            Ok(n) => break n,
+            Err(e) if tries < FIRST_ANNOUNCE_RETRIES => {
+                tries += 1;
+                eprintln!("openhydra-agent: announce models from {engine_url}: {e} (retrying, {tries}/{FIRST_ANNOUNCE_RETRIES})");
+                std::thread::sleep(FIRST_ANNOUNCE_RETRY_WAIT);
+            }
+            Err(e) => return Err(format!("announce models from {engine_url}: {e}").into()),
+        }
+    };
     if announced == 0 {
         // Not fatal — the operator may load models later — but the node serves nothing
         // until something is advertised, so make the silence visible. No restart needed:
