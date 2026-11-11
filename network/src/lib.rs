@@ -24,6 +24,7 @@ pub mod mdns;
 /// public keys — the "private key for private sharing" crypto core. Sibling of [`card`].
 pub mod membership;
 pub mod nat;
+pub mod pinned;
 pub mod node;
 /// M5: the signed `REMOTE_SCOPE_SET` remote-rig control command — a control-capable swarm member
 /// flips a model's share scope on an owner's rig from another device. Sibling of [`membership`].

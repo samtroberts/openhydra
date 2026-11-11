@@ -72,6 +72,9 @@ pub struct SwarmOptions {
     pub enable_mdns: bool,
     /// Which network this node is on, told to peers in identify ([`crate::relay::network_id`]).
     pub network_id: String,
+    /// The addresses this node dials its own provider on ([`crate::pinned`]): shared with the event
+    /// loop, and kept out of the routing table.
+    pub pinned: crate::pinned::PinnedPeers,
 }
 
 impl Default for SwarmOptions {
@@ -92,6 +95,7 @@ impl Default for SwarmOptions {
             public_network: false,
             enable_mdns: true,
             network_id: "public".into(),
+            pinned: Default::default(),
         }
     }
 }
@@ -256,9 +260,16 @@ pub fn build_swarm(
     // On the public network, no private address enters the routing table by any path (an mDNS dial
     // to a LAN peer included), so none is handed out in a DHT answer. The filter lives in the
     // vendored libp2p-kad, the one place every address passes (review 2026-10-29).
-    if opts.public_network {
-        kad_config.set_address_filter(kad::AddressFilter::new(|_peer, addr| routable_on_public_network(addr)));
-    }
+    // On every network, a pinned peer's loopback address stays out too ([`crate::pinned::kad_allows`]),
+    // except for a configured bootstrap: the user gave that address (a one-machine network whose
+    // gateway bootstraps from its own provider), and without it the DHT would have nobody to ask.
+    let public_network = opts.public_network;
+    let pinned = opts.pinned.clone();
+    let bootstraps: std::collections::HashSet<PeerId> = opts.bootstrap_peers.iter().map(|(p, _)| *p).collect();
+    kad_config.set_address_filter(kad::AddressFilter::new(move |peer, addr| {
+        (!public_network || routable_on_public_network(addr))
+            && (bootstraps.contains(peer) || crate::pinned::kad_allows(&pinned, peer, addr))
+    }));
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);

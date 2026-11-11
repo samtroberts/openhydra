@@ -941,6 +941,19 @@ fn weight_file_alias(requested: &str, known: &[String]) -> Option<String> {
 
 /// How long our own provider's list of what it shares is used before asking again.
 const OWN_MODELS_TTL_MS: u64 = 15_000;
+/// The time a failed ask of our own provider is filed under, so that it stands for
+/// [`OWN_MODELS_RETRY_MS`] from when the ask ENDED (`now` is when it began): an ask that ran its
+/// whole 3 s timeout would otherwise be filed already expired, and asked again at once.
+fn failed_own_models_ask_at(now: u64, took: std::time::Duration) -> u64 {
+    now.saturating_add(took.as_millis() as u64).saturating_sub(OWN_MODELS_TTL_MS - OWN_MODELS_RETRY_MS)
+}
+
+/// How long a failed ask of our own provider stands (it counts as sharing nothing meanwhile):
+/// short, so the machine's models are back within a couple of seconds of the provider starting
+/// (sharing turned on, the app's provider restarted), not up to [`OWN_MODELS_TTL_MS`] later. The
+/// ask is cheap when it fails: one at a time, a refused loopback dial when the gateway knows where
+/// its provider listens (`--self-provider-addr`), else at once under the relayed-dial back-off.
+const OWN_MODELS_RETRY_MS: u64 = 2_000;
 
 /// How long a conversation stays with the provider that served it last. Engines evict an idle
 /// prompt cache; after this the conversation is placed like any other request.
@@ -3589,9 +3602,18 @@ impl ConsumerNode {
         models
     }
 
+    /// Whether `only` restricts a request to this machine's own provider, and that provider is dialled
+    /// on its pinned loopback address (`serve --self-provider-addr`).
+    fn own_provider_only(&self, only: Option<&std::collections::HashSet<String>>) -> bool {
+        match (only, self.self_provider.as_deref()) {
+            (Some(o), Some(me)) => o.len() == 1 && o.contains(me) && self.net.is_pinned(me),
+            _ => false,
+        }
+    }
+
     /// What our own provider shares (phase 0.3), asked of it at most every [`OWN_MODELS_TTL_MS`];
     /// `None` without a `--self-provider`. A provider that can't be reached counts as sharing
-    /// nothing until the next ask.
+    /// nothing until the next ask, [`OWN_MODELS_RETRY_MS`] later.
     fn own_models(&self, now: u64) -> Option<crate::provider::OwnModels> {
         if !self.own_models_allowed {
             return None;
@@ -3619,13 +3641,15 @@ impl ConsumerNode {
             }
         }
         let _clear = stale.is_some().then(|| Clear(&self.own_models_asking));
-        let fresh = self
+        let asked = std::time::Instant::now();
+        let answer = self
             .net
             .proxy_forward_timeout(own, vec![crate::provider::OWN_MODELS_REQUEST], std::time::Duration::from_secs(3))
             .ok()
-            .and_then(|r| serde_json::from_slice::<crate::provider::OwnModels>(&r).ok())
-            .unwrap_or_default();
-        *self.own_models.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, fresh.clone()));
+            .and_then(|r| serde_json::from_slice::<crate::provider::OwnModels>(&r).ok());
+        let at = if answer.is_some() { now } else { failed_own_models_ask_at(now, asked.elapsed()) };
+        let fresh = answer.unwrap_or_default();
+        *self.own_models.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, fresh.clone()));
         Some(fresh)
     }
 
@@ -3679,6 +3703,12 @@ impl ConsumerNode {
         let pin = self.cards.as_ref().map(|c| c.pin_for(model, now_unix_ms())).unwrap_or(crate::cards::CardPin::None);
         let (card_peers, private) = match &pin {
             crate::cards::CardPin::None => {
+                // Restricted to this machine's own provider (`openhydra/auto` chose one of its models)
+                // and dialled on loopback: a failed dial means it isn't running, so one pass. The
+                // retries for a provider that just joined would only delay the answer by ~28 s.
+                if self.own_provider_only(only) {
+                    return self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
+                }
                 return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
             }
             // Inside a keyed private network every node holds the organisation's network key, so
@@ -7976,6 +8006,40 @@ mod tests {
         assert_eq!(node.own_models(2_000).map(|m| m.models), Some(vec!["device-only".to_string()]));
         node = node.with_own_models(false);
         assert!(node.own_models(2_000).is_none(), "off on a gateway other machines reach");
+    }
+
+    #[test]
+    fn an_unreachable_own_provider_is_asked_again_within_seconds_not_the_full_ttl() {
+        let (dir, node) = test_node();
+        // A provider nobody can reach (no address, no relay): every ask fails at once.
+        let other = openhydra_network::identity::Identity::load_or_create(&dir.path().join("own.key")).unwrap();
+        let node = node.with_self_provider(Some(other.libp2p_peer_id.to_base58()));
+        let at = |n: &ConsumerNode| n.own_models.lock().unwrap().as_ref().map(|(t, _)| *t);
+        let t0 = 1_000_000;
+        assert_eq!(node.own_models(t0).map(|m| m.models), Some(vec![]), "unreachable: shares nothing");
+        let first = at(&node).unwrap();
+        assert_eq!(t0 - first, OWN_MODELS_TTL_MS - OWN_MODELS_RETRY_MS, "a failed ask stands OWN_MODELS_RETRY_MS");
+        node.own_models(t0 + OWN_MODELS_RETRY_MS - 1);
+        assert_eq!(at(&node), Some(first), "not asked again yet");
+        node.own_models(t0 + OWN_MODELS_RETRY_MS);
+        assert!(at(&node).unwrap() > first, "asked again {OWN_MODELS_RETRY_MS} ms later, not {OWN_MODELS_TTL_MS}");
+        // An ask that ran its whole 3 s timeout stands OWN_MODELS_RETRY_MS from when it ended.
+        let filed = failed_own_models_ask_at(t0, std::time::Duration::from_secs(3));
+        assert_eq!(filed + OWN_MODELS_TTL_MS, t0 + 3_000 + OWN_MODELS_RETRY_MS);
+    }
+
+    #[test]
+    fn a_request_held_to_the_pinned_own_provider_gets_one_pass() {
+        let (dir, node) = test_node();
+        let me = openhydra_network::identity::Identity::load_or_create(&dir.path().join("me.key")).unwrap().libp2p_peer_id.to_base58();
+        let node = node.with_self_provider(Some(me.clone()));
+        let only: std::collections::HashSet<String> = [me.clone()].into();
+        assert!(!node.own_provider_only(Some(&only)), "not pinned: it may just not be reachable yet");
+        node.net.pin_peer_addrs(&me, &["/ip4/127.0.0.1/tcp/9".to_string()]).unwrap();
+        assert!(node.own_provider_only(Some(&only)));
+        let wider: std::collections::HashSet<String> = [me, "12D3KooWOther".to_string()].into();
+        assert!(!node.own_provider_only(Some(&wider)), "other providers too: the usual retries");
+        assert!(!node.own_provider_only(None));
     }
 
     fn test_node() -> (tempfile::TempDir, ConsumerNode) {

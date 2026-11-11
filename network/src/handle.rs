@@ -57,6 +57,8 @@ pub struct NetworkHandle {
     net_generation: Arc<std::sync::atomic::AtomicU64>,
     /// The latest ping round trip to each peer, recorded by the event loop.
     peer_rtts: Arc<crate::rtt::PeerRtts>,
+    /// Peers dialled on pinned addresses ([`crate::pinned`]).
+    pinned: crate::pinned::PinnedPeers,
 }
 
 impl NetworkHandle {
@@ -75,7 +77,7 @@ impl NetworkHandle {
             hex::encode(pk.to_bytes())
         };
         let keypair = identity.keypair.clone();
-        let (cmd_tx, proxy_queue, thread, net_generation, peer_rtts) = start_node(&config)?;
+        let (cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned) = start_node(&config)?;
         Ok(Self {
             cmd_tx,
             proxy_queue,
@@ -86,6 +88,7 @@ impl NetworkHandle {
             keypair,
             net_generation,
             peer_rtts,
+            pinned,
         })
     }
 
@@ -238,6 +241,29 @@ impl NetworkHandle {
     /// `openhydra/auto` choice (which models its own provider serves, how many providers serve each).
     pub fn known_providers(&self) -> Result<Vec<crate::types::KnownProvider>, String> {
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::KnownProviders { reply })
+    }
+
+    /// Dial `peer` on `addrs` (and only there: no relay circuit) whenever it isn't connected, without back-off
+    /// ([`crate::pinned`]): the gateway's own provider on this machine. Each address must pass
+    /// [`crate::pinned::self_provider_addr`] (loopback, TCP or QUIC); none is ever handed out. An empty
+    /// list unpins the peer.
+    pub fn pin_peer_addrs(&self, peer: &str, addrs: &[String]) -> Result<(), String> {
+        let peer_id: libp2p::PeerId = peer.parse().map_err(|e| format!("invalid peer id {peer}: {e}"))?;
+        let addrs = addrs
+            .iter()
+            .map(|a| {
+                let ma: libp2p::Multiaddr = a.parse().map_err(|e| format!("{a}: not a multiaddr ({e})"))?;
+                crate::pinned::self_provider_addr(&ma, &peer_id)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::PinPeerAddrs { peer_id, addrs, reply })?
+    }
+
+    /// Whether `peer` is pinned ([`pin_peer_addrs`](Self::pin_peer_addrs)): dialled on loopback, so a
+    /// failed dial means it isn't running, not that it isn't reachable yet.
+    pub fn is_pinned(&self, peer: &str) -> bool {
+        peer.parse::<libp2p::PeerId>()
+            .is_ok_and(|p| self.pinned.read().unwrap_or_else(|e| e.into_inner()).contains_key(&p))
     }
 
     /// Forward `data` to `peer_id` and block for the one-shot response (the consumer's

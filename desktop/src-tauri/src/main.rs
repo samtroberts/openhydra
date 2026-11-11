@@ -939,6 +939,14 @@ fn tokenizer_downloads_on(settings: &Settings) -> bool {
     }
 }
 
+/// `--self-provider-addr` for the app's provider on `port`, on loopback: the provider listens on
+/// every interface, and loopback needs no LAN discovery (nor, on macOS, the Local Network
+/// permission). TCP only: the provider always listens on it, and a stopped provider refuses a TCP
+/// dial at once (a QUIC dial would wait out its handshake timeout).
+fn self_provider_addr_args(port: u16) -> Vec<String> {
+    vec!["--self-provider-addr".into(), format!("/ip4/127.0.0.1/tcp/{port}")]
+}
+
 /// The gateway's W4 flags: no tokenizer downloads from Hugging Face unless they are on (off by
 /// default in a private deployment), and in a private deployment no fetch of the signed tokenizer
 /// list from dl.openhydra.co either: the gateway uses the list built into this release (review
@@ -2188,6 +2196,20 @@ fn gateway_error(status: u16, body: &str) -> String {
 #[tauri::command]
 fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let sub = gateway_subcommand(&settings, provider_peer_id());
+    spawn_role(
+        &state.gateway,
+        "desktop-consumer.key",
+        GATEWAY_PORT,
+        GATEWAY_STATUS_PORT,
+        &settings,
+        &sub,
+    )
+}
+
+/// The gateway's `serve` subcommand and flags, for the app's provider `provider_id` (its peer id,
+/// when its key exists).
+fn gateway_subcommand(settings: &Settings, provider_id: Option<String>) -> Vec<String> {
     let mut sub = vec![
         "serve".to_string(),
         "--bind".into(),
@@ -2195,9 +2217,14 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     ];
     // #7: mark our own provider so the gateway never settles credit against itself on a
     // self-serve. Computed from the provider identity key (stable across runs).
-    if let Some(id) = provider_peer_id() {
+    if let Some(id) = provider_id {
         sub.push("--self-provider".into());
         sub.push(id);
+        // And where it listens, so the gateway dials it directly on loopback: without this it has
+        // to find its own provider like any other peer, and with LAN discovery off (or no network)
+        // it couldn't, so the user's own models failed. Works whether sharing starts before or
+        // after the gateway.
+        sub.extend(self_provider_addr_args(PROVIDER_PORT));
     }
     // Persist earned reputation + give-side credit across restarts (separate redb from the
     // provider role — redb allows a single writer process per file).
@@ -2219,14 +2246,7 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     if let Some(tier) = gateway_floor(&settings.min_authenticity) {
         sub.extend(["--min-authenticity".into(), tier.into(), "--assurance".into(), "gate".into()]);
     }
-    spawn_role(
-        &state.gateway,
-        "desktop-consumer.key",
-        GATEWAY_PORT,
-        GATEWAY_STATUS_PORT,
-        &settings,
-        &sub,
-    )
+    sub
 }
 
 #[tauri::command]
@@ -3748,6 +3768,22 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gateway_is_told_where_the_apps_provider_listens() {
+        assert_eq!(
+            super::self_provider_addr_args(super::PROVIDER_PORT),
+            ["--self-provider-addr", "/ip4/127.0.0.1/tcp/4111"]
+        );
+        // And the gateway's real command line carries it, right after its peer id.
+        let settings = super::Settings::default();
+        let sub = super::gateway_subcommand(&settings, Some("12D3KooWOwn".into()));
+        let at = sub.iter().position(|a| a == "--self-provider").expect("--self-provider");
+        assert_eq!(sub[at + 1..at + 4], ["12D3KooWOwn", "--self-provider-addr", "/ip4/127.0.0.1/tcp/4111"]);
+        // No provider key yet: neither flag (the gateway would refuse an address without the id).
+        let sub = super::gateway_subcommand(&settings, None);
+        assert!(!sub.iter().any(|a| a.starts_with("--self-provider")), "{sub:?}");
+    }
+
     use super::*;
 
     /// Every screen was checked at 900×600 (2026-10-19; below 900 wide Share and Engines overflow),

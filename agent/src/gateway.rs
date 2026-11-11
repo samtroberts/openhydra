@@ -1138,6 +1138,7 @@ fn spawn_worker(
     only: Option<std::collections::HashSet<String>>,
     fallback: Option<crate::cards::CardFallback>,
     gen_permit: OwnedSemaphorePermit,
+    own_machine: bool,
 ) -> (
     EventRx,
     std::time::Instant,
@@ -1169,11 +1170,39 @@ fn spawn_worker(
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
+                let e = if own_machine { own_machine_failure(&model, e) } else { e };
                 let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e), error_details(&e)));
             }
         }
     });
     (rx, started)
+}
+
+/// What an `openhydra/auto` request that went to this machine's own provider says when that
+/// provider couldn't be reached: `auto` keeps such a request on this machine (it may hold code
+/// the user wouldn't send elsewhere), so the answer is how to get it served, not a raw dial error.
+/// Any other error (the provider's own, its engine's, a timeout, a stalled stream) is passed on as is.
+fn own_machine_failure(model: &str, e: crate::adapter::AdapterError) -> crate::adapter::AdapterError {
+    use crate::adapter::AdapterError;
+    // Only a dial that failed outright: a stream that stalled, was refused or lost its result did
+    // reach the provider, and "check that this machine is sharing" would be wrong advice for it.
+    let unreachable = match &e {
+        AdapterError::Network(m) => {
+            m.contains(openhydra_network::event_loop::DIAL_FAILED_UNREACHABLE)
+                || m.contains(openhydra_network::event_loop::DIAL_FAILED_RELAY_LIMIT)
+        }
+        AdapterError::Route(_) => true,
+        _ => false,
+    };
+    if !unreachable {
+        return e;
+    }
+    AdapterError::Route(format!(
+        "openhydra/auto picked {model} because this machine serves it, but this machine's own provider \
+         couldn't be reached ({}). Check that this machine is sharing {model} (in the app: Share; on \
+         the command line: openhydra-agent provide), or name a model to send the request to the network.",
+        e.message()
+    ))
 }
 
 async fn chat_completions(
@@ -1350,7 +1379,8 @@ async fn spawn_dispatch(
             gen_permit,
         )
     } else {
-        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, gen_permit)
+        let own_machine = matches!(route, Route::Auto(AutoStep::OwnMachine, _));
+        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, gen_permit, own_machine)
     };
     Ok((model, route, rx, started))
 }
@@ -3478,6 +3508,32 @@ mod tests {
         assert!(validate(&r).is_some());
         let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None, openhydra: None };
         assert!(validate(&r).is_none());
+    }
+
+    #[test]
+    fn an_unreachable_own_provider_says_how_to_get_served() {
+        use crate::adapter::AdapterError;
+        let e = own_machine_failure("qwen2.5:0.5b", AdapterError::Network("proxy_forward: dial failed (peer unreachable)".into()));
+        let msg = e.to_string();
+        assert!(msg.starts_with("openhydra/auto picked qwen2.5:0.5b because this machine serves it"), "{msg}");
+        assert!(msg.contains("(proxy_forward: dial failed (peer unreachable))") && msg.contains("Share"), "{msg}");
+        assert_eq!(error_class(&e), (StatusCode::BAD_GATEWAY, "upstream_error"));
+        // Not found at all (no provider record left): the same advice, still "no provider".
+        let e = own_machine_failure("m", AdapterError::Route("no provider for model 'm'".into()));
+        assert_eq!(error_class(&e).1, "no_provider");
+        // A timeout, a stalled or refused stream, an engine error and a busy provider are passed on
+        // unchanged: the provider was reached.
+        for e in [
+            AdapterError::Network("proxy_forward timed out after 45s".into()),
+            AdapterError::Network("stream stalled (no progress before deadline)".into()),
+            AdapterError::Network("stream open forbidden".into()),
+            AdapterError::Network("proxy_forward: relay queue full".into()),
+            AdapterError::Provider("engine http error: ollama: model crashed".into()),
+            AdapterError::Overloaded("serve pool full".into()),
+        ] {
+            let before = e.to_string();
+            assert_eq!(own_machine_failure("m", e).to_string(), before);
+        }
     }
 
     #[test]

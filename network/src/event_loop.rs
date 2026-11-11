@@ -539,6 +539,14 @@ pub enum SwarmCommand {
         multiaddr: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Dial `peer_id` on these addresses (and only these: no relay circuit) whenever it isn't
+    /// connected, and never back off from it ([`crate::pinned`]). Replaces any earlier pin of the peer; an empty
+    /// list unpins it. The addresses must already be checked ([`crate::pinned::self_provider_addr`]).
+    PinPeerAddrs {
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Drain the oldest queued inbound gossip message, if any (PR-3 / B1).
     /// Returns ``None`` when the queue is empty. The returned tuple is
     /// ``(sender_libp2p_peer_id, payload_bytes)`` — callers that need the
@@ -767,6 +775,9 @@ struct LoopState {
     dials_in_flight: DialsInFlight,
     /// Relayed-dial back-off per peer (see [`next_relay_dial_backoff`]).
     relay_dial_backoff: HashMap<PeerId, RelayDialBackoff>,
+    /// Peers dialled directly on addresses this node was told ([`crate::pinned`]): the gateway's own
+    /// provider on loopback. Never in Kademlia, the address book or any answer.
+    pinned: crate::pinned::PinnedPeers,
     /// When each bootstrap was last re-dialled from a new port after an address-in-use refusal.
     in_use_redials: HashMap<PeerId, std::time::Instant>,
     /// C-N1: peers with both a direct and a relay connection, mapped to the
@@ -1284,6 +1295,7 @@ impl LoopState {
             pending_relay_forwards: Vec::new(),
             dials_in_flight: HashMap::new(),
             relay_dial_backoff: HashMap::new(),
+            pinned: Default::default(),
             in_use_redials: HashMap::new(),
             relay_close_deadline: HashMap::new(),
             v4_close_deadline: HashMap::new(),
@@ -1373,8 +1385,11 @@ pub async fn run_event_loop(
     peer_rtts: Arc<crate::rtt::PeerRtts>,
     // #43-W2: opt-in PCP v6 firewall-pinhole wiring (None = disabled).
     pcp_bind: Option<crate::pcp::PcpBind>,
+    // The own provider's loopback addresses (`crate::pinned`), shared with the Kademlia filter.
+    pinned: crate::pinned::PinnedPeers,
 ) {
     let mut state = LoopState::new();
+    state.pinned = pinned;
     state.local_libp2p = swarm.local_peer_id().to_base58();
     state.enable_connection_reversal = enable_connection_reversal;
     state.peer_relay_leech = peer_relay_leech; // WS-F F-4
@@ -1898,6 +1913,9 @@ pub async fn run_event_loop(
                             Err(e) => Err(format!("invalid peer_id: {e}")),
                         };
                         let _ = reply.send(res);
+                    }
+                    Some(SwarmCommand::PinPeerAddrs { peer_id, addrs, reply }) => {
+                        let _ = reply.send(pin_peer_addrs(&mut swarm, &mut state, peer_id, addrs));
                     }
                     Some(SwarmCommand::AddAddress { peer_id, multiaddr, reply }) => {
                         // Feed the ``(peer_id, multiaddr)`` pair into Kademlia's
@@ -4671,7 +4689,12 @@ fn handle_swarm_event(
                 state.lan_dialer.failed(&connection_id, std::time::Instant::now());
                 return;
             }
-            warn!(?peer_id, %error, "outgoing_connection_error");
+            if peer_id.is_some_and(|p| !pinned_addrs(state, &p).is_empty()) {
+                // The own provider isn't running (sharing off): routine, and asked every few seconds.
+                debug!(?peer_id, %error, "outgoing_connection_error (pinned peer)");
+            } else {
+                warn!(?peer_id, %error, "outgoing_connection_error");
+            }
             // A bootstrap dial refused because our port's previous connection to it is still in
             // TIME_WAIT (just restarted): dial those addresses again at once from a new port, at most
             // once per bootstrap per IN_USE_REDIAL_EVERY.
@@ -4704,7 +4727,10 @@ fn handle_swarm_event(
                 if dial_ended_unreachable(&mut state.dials_in_flight, pid, connection_id, connected) {
                     let relay_limit = crate::transport::dial_refused_by_relay_limits(&error);
                     let why = if relay_limit { DIAL_FAILED_RELAY_LIMIT } else { DIAL_FAILED_UNREACHABLE };
-                    if state.relay_dial_backoff.len() < MAX_RELAY_DIAL_BACKOFFS || state.relay_dial_backoff.contains_key(&pid) {
+                    // Never for a pinned peer: a loopback dial is cheap, and the own provider that was
+                    // down a moment ago must be reachable the moment it's up.
+                    let pinned = !pinned_addrs(state, &pid).is_empty();
+                    if !pinned && (state.relay_dial_backoff.len() < MAX_RELAY_DIAL_BACKOFFS || state.relay_dial_backoff.contains_key(&pid)) {
                         let step = next_relay_dial_backoff(state.relay_dial_backoff.get(&pid).map(|b| b.step), relay_limit);
                         state.relay_dial_backoff.insert(pid, RelayDialBackoff {
                             until: std::time::Instant::now() + step,
@@ -5085,7 +5111,12 @@ fn handle_kad_event(
         // Phase 1.2: UnroutablePeer is the strongest signal that a peer
         // should be evicted — Kademlia itself declares it unreachable.
         kad::Event::UnroutablePeer { peer } => {
-            warn!(%peer, "kademlia reports peer unroutable — dropping route, keeping cache");
+            if pinned_addrs(state, &peer).is_empty() {
+                warn!(%peer, "kademlia reports peer unroutable — dropping route, keeping cache");
+            } else {
+                // Expected: its only address here is the loopback one Kademlia is not allowed to keep.
+                debug!(%peer, "kademlia reports pinned peer unroutable (its loopback address is kept out)");
+            }
             // Routing-only: keep `known_peers` (TTL reaper owns lifecycle). Wiping here collapsed
             // multi-model providers whenever Kademlia transiently declared a relayed peer unroutable.
             evict_unreachable_peer(swarm, peer, &[]);
@@ -6053,8 +6084,14 @@ fn handle_grpc_proxy_event(
                 warn!(%peer, threshold = ZOMBIE_FAILURE_THRESHOLD,
                     "zombie_evict: consecutive proxy path failures — closing presumed-dead connections and redialing via relay");
                 let _ = swarm.disconnect_peer_id(peer);
-                let circuit_addrs = relay_circuit_addrs(&state.relays, peer, state.ipv6_capable);
-                if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer, circuit_addrs)) {
+                // The own provider is redialled on its loopback address, never through a relay.
+                let pinned = pinned_addrs(state, &peer);
+                let opts = if pinned.is_empty() {
+                    relay_dial_opts(peer, relay_circuit_addrs(&state.relays, peer, state.ipv6_capable))
+                } else {
+                    pinned_dial_opts(peer, pinned, libp2p::swarm::dial_opts::PeerCondition::Always)
+                };
+                if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, opts) {
                     debug!(%peer, %e, "zombie_evict: relay redial enqueue failed");
                 }
             }
@@ -6144,9 +6181,12 @@ fn handle_proxy_forward(
         // what a hole punch through two stateful firewalls needs (its rounds were one-sided).
         if direct_conns == 0 {
             pursue_v6_holepunch_debounced(swarm, state, peer_id, "request");
+            // The own provider reached only through a relay (a dial elsewhere found its relay
+            // address): this request rides it, the next one the loopback connection this opens.
+            dial_pinned_if_only_relayed(swarm, state, peer_id);
         }
     } else {
-        info!(%peer_id, "proxy_forward: peer not connected, dialing via relay");
+        info!(%peer_id, "proxy_forward: peer not connected, dialing it");
         // Finding A: dial the peer ONCE via every bootstrap-relay circuit as a
         // multi-address DialOpts, instead of looping and breaking on the first
         // swarm.dial()==Ok. swarm.dial() returns Ok the instant the dial is
@@ -6163,7 +6203,12 @@ fn handle_proxy_forward(
             let _ = reply.send(Err("proxy_forward: relay queue full".into()));
             return;
         }
-        if let Some(b) = state.relay_dial_backoff.get(&peer_id).filter(|b| b.until > std::time::Instant::now()) {
+        let pinned = pinned_addrs(state, &peer_id);
+        if let Some(b) = state
+            .relay_dial_backoff
+            .get(&peer_id)
+            .filter(|b| pinned.is_empty() && b.until > std::time::Instant::now())
+        {
             // A dial to it just failed: answer as that dial did, without spending relay budget.
             if state.dials_in_flight.get(&peer_id).map_or(true, |d| d.is_empty()) {
                 debug!(%peer_id, "proxy_forward: peer in relayed-dial back-off — failing at once");
@@ -6171,8 +6216,15 @@ fn handle_proxy_forward(
                 return;
             }
         }
-        let circuit_addrs = relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable);
-        match swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer_id, circuit_addrs)) {
+        // The own provider is dialled on its loopback addresses alone: a relay circuit can't reach it
+        // when they can't (it's on this machine), and waiting for circuits to time out made every
+        // request fail 5 s late while it was down.
+        let opts = if pinned.is_empty() {
+            relay_dial_opts(peer_id, relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable))
+        } else {
+            pinned_dial_opts(peer_id, pinned, libp2p::swarm::dial_opts::PeerCondition::Disconnected)
+        };
+        match swarm.dial_tracked(&mut state.dials_in_flight, opts) {
             Ok(()) => {
                 state
                     .pending_relay_forwards
@@ -6226,6 +6278,104 @@ fn relay_circuit_addrs(relays: &[Multiaddr], peer_id: PeerId, ipv6_capable: bool
                 .with(libp2p::multiaddr::Protocol::P2p(peer_id))
         })
         .collect()
+}
+
+/// The addresses `peer` is pinned to that this node can dial now ([`crate::pinned::dialable`]).
+fn pinned_addrs(state: &LoopState, peer: &PeerId) -> Vec<Multiaddr> {
+    let quic = crate::transport::quic_enabled();
+    let m = state.pinned.read().unwrap_or_else(|e| e.into_inner());
+    m.get(peer).map(|a| crate::pinned::dialable(a, quic)).unwrap_or_default()
+}
+
+/// A dial to a pinned peer on exactly `addrs`: no relay circuit, and none of the addresses the
+/// behaviours know for it.
+fn pinned_dial_opts(
+    peer: PeerId,
+    addrs: Vec<Multiaddr>,
+    condition: libp2p::swarm::dial_opts::PeerCondition,
+) -> libp2p::swarm::dial_opts::DialOpts {
+    libp2p::swarm::dial_opts::DialOpts::peer_id(peer).condition(condition).addresses(addrs).build()
+}
+
+/// Pin `peer` to `addrs` ([`SwarmCommand::PinPeerAddrs`]) and dial them at once if it isn't connected
+/// directly, so the own provider is connected before the first request needs it. Refused when none
+/// of the addresses can be dialled here (a QUIC-only pin with QUIC off): the peer would silently go
+/// back to relay dials.
+fn pin_peer_addrs(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    peer: PeerId,
+    addrs: Vec<Multiaddr>,
+) -> Result<(), String> {
+    if peer == *swarm.local_peer_id() {
+        return Err("can't pin this node's own peer id".into());
+    }
+    if addrs.is_empty() {
+        state.pinned.write().unwrap_or_else(|e| e.into_inner()).remove(&peer);
+        info!(%peer, "pinned addresses cleared");
+        return Ok(());
+    }
+    // Checked again here (the handle checks them too): only loopback ever gets pinned.
+    let addrs = addrs
+        .iter()
+        .map(|a| crate::pinned::self_provider_addr(a, &peer))
+        .collect::<Result<Vec<_>, String>>()?;
+    let dial = crate::pinned::dialable(&addrs, crate::transport::quic_enabled());
+    if dial.is_empty() {
+        return Err("none of these addresses can be dialled on this network (QUIC is off here: give a TCP address)".into());
+    }
+    state.pinned.write().unwrap_or_else(|e| e.into_inner()).insert(peer, addrs);
+    state.relay_dial_backoff.remove(&peer);
+    purge_refused_kad_addrs(swarm, state, peer);
+    info!(%peer, addrs = ?dial, "pinned addresses set");
+    if !swarm.is_connected(&peer) {
+        let opts = pinned_dial_opts(peer, dial, libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing);
+        if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, opts) {
+            // Not an error for the caller: the next request dials again.
+            debug!(%peer, error = %e, "pinned dial not started");
+        }
+    } else {
+        dial_pinned_if_only_relayed(swarm, state, peer);
+    }
+    Ok(())
+}
+
+/// Every address Kademlia holds for `peer` that its filter now refuses ([`crate::pinned::kad_allows`])
+/// goes: one restored from the routing cache or added before the pin (any loopback port or family,
+/// not just the pinned ones). A configured bootstrap is exempt, as in the filter.
+fn purge_refused_kad_addrs(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &LoopState, peer: PeerId) {
+    if state.bootstrap_peers.iter().any(|(b, _)| *b == peer) {
+        return;
+    }
+    let mut refused = Vec::new();
+    for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+        for entry in bucket.iter() {
+            if *entry.node.key.preimage() == peer {
+                refused.extend(entry.node.value.iter().filter(|a| !crate::pinned::kad_allows(&state.pinned, &peer, a)).cloned());
+            }
+        }
+    }
+    for a in &refused {
+        swarm.behaviour_mut().kademlia.remove_address(&peer, a);
+    }
+    if !refused.is_empty() {
+        info!(%peer, n = refused.len(), "removed the pinned peer's loopback addresses from the routing table");
+    }
+}
+
+/// When `peer` is pinned and connected only through relays, dial its pinned addresses (unless a dial
+/// to it is already under way), so its traffic moves to the direct loopback connection.
+fn dial_pinned_if_only_relayed(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &mut LoopState, peer: PeerId) {
+    let pinned = pinned_addrs(state, &peer);
+    let direct = state.peer_connections.get(&peer).map_or(0, |i| i.direct_count());
+    if pinned.is_empty() || direct > 0 || state.dials_in_flight.get(&peer).is_some_and(|d| !d.is_empty()) {
+        return;
+    }
+    info!(%peer, "pinned peer connected only through a relay: dialling its pinned address");
+    let opts = pinned_dial_opts(peer, pinned, libp2p::swarm::dial_opts::PeerCondition::NotDialing);
+    if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, opts) {
+        debug!(%peer, error = %e, "pinned dial not started");
+    }
 }
 
 /// Finding A helper: a single multi-address dial to `peer_id` over the given
@@ -6311,7 +6461,7 @@ fn handle_proxy_forward_no_wait(
             .grpc_proxy
             .send_request(&peer_id, ProxyRequest(data));
     } else {
-        info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing via relay");
+        info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing it");
         // Finding A: one multi-address dial across all relay circuits (see
         // handle_proxy_forward) instead of break-on-first-queued (always US).
         // C-N2: same cap guard as the blocking path (fire-and-forget, so just
@@ -6321,13 +6471,20 @@ fn handle_proxy_forward_no_wait(
                   "proxy_forward_no_wait: pending_relay_forwards at cap — dropping");
             return;
         }
-        if state.relay_dial_backoff.get(&peer_id).is_some_and(|b| b.until > std::time::Instant::now())
+        let pinned = pinned_addrs(state, &peer_id);
+        if pinned.is_empty()
+            && state.relay_dial_backoff.get(&peer_id).is_some_and(|b| b.until > std::time::Instant::now())
             && state.dials_in_flight.get(&peer_id).map_or(true, |d| d.is_empty())
         {
             debug!(%peer_id, "proxy_forward_no_wait: peer in relayed-dial back-off — dropped");
             return;
         }
-        match swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer_id, relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable))) {
+        let opts = if pinned.is_empty() {
+            relay_dial_opts(peer_id, relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable))
+        } else {
+            pinned_dial_opts(peer_id, pinned, libp2p::swarm::dial_opts::PeerCondition::Disconnected)
+        };
+        match swarm.dial_tracked(&mut state.dials_in_flight, opts) {
             Ok(()) => {
                 let (dummy_tx, _dummy_rx) = oneshot::channel();
                 state
@@ -7213,6 +7370,19 @@ mod tests {
         assert_eq!(next_relay_dial_backoff(Some(s(16)), false), s(16), "capped");
         assert_eq!(next_relay_dial_backoff(None, true), s(20), "the relays said no: let their budget refill");
         assert_eq!(next_relay_dial_backoff(Some(s(16)), true), s(20));
+    }
+
+    #[test]
+    fn a_pinned_peer_is_dialled_on_its_pinned_addresses_alone() {
+        // Exactly its pinned addresses: no relay circuit, nothing the behaviours add.
+        let p = PeerId::random();
+        let lo: Multiaddr = "/ip4/127.0.0.1/tcp/4111".parse().unwrap();
+        let opts = pinned_dial_opts(p, vec![lo.clone()], libp2p::swarm::dial_opts::PeerCondition::Disconnected);
+        assert_eq!(opts.get_peer_id(), Some(p));
+        // (DialOpts keeps its address list and the extend flag private: read them off its Debug.)
+        let dbg = format!("{opts:?}");
+        assert!(dbg.contains(&format!("addresses: [{lo}]")), "{dbg}");
+        assert!(dbg.contains("extend_addresses_through_behaviour: false"), "{dbg}");
     }
 
     #[test]

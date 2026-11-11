@@ -1059,6 +1059,15 @@ struct ServeArgs {
     #[arg(long = "self-provider")]
     self_provider: Option<String>,
 
+    /// Where the `--self-provider` listens on this machine, e.g. `/ip4/127.0.0.1/tcp/4111` (repeat
+    /// for QUIC: `/ip4/127.0.0.1/udp/4111/quic-v1`). The gateway then dials it there directly,
+    /// with no LAN discovery, DHT entry or relay needed: without it, the own provider is found like
+    /// any other peer, and with LAN discovery off or no network it may not be found at all. Loopback
+    /// only (127.0.0.0/8 or ::1, TCP or QUIC); the address is never passed on to other peers. The
+    /// desktop app sets it; set it yourself when you run `provide` and `serve` on one machine.
+    #[arg(long = "self-provider-addr", value_name = "MULTIADDR", requires = "self_provider")]
+    self_provider_addr: Vec<String>,
+
     /// M2: path to the imported-cards store — verified `.openhydra` cards routed by peer id without
     /// live discovery. Hot-reloaded on change. Omit to disable card routing.
     #[arg(long = "cards-file")]
@@ -2358,6 +2367,14 @@ fn serve(
             peers.extend(own.clone());
             peers
         });
+    }
+    // The own provider's address on this machine: checked (loopback only) and pinned before the
+    // gateway takes a request, so the first one already finds it connected. After the fence above:
+    // the pin dials at once, and a fenced gateway must already allow its own provider.
+    if !args.self_provider_addr.is_empty() {
+        let own = args.self_provider.as_deref().ok_or("--self-provider-addr needs --self-provider")?;
+        net.pin_peer_addrs(own, &args.self_provider_addr).map_err(|e| format!("--self-provider-addr: {e}"))?;
+        eprintln!("openhydra-agent: own provider dialled directly at {}", args.self_provider_addr.join(", "));
     }
     // Phase 0 device attestation of providers (opt-in).
     let provider_attest = if args.attest_providers {
