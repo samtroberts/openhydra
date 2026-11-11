@@ -2184,8 +2184,8 @@ pub struct AutoCandidates {
     /// The models of the usable private cards alone (the user's swarms): where a tool request goes
     /// when this machine's own models are too small for it.
     pub swarm_card_models: Vec<String>,
-    /// The caller is a member of a private swarm (holds a live membership credential) on the public
-    /// network: `auto` stays inside the swarm (this machine, the swarm's cards) and never falls
+    /// The caller is in a private swarm (owns one, or holds a live membership credential for one)
+    /// on the public network: `auto` stays inside the swarm (this machine, the swarm's cards) and never falls
     /// back to the public network (Sam, 11 Nov).
     pub swarm_only: bool,
     /// On a keyed private network: every provider is the organisation's, so the network's steps
@@ -3578,7 +3578,8 @@ impl ConsumerNode {
         now: u64,
     ) -> AutoCandidates {
         let private_network = openhydra_network::transport::private_network_key().is_some();
-        let swarm_only = !private_network && self.creds.as_ref().is_some_and(|c| c.credential_for(now).is_some());
+        // In a swarm: a member (a live credential) or its owner (Sam, 11 Nov: owners too).
+        let swarm_only = !private_network && self.creds.as_ref().is_some_and(|c| c.in_a_swarm(now));
         let member = |swarm: &str| self.creds.as_ref().is_some_and(|c| c.credential_for_swarm(swarm, now).is_some());
         // Usable cards only (a private card of a swarm this node isn't in can't serve it); a swarm
         // member's `auto` uses its swarms' private cards alone.
@@ -8015,6 +8016,15 @@ mod tests {
         crate::cards::add_card(&cards_path, &card("acme-model", Some(acme.swarm_public_key.clone()))).unwrap();
         crate::cards::add_card(&cards_path, &card("other-model", Some(other.swarm_public_key.clone()))).unwrap();
         let sorted = |mut v: Vec<String>| { v.sort(); v };
+
+        // A swarm's owner (no credential of its own): in a swarm too, so swarm-only.
+        let (_d0, owner) = test_node();
+        let owner = owner
+            .with_cards(Some(crate::cards::CardStore::new(cards_path.clone())))
+            .with_credentials(Some(crate::swarms::CredentialStore::new(owner_dir.clone())));
+        let c = owner.auto_candidates_from(vec![], None, now);
+        assert!(c.swarm_only, "an owner's auto stays in its swarm too");
+        assert!(c.card_models.is_empty(), "no public card for it");
 
         // Not a member of anything.
         let (_d, outsider) = test_node();

@@ -693,6 +693,8 @@ fn swarms_dir_signature(dir: &Path) -> DirSig {
 struct CredCache {
     sig: Option<DirSig>,
     creds: Vec<MembershipCredential>,
+    /// The folder holds an owner record: this node created a swarm.
+    owns: bool,
 }
 
 /// Hot-reloaded set of the membership credentials this node holds (member records). Rescans the
@@ -714,6 +716,7 @@ impl CredentialStore {
             return;
         }
         let mut creds = Vec::new();
+        let mut owns = false;
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -722,6 +725,7 @@ impl CredentialStore {
                 }
                 if let Ok(s) = std::fs::read_to_string(&path) {
                     if let Ok(rec) = serde_json::from_str::<SwarmRecord>(&s) {
+                        owns |= rec.role == SwarmRole::Owner;
                         if let Some(cred) = rec.credential {
                             creds.push(cred);
                         }
@@ -730,7 +734,16 @@ impl CredentialStore {
             }
         }
         c.creds = creds;
+        c.owns = owns;
         c.sig = Some(sig);
+    }
+
+    /// Whether this node is in a private swarm: it owns one (it created it; the app keeps owner
+    /// records in the same folder) or holds a live membership credential for one.
+    pub fn in_a_swarm(&self, now_ms: u64) -> bool {
+        self.refresh();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.owns || c.creds.iter().any(|cr| now_ms < cr.expires_at)
     }
 
     /// The best membership credential to present right now — the first that hasn't expired. `None`
