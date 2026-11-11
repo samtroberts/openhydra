@@ -421,16 +421,23 @@ pub fn decode_latest(bytes: &[u8]) -> Result<LatestReceipt, AdapterError> {
     Ok(LatestReceipt { receipt: CoSignedReceipt { payload, consumer_sig, provider_sig }, claim })
 }
 
-/// Consumer side: build the receipt, sign it, settle with the provider over `transport`,
-/// and verify the returned co-signed receipt. Returns it on success.
-///
-/// `sign(canonical_bytes) -> 64-byte sig` is the consumer node signing with its identity
-/// key (never exported). `transport(framed) -> response` is a `proxy_forward` to the
-/// provider. `nonce`/`ts_unix_ms` are supplied by the caller (random/now live).
+/// A receipt the consumer has built and signed, framed for the provider (method byte first),
+/// before it is sent. The same bytes go out on their own or inside a [`RECEIPT_BATCH`], and are sent
+/// again unchanged on a retry (so a provider that co-signed them already answers from its replay
+/// cache instead of refusing a spent serve commitment).
+#[derive(Debug, Clone)]
+pub struct SignedReceiptRequest {
+    pub payload: ReceiptPayload,
+    consumer_sig: Signature,
+    /// [`RECEIPT_REQUEST`] followed by the request framing.
+    pub framed: Vec<u8>,
+}
+
+/// Consumer side, first half of [`request_receipt`]: build the receipt and sign it (and, on a
+/// settlement chain, its claim), ready to send.
 #[allow(clippy::too_many_arguments)]
-pub fn request_receipt(
+pub fn sign_receipt_request(
     sign: &dyn Fn(&[u8]) -> Vec<u8>,
-    transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>,
     provider_pub: &[u8],
     consumer_pub: &[u8],
     model_id: &str,
@@ -442,7 +449,7 @@ pub fn request_receipt(
     settlement_asset: Option<SettlementAsset>,
     peg_micros_per_credit: Option<u64>,
     claim_signer: Option<(u64, &dyn Fn(&openhydra_protocol::settlement::SettlementClaim) -> Vec<u8>)>,
-) -> Result<CoSignedReceipt, ReceiptFailure> {
+) -> Result<SignedReceiptRequest, AdapterError> {
     let payload = payload_from_bytes(
         provider_pub,
         consumer_pub,
@@ -468,8 +475,12 @@ pub fn request_receipt(
     });
     let mut framed = vec![RECEIPT_REQUEST];
     framed.extend_from_slice(&encode_request_with_claim(&payload, &consumer_sig, claim.as_ref()));
-    let response = transport(&framed)?;
+    Ok(SignedReceiptRequest { payload, consumer_sig, framed })
+}
 
+/// Consumer side, second half of [`request_receipt`]: read the provider's answer to `request` and
+/// verify the co-signed receipt it makes.
+pub fn read_receipt_response(request: &SignedReceiptRequest, response: &[u8]) -> Result<CoSignedReceipt, ReceiptFailure> {
     let provider_sig = match response.first() {
         Some(&RESP_OK) => to_sig(response.get(1..65).unwrap_or_default())?,
         Some(&RESP_ERR) => {
@@ -482,10 +493,135 @@ pub fn request_receipt(
         Some(&RESP_BEHIND) => return Err(ReceiptFailure::Behind(Box::new(decode_latest(&response[1..])?))),
         _ => return Err(AdapterError::Parse("receipt response malformed".into()).into()),
     };
-
-    let receipt = CoSignedReceipt { payload, consumer_sig, provider_sig };
+    let receipt = CoSignedReceipt { payload: request.payload.clone(), consumer_sig: request.consumer_sig, provider_sig };
     verify_receipt(&receipt).map_err(receipt_err)?; // consumer independently verifies
     Ok(receipt)
+}
+
+/// Consumer side: build the receipt, sign it, settle with the provider over `transport`,
+/// and verify the returned co-signed receipt. Returns it on success.
+///
+/// `sign(canonical_bytes) -> 64-byte sig` is the consumer node signing with its identity
+/// key (never exported). `transport(framed) -> response` is a `proxy_forward` to the
+/// provider. `nonce`/`ts_unix_ms` are supplied by the caller (random/now live).
+#[allow(clippy::too_many_arguments)]
+pub fn request_receipt(
+    sign: &dyn Fn(&[u8]) -> Vec<u8>,
+    transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>,
+    provider_pub: &[u8],
+    consumer_pub: &[u8],
+    model_id: &str,
+    tokens: u64,
+    nonce: [u8; 16],
+    ts_unix_ms: u64,
+    canonical_model_id: &str,
+    cumulative_amount: Option<u64>,
+    settlement_asset: Option<SettlementAsset>,
+    peg_micros_per_credit: Option<u64>,
+    claim_signer: Option<(u64, &dyn Fn(&openhydra_protocol::settlement::SettlementClaim) -> Vec<u8>)>,
+) -> Result<CoSignedReceipt, ReceiptFailure> {
+    let request = sign_receipt_request(
+        sign,
+        provider_pub,
+        consumer_pub,
+        model_id,
+        tokens,
+        nonce,
+        ts_unix_ms,
+        canonical_model_id,
+        cumulative_amount,
+        settlement_asset,
+        peg_micros_per_credit,
+        claim_signer,
+    )?;
+    let response = transport(&request.framed)?;
+    read_receipt_response(&request, &response)
+}
+
+/// Several receipt requests to one provider in one message, settled in order (consumer → provider).
+/// Body: `count:u16-LE`, then per request `len:u32-LE ‖ request` (each a whole [`RECEIPT_REQUEST`]
+/// message). The reply has the same layout behind the same byte, one answer per request the
+/// provider got to: it stops after the first answer that isn't a co-signature, so a receipt that
+/// was refused, rate limited or behind is never followed by one built on top of it.
+///
+/// A provider that predates batches answers with an "unsupported method" error frame; the consumer
+/// then sends the same requests one at a time.
+pub const RECEIPT_BATCH: u8 = 0x1B;
+
+/// Most receipt requests in one [`RECEIPT_BATCH`].
+pub const MAX_RECEIPT_BATCH: usize = 64;
+
+/// Frame `parts` behind `method` in the batch layout (see [`RECEIPT_BATCH`]).
+fn encode_parts<T: AsRef<[u8]>>(method: u8, parts: &[T]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(3 + parts.iter().map(|p| 4 + p.as_ref().len()).sum::<usize>());
+    b.push(method);
+    b.extend_from_slice(&(parts.len().min(u16::MAX as usize) as u16).to_le_bytes());
+    for p in parts.iter().take(u16::MAX as usize) {
+        let p = p.as_ref();
+        b.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        b.extend_from_slice(p);
+    }
+    b
+}
+
+/// The parts of a batch-layout message behind `method`, or `None` when it isn't one (another method
+/// byte, a truncated part, bytes left over).
+fn decode_parts(method: u8, data: &[u8]) -> Option<Vec<&[u8]>> {
+    if data.first() != Some(&method) || data.len() < 3 {
+        return None;
+    }
+    let count = u16::from_le_bytes([data[1], data[2]]) as usize;
+    let mut parts = Vec::with_capacity(count.min(MAX_RECEIPT_BATCH));
+    let mut pos = 3;
+    for _ in 0..count {
+        let len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        parts.push(data.get(pos..pos.checked_add(len)?)?);
+        pos += len;
+    }
+    (pos == data.len()).then_some(parts)
+}
+
+/// A [`RECEIPT_BATCH`] message carrying `requests` (each a [`SignedReceiptRequest::framed`]).
+pub fn encode_receipt_batch<T: AsRef<[u8]>>(requests: &[T]) -> Vec<u8> {
+    encode_parts(RECEIPT_BATCH, requests)
+}
+
+/// The provider's answers to a [`RECEIPT_BATCH`], in order, or `None` when the reply isn't a batch
+/// reply (a provider that predates batches answers with an error frame).
+pub fn decode_receipt_batch_reply(reply: &[u8]) -> Option<Vec<&[u8]>> {
+    decode_parts(RECEIPT_BATCH, reply)
+}
+
+/// A refusal in the receipt reply format (the consumer reads it as "provider rejected receipt").
+pub fn receipt_refusal(reason: &str) -> Vec<u8> {
+    err_response(reason)
+}
+
+/// Provider side: answer a [`RECEIPT_BATCH`] by settling its requests in order with `settle_one`
+/// (which answers a single [`RECEIPT_REQUEST`] message), stopping after the first answer that isn't a
+/// co-signature. A malformed batch, an empty one or one over [`MAX_RECEIPT_BATCH`] gets a plain
+/// refusal, which the consumer takes as "send them one at a time".
+pub fn handle_receipt_batch(data: &[u8], settle_one: &mut dyn FnMut(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let requests = match decode_parts(RECEIPT_BATCH, data) {
+        Some(r) if !r.is_empty() && r.len() <= MAX_RECEIPT_BATCH => r,
+        Some(_) => return err_response("receipt batch empty or too large"),
+        None => return err_response("receipt batch malformed"),
+    };
+    let mut answers = Vec::with_capacity(requests.len());
+    for request in requests {
+        let answer = if request.first() == Some(&RECEIPT_REQUEST) {
+            settle_one(request)
+        } else {
+            err_response("unsupported method")
+        };
+        let co_signed = answer.first() == Some(&RESP_OK);
+        answers.push(answer);
+        if !co_signed {
+            break;
+        }
+    }
+    encode_parts(RECEIPT_BATCH, &answers)
 }
 
 /// Provider side: decode an inbound receipt request, refuse if it names a different
@@ -552,6 +688,43 @@ mod tests {
     }
     fn sign_with(k: &SigningKey) -> impl Fn(&[u8]) -> Vec<u8> + '_ {
         move |msg: &[u8]| k.sign(msg).to_bytes().to_vec()
+    }
+
+    #[test]
+    fn a_receipt_batch_frames_and_reads_back_exactly() {
+        let parts: Vec<Vec<u8>> = vec![vec![RECEIPT_REQUEST, 1, 2], vec![], vec![RECEIPT_REQUEST; 300]];
+        let framed = encode_receipt_batch(&parts);
+        let back = decode_parts(RECEIPT_BATCH, &framed).unwrap();
+        assert_eq!(back, parts.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        // Truncated, with bytes left over, or behind another method byte: not a batch.
+        assert!(decode_parts(RECEIPT_BATCH, &framed[..framed.len() - 1]).is_none());
+        assert!(decode_parts(RECEIPT_BATCH, &[framed.as_slice(), &[0]].concat()).is_none());
+        assert!(decode_parts(RECEIPT_BATCH, &[RECEIPT_REQUEST, 0, 0]).is_none());
+        assert!(decode_receipt_batch_reply(&err_response("unsupported method")).is_none());
+        // A length that runs past the end doesn't overflow or allocate.
+        assert!(decode_parts(RECEIPT_BATCH, &[RECEIPT_BATCH, 1, 0, 0xff, 0xff, 0xff, 0xff]).is_none());
+    }
+
+    #[test]
+    fn a_receipt_batch_is_settled_in_order_and_stops_at_the_first_refusal() {
+        let requests: Vec<Vec<u8>> = (0..4u8).map(|i| vec![RECEIPT_REQUEST, i]).collect();
+        let mut seen = Vec::new();
+        let reply = handle_receipt_batch(&encode_receipt_batch(&requests), &mut |r: &[u8]| {
+            seen.push(r[1]);
+            if r[1] == 1 { err_response("no") } else { ok_response(&Signature::from_bytes(&[0; 64])) }
+        });
+        assert_eq!(seen, vec![0, 1], "nothing after the refusal is settled");
+        let answers = decode_receipt_batch_reply(&reply).unwrap();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0][0], RESP_OK);
+        assert_eq!(answers[1][0], RESP_ERR);
+        // Empty, too large, or holding another method: a plain refusal, or that part refused.
+        let mut never = |_: &[u8]| -> Vec<u8> { panic!("not settled") };
+        assert_eq!(handle_receipt_batch(&encode_receipt_batch::<Vec<u8>>(&[]), &mut never)[0], RESP_ERR);
+        let too_many = vec![vec![RECEIPT_REQUEST]; MAX_RECEIPT_BATCH + 1];
+        assert_eq!(handle_receipt_batch(&encode_receipt_batch(&too_many), &mut never)[0], RESP_ERR);
+        let other = handle_receipt_batch(&encode_receipt_batch(&[vec![RECEIPT_BATCH]]), &mut never);
+        assert_eq!(decode_receipt_batch_reply(&other).unwrap()[0][0], RESP_ERR);
     }
 
     #[test]

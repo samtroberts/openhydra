@@ -43,7 +43,7 @@ use crate::prompt_score::{
 };
 use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
-use crate::receipt::{handle_receipt_inbound, BindRejection, RECEIPT_REQUEST};
+use crate::receipt::{handle_receipt_inbound, BindRejection, RECEIPT_BATCH, RECEIPT_REQUEST};
 use crate::serve::{
     failed_serve_billable, frame_response, handle_serve_request, FetchChunksResponse,
     FetchResponse, ServeChunk, ServeRequest, ServeSummary,
@@ -909,7 +909,10 @@ const CONTROL_WORKERS: usize = 2;
 /// Whether an inbound message (by its first byte) is answered apart from generations (receipts on
 /// a pool of their own, the rest on the control pool): quick work that must not wait behind them.
 fn is_control_message(method: Option<u8>) -> bool {
-    matches!(method, Some(FETCH_CHUNKS) | Some(STREAM_CLOSE) | Some(FETCH_RESULT) | Some(RECEIPT_REQUEST) | Some(OWN_MODELS_REQUEST))
+    matches!(
+        method,
+        Some(FETCH_CHUNKS) | Some(STREAM_CLOSE) | Some(FETCH_RESULT) | Some(RECEIPT_REQUEST) | Some(RECEIPT_BATCH) | Some(OWN_MODELS_REQUEST)
+    )
 }
 
 /// Ready fetches of one buffered result answered (round 9 B9-8): a consumer that lost a reply
@@ -3455,7 +3458,7 @@ impl<A: EngineAdapter> Provider<A> {
                 // Polls, closes, fetches and receipts are quick and must never wait behind
                 // generations (each stream holds a serve worker while it generates): they have their
                 // own small pool (round 8 G8-1).
-                let target = if data.first() == Some(&RECEIPT_REQUEST) {
+                let target = if matches!(data.first(), Some(&RECEIPT_REQUEST) | Some(&RECEIPT_BATCH)) {
                     // Receipts sign and write the store: their own workers, so they never hold up
                     // polls (round 9 B9-2).
                     &receipt_pool
@@ -3675,6 +3678,73 @@ impl<A: EngineAdapter> Provider<A> {
         }
     }
 
+    /// Answer one [`RECEIPT_REQUEST`] message (on its own, or one of a [`RECEIPT_BATCH`]'s): check it
+    /// settles a serve we recorded, co-sign it, and record it. The rate cap is the caller's.
+    fn settle_receipt_message(&self, source_peer: &str, data: &[u8]) -> Vec<u8> {
+        let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
+        let provider_pub = self.net.public_key_bytes().unwrap_or_default();
+        // B-S1: only co-sign a receipt that settles a real serve we recorded. Review F2: also
+        // reject a non-monotonic / under-signed crypto-rail cumulative BEFORE consuming the
+        // commitment (so a bad cumulative doesn't burn the single-use nonce).
+        // The claim that came with the receipt, kept once it is co-signed.
+        let accepted_claim = std::cell::RefCell::new(None);
+        let bind = |p: &openhydra_protocol::receipts::ReceiptPayload, claim: Option<&crate::receipt::ClaimSig>| {
+            // From its own consumer first: nothing (not even a BEHIND reply) for a replay.
+            self.check_sender(p, source_peer).map_err(BindRejection::from)?;
+            // The claim first: on Base its signer picks the running total to check against.
+            let kept = self.check_settlement_claim(p, claim).map_err(BindRejection::from)?;
+            let floor = self.validate_settlement_cumulative(p, kept.as_ref().and_then(|k| k.signer))?;
+            self.check_and_consume_commitment(p, source_peer, floor).map_err(BindRejection::from)?;
+            *accepted_claim.borrow_mut() = kept;
+            Ok(())
+        };
+        // Validate, co-sign and record as one step (see `receipt_lock`).
+        let _receipt_guard = self.receipt_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let replay_key = recent_cosign_key(source_peer, data);
+        if let Some(reply) = self.recent_cosign(&replay_key) {
+            return reply;
+        }
+        let (response, accepted) =
+            handle_receipt_inbound(data, &sign, &provider_pub, &bind);
+        if accepted.is_some() {
+            self.note_cosign(replay_key, &response);
+        }
+        // Persist the accepted co-signed receipt (best-effort; never fails the reply).
+        ledger_receipt(self.store.as_ref(), accepted.as_ref());
+        // M2.3: accrue the consumer's give/take (it consumed `tokens` from us).
+        if let Some(receipt) = &accepted {
+            self.record_consumption(receipt);
+            // Review F2: advance our co-signed cumulative high-water mark for this pair.
+            self.record_settlement_cumulative(receipt, accepted_claim.borrow().as_ref());
+            if let Some(stats) = &self.stats {
+                stats.receipts_ledgered.fetch_add(1, Ordering::Relaxed);
+                // #5 Ledger: a co-signed receipt is an authoritative "served" transaction
+                // (right model/tokens, counterparty = the consumer we served).
+                stats.record_ledger(
+                    now_unix_ms(),
+                    "served",
+                    &receipt.payload.model_id,
+                    source_peer,
+                    receipt.payload.tokens,
+                    Some(receipt_credits(receipt)),
+                );
+            }
+            // Durable Ledger row so the view + lifetime totals survive a restart
+            // (rehydrated on boot). Best-effort — never fails the settlement reply.
+            if let Some(store) = &self.store {
+                let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
+                    ts_ms: now_unix_ms(),
+                    kind: "served".to_string(),
+                    model: receipt.payload.model_id.clone(),
+                    counterparty: source_peer.to_string(),
+                    tokens: receipt.payload.tokens,
+                    credits: Some(receipt_credits(receipt)),
+                });
+            }
+        }
+        response
+    }
+
     /// Route one inbound request by its method byte: serve completions, settle receipts.
     /// `source_peer` is the libp2p-authenticated sender, used to rate-limit per peer.
     /// `parsed` is the already-decoded serve request (F-C5), `None` for non-serve frames.
@@ -3794,69 +3864,15 @@ impl<A: EngineAdapter> Provider<A> {
                         ServeChunk::Error("receipt rate limited, retry".into()).encode(),
                     ]);
                 }
-                let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
-                let provider_pub = self.net.public_key_bytes().unwrap_or_default();
-                // B-S1: only co-sign a receipt that settles a real serve we recorded. Review F2: also
-                // reject a non-monotonic / under-signed crypto-rail cumulative BEFORE consuming the
-                // commitment (so a bad cumulative doesn't burn the single-use nonce).
-                // The claim that came with the receipt, kept once it is co-signed.
-                let accepted_claim = std::cell::RefCell::new(None);
-                let bind = |p: &openhydra_protocol::receipts::ReceiptPayload, claim: Option<&crate::receipt::ClaimSig>| {
-                    // From its own consumer first: nothing (not even a BEHIND reply) for a replay.
-                    self.check_sender(p, source_peer).map_err(BindRejection::from)?;
-                    // The claim first: on Base its signer picks the running total to check against.
-                    let kept = self.check_settlement_claim(p, claim).map_err(BindRejection::from)?;
-                    let floor = self.validate_settlement_cumulative(p, kept.as_ref().and_then(|k| k.signer))?;
-                    self.check_and_consume_commitment(p, source_peer, floor).map_err(BindRejection::from)?;
-                    *accepted_claim.borrow_mut() = kept;
-                    Ok(())
-                };
-                // Validate, co-sign and record as one step (see `receipt_lock`).
-                let _receipt_guard = self.receipt_lock.lock().unwrap_or_else(|e| e.into_inner());
-                let replay_key = recent_cosign_key(source_peer, data);
-                if let Some(reply) = self.recent_cosign(&replay_key) {
-                    return reply;
-                }
-                let (response, accepted) =
-                    handle_receipt_inbound(data, &sign, &provider_pub, &bind);
-                if accepted.is_some() {
-                    self.note_cosign(replay_key, &response);
-                }
-                // Persist the accepted co-signed receipt (best-effort; never fails the reply).
-                ledger_receipt(self.store.as_ref(), accepted.as_ref());
-                // M2.3: accrue the consumer's give/take (it consumed `tokens` from us).
-                if let Some(receipt) = &accepted {
-                    self.record_consumption(receipt);
-                    // Review F2: advance our co-signed cumulative high-water mark for this pair.
-                    self.record_settlement_cumulative(receipt, accepted_claim.borrow().as_ref());
-                    if let Some(stats) = &self.stats {
-                        stats.receipts_ledgered.fetch_add(1, Ordering::Relaxed);
-                        // #5 Ledger: a co-signed receipt is an authoritative "served" transaction
-                        // (right model/tokens, counterparty = the consumer we served).
-                        stats.record_ledger(
-                            now_unix_ms(),
-                            "served",
-                            &receipt.payload.model_id,
-                            source_peer,
-                            receipt.payload.tokens,
-                            Some(receipt_credits(receipt)),
-                        );
-                    }
-                    // Durable Ledger row so the view + lifetime totals survive a restart
-                    // (rehydrated on boot). Best-effort — never fails the settlement reply.
-                    if let Some(store) = &self.store {
-                        let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
-                            ts_ms: now_unix_ms(),
-                            kind: "served".to_string(),
-                            model: receipt.payload.model_id.clone(),
-                            counterparty: source_peer.to_string(),
-                            tokens: receipt.payload.tokens,
-                            credits: Some(receipt_credits(receipt)),
-                        });
-                    }
-                }
-                response
+                self.settle_receipt_message(source_peer, data)
             }
+            // Several receipts in one message, settled in order; each counts against the same rate cap.
+            Some(&RECEIPT_BATCH) => crate::receipt::handle_receipt_batch(data, &mut |request: &[u8]| {
+                if self.receipt_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+                    return crate::receipt::receipt_refusal("receipt rate limited, retry");
+                }
+                self.settle_receipt_message(source_peer, request)
+            }),
             // A serve request: run it, and — when the status endpoint is on — fold the
             // outcome into the shared transfer counters (per-model tokens + native TPS).
             Some(&SERVE_REQUEST) => {
@@ -4789,7 +4805,7 @@ mod tests {
     /// Round 8 G8-1: polls, closes, fetches and receipts go to the control pool; serves don't.
     #[test]
     fn quick_messages_have_their_own_workers() {
-        for m in [FETCH_CHUNKS, STREAM_CLOSE, FETCH_RESULT, RECEIPT_REQUEST, OWN_MODELS_REQUEST] {
+        for m in [FETCH_CHUNKS, STREAM_CLOSE, FETCH_RESULT, RECEIPT_REQUEST, RECEIPT_BATCH, OWN_MODELS_REQUEST] {
             assert!(is_control_message(Some(m)));
         }
         for m in [SERVE_REQUEST, SERVE_STREAM, ATTEST_CHALLENGE, PROMPT_SCORE_CHALLENGE] {

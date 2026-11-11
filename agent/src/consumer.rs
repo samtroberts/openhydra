@@ -159,9 +159,18 @@ const FETCH_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// the detached settlement thread — kept well below the serve budget ([`attempt_timeout`]) since credit is
 /// advisory and a dropped settlement never affects the delivered completion.
 const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Settlements in flight at once, across all providers. Each is a detached thread; past this a new
-/// one is dropped (logged) rather than spawned, so a burst of serves can't grow threads without bound.
-const MAX_SETTLES_IN_FLIGHT: usize = 512;
+/// Settlements queued or being settled at once, across all providers; past this a new one is dropped
+/// (logged), so a burst of serves can't grow memory without bound. A queued one is a few hundred
+/// bytes; the threads are one per pair settling now ([`MAX_SETTLE_WORKERS`]).
+const MAX_SETTLES_IN_FLIGHT: usize = 4096;
+/// Pairs settling at once (one worker thread each); past this a settlement for a pair with no
+/// worker is dropped.
+const MAX_SETTLE_WORKERS: usize = 256;
+/// Providers remembered as predating receipt batches (the oldest expire first).
+const MAX_SETTLE_BATCH_REFUSALS: usize = 1024;
+/// How long a provider that predates receipt batches gets its receipts one at a time before a batch
+/// is tried again (it may have updated).
+const SETTLE_BATCH_REFUSED_MS: u64 = 10 * 60 * 1000;
 /// How long a provider that refused us over payment is tried last (see `payment_refusals`).
 const PAYMENT_REFUSAL_TTL_MS: u64 = 10 * 60 * 1000;
 /// Providers whose recent settlements a consumer remembers (for [`ConsumerNode::paid_recently`]).
@@ -182,12 +191,13 @@ const AUDIT_SHED_EVIDENCE_MS: u64 = 60 * 1000;
 const FOLLOW_UP_RETRIES: u32 = 3;
 /// Payment refusals remembered at once (the oldest are forgotten first).
 const MAX_PAYMENT_REFUSALS: usize = 1024;
-/// Settlements running or queued for one `(peer, model)`. They run one at a time (its lock), so with
-/// a provider that black-holes receipts each waits out [`SETTLE_TIMEOUT`] in turn; more than a few
-/// queued behind it would only wait to fail.
-const MAX_SETTLES_PER_PAIR: usize = 32;
-/// Retries of a settlement whose round-trip failed (or the provider asked us to retry), and the wait
-/// before each: a serve that goes unpaid counts against us at a provider that charges.
+/// Settlements queued for one `(peer, model)` behind the batch being settled. Its worker takes up to
+/// [`crate::receipt::MAX_RECEIPT_BATCH`] per round trip, so a busy pair's queue clears in a few
+/// round trips; this only bounds a pair whose provider stopped answering.
+const MAX_SETTLES_PER_PAIR: usize = 1024;
+/// Retries of a settlement batch whose round-trip failed (or the provider asked us to retry), and the
+/// wait before each; any receipt co-signed in between starts the count again. A serve that goes
+/// unpaid counts against us at a provider that charges.
 const SETTLE_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(8)];
 
 /// The waits before each try of a stream close (S8): spread over most of the provider's commitment
@@ -380,10 +390,120 @@ fn signed_for_deployment(chain: Option<&crate::settlement_config::SettlementChai
     }
 }
 
-/// Whether a new settlement may start, given how many are in flight and how many already hold or
-/// wait on its pair's lock.
-fn settle_admitted(in_flight: usize, pair_queue: usize) -> bool {
-    in_flight < MAX_SETTLES_IN_FLIGHT && pair_queue < MAX_SETTLES_PER_PAIR
+/// Whether a new settlement may join its pair's queue: fewer than [`MAX_SETTLES_IN_FLIGHT`] are in
+/// flight, and its pair's queue (`queued`, `None` when the pair has no worker) has room, or a new
+/// worker may start (`workers` running).
+fn settle_admitted(in_flight: usize, queued: Option<usize>, workers: usize) -> bool {
+    in_flight < MAX_SETTLES_IN_FLIGHT
+        && match queued {
+            Some(n) => n < MAX_SETTLES_PER_PAIR,
+            None => workers < MAX_SETTLE_WORKERS,
+        }
+}
+
+/// A completed serve waiting for its receipt to be settled (see [`ConsumerNode::settle_receipt`]).
+struct SettleJob {
+    provider_libp2p: String,
+    provider_pub: Vec<u8>,
+    consumer_pub: Vec<u8>,
+    model_id: String,
+    canonical: String,
+    /// The provider's validated engine handle ([`rep_model_key`]).
+    model_key: String,
+    /// The provider's 128-bit state id.
+    peer_id: String,
+    /// The provider's OpenHydra id, for its ledger row.
+    ledger_peer: String,
+    tokens: u64,
+    nonce: [u8; 16],
+    purpose: SettlePurpose,
+    /// Counts this settlement in flight until it is concluded or dropped.
+    _slot: SettleSlot,
+}
+
+/// A settlement's receipt, signed and ready to send.
+struct PreparedReceipt {
+    job: SettleJob,
+    /// What its running total was built on.
+    base: u64,
+    voucher: Option<(FeeSplit, u64)>,
+    signed: crate::receipt::SignedReceiptRequest,
+}
+
+/// Send signed receipts to one provider, in order, and hand each answer to `conclude` (by index,
+/// in order). With `batches` on they go together ([`crate::receipt::RECEIPT_BATCH`]); a provider that
+/// predates batches turns `batches` off and gets the rest one at a time. A failed round trip, or an
+/// answer asking for a retry, sends the same bytes again from that receipt on, after each of `waits`
+/// in turn (a co-signed receipt starts the waits again); with none left, the receipts not yet answered
+/// conclude with the failure.
+///
+/// Returns where to start over: after a receipt the provider found behind its high-water, the
+/// receipts after it (which the provider didn't look at) were built on a base it doesn't hold, so they
+/// are left unconcluded for the caller to sign again.
+fn send_receipts(
+    requests: &[&crate::receipt::SignedReceiptRequest],
+    transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>,
+    batches: &mut bool,
+    waits: &[Duration],
+    sleep: &mut dyn FnMut(Duration),
+    conclude: &mut dyn FnMut(usize, Result<openhydra_protocol::receipts::CoSignedReceipt, ReceiptFailure>),
+) -> usize {
+    let mut waits_left = waits.iter();
+    let mut next = 0;
+    while next < requests.len() {
+        let rest = &requests[next..];
+        // The provider's answers to `rest`, in order, as far as it got.
+        let answers = if *batches && rest.len() > 1 {
+            let framed: Vec<&[u8]> = rest.iter().map(|r| r.framed.as_slice()).collect();
+            transport(&crate::receipt::encode_receipt_batch(&framed)).and_then(|reply| {
+                match crate::receipt::decode_receipt_batch_reply(&reply) {
+                    Some(answers) if !answers.is_empty() => Ok(answers.into_iter().take(rest.len()).map(<[u8]>::to_vec).collect()),
+                    Some(_) => Err(AdapterError::Parse("receipt batch reply empty".into())),
+                    // A provider that predates batches answered with an error frame; nothing was settled.
+                    None => Ok(Vec::new()),
+                }
+            })
+        } else {
+            transport(&rest[0].framed).map(|answer| vec![answer])
+        };
+        let answers = match answers {
+            Ok(answers) if answers.is_empty() => {
+                *batches = false;
+                continue;
+            }
+            Ok(answers) => answers,
+            Err(e) => {
+                if let Some(wait) = waits_left.next() {
+                    sleep(*wait);
+                    continue;
+                }
+                for i in next..requests.len() {
+                    conclude(i, Err(ReceiptFailure::Failed(e.clone())));
+                }
+                return requests.len();
+            }
+        };
+        for answer in answers {
+            let outcome = crate::receipt::read_receipt_response(requests[next], &answer);
+            match &outcome {
+                Err(ReceiptFailure::Failed(e)) if settle_retryable(e) => {
+                    if let Some(wait) = waits_left.next() {
+                        sleep(*wait);
+                        break; // the provider stopped here: send again from this receipt
+                    }
+                }
+                Err(ReceiptFailure::Behind(_)) => {
+                    conclude(next, outcome);
+                    return next + 1;
+                }
+                Ok(_) => waits_left = waits.iter(),
+                Err(_) => {}
+            }
+            conclude(next, outcome);
+            next += 1;
+        }
+    }
+    requests.len()
 }
 
 /// Decrements the in-flight settlement count when a settlement thread ends (however it ends).
@@ -2103,14 +2223,17 @@ pub struct ConsumerNode {
     settlement_peg: Option<u64>,
     /// The on-chain deployment paying receipts settle on: each carries its claim, signed for it.
     settlement_chain: Option<crate::settlement_config::SettlementChain>,
-    /// Per-`(peer, model)` serialization locks for settlement (review F1). The cumulative voucher must
-    /// advance monotonically, but `settle_receipt` reads the base, co-signs over a network round-trip,
-    /// then commits — so concurrent settles to the same pair would race and emit non-monotonic /
-    /// divergent co-signed cumulatives. Each settle holds its pair's lock across the whole
-    /// read→co-sign→commit window. Grows one entry per distinct `(peer, model)` seen.
-    settle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Settlement threads running now (bounded by [`MAX_SETTLES_IN_FLIGHT`]).
+    /// Settlements waiting, per `(peer, model)` voucher key (review F1). The cumulative voucher must
+    /// advance monotonically, and a settlement reads the base, co-signs over a network round trip,
+    /// then commits, so concurrent settles to one pair would race and emit non-monotonic / divergent
+    /// co-signed cumulatives. A key is present while its pair's one worker runs
+    /// ([`ConsumerNode::run_settle_queue`]); the worker settles the queue a batch at a time.
+    settle_queues: Mutex<HashMap<String, std::collections::VecDeque<SettleJob>>>,
+    /// Settlements queued or being settled now (bounded by [`MAX_SETTLES_IN_FLIGHT`]).
     settles_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Providers (libp2p id) that answered a receipt batch as one that predates them → until when
+    /// their receipts go one at a time.
+    settle_batch_refused: Mutex<HashMap<String, u64>>,
     /// `(provider libp2p id, model)` → when it last refused us over payment: tried last (and not
     /// audited) for [`PAYMENT_REFUSAL_TTL_MS`], so a consumer that doesn't pay its price doesn't ask
     /// it first on every request.
@@ -2473,15 +2596,6 @@ enum AttemptOutcome {
     Fatal(AdapterError),
 }
 
-/// Evict per-`(peer, model)` settlement locks that no settle is using, keeping the lock map bounded
-/// on a long-lived node (review F1 follow-up). An entry is **idle** iff only the map references its
-/// `Arc` (`strong_count == 1`); any in-flight or waiting settle captured an extra clone (in
-/// `settle_receipt`, before it takes the guard), so a busy pair's lock keeps `strong_count >= 2` and
-/// survives the sweep — the serialization guarantee is never broken by pruning.
-fn prune_idle_settle_locks(locks: &mut HashMap<String, Arc<Mutex<()>>>) {
-    locks.retain(|_, arc| Arc::strong_count(arc) > 1);
-}
-
 impl ConsumerNode {
     /// An in-memory consumer (reputation and credit are not persisted across restarts).
     pub fn new(net: NetworkHandle) -> Self {
@@ -2509,7 +2623,8 @@ impl ConsumerNode {
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
             settlement_chain: None,
-            settle_locks: Mutex::new(HashMap::new()),
+            settle_queues: Mutex::new(HashMap::new()),
+            settle_batch_refused: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             payment_refusals: Mutex::new(HashMap::new()),
             unavailable: Mutex::new(HashMap::new()),
@@ -2778,22 +2893,6 @@ impl ConsumerNode {
         self
     }
 
-    /// The per-`(peer, model)` settlement lock for `vkey`, creating it on first use — held across a
-    /// settle's read→co-sign→commit so concurrent settles to the same pair serialize (review F1).
-    ///
-    /// Bounds the lock map: a long-lived node churning through many providers would otherwise grow one
-    /// permanent entry per distinct `(peer, model)` ever settled. Past a threshold we sweep entries no
-    /// settle is using (`prune_idle_settle_locks`) before handing back this pair's lock. The sweep is
-    /// gated on size so the common path stays O(1).
-    fn settle_lock_for(&self, vkey: &str) -> Arc<Mutex<()>> {
-        const PRUNE_THRESHOLD: usize = 256;
-        let mut locks = self.settle_locks.lock().unwrap_or_else(|e| e.into_inner());
-        if locks.len() >= PRUNE_THRESHOLD {
-            prune_idle_settle_locks(&mut locks);
-        }
-        locks.entry(vkey.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
-    }
-
     /// Attach the shared transfer counters so completions record per-model consumed tokens
     /// and `used` ledger rows (builder form; keeps `new`/`with_store` signatures unchanged).
     pub fn with_stats(mut self, stats: Arc<crate::status::TransferStats>) -> Self {
@@ -2958,7 +3057,8 @@ impl ConsumerNode {
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
             settlement_chain: None,
-            settle_locks: Mutex::new(HashMap::new()),
+            settle_queues: Mutex::new(HashMap::new()),
+            settle_batch_refused: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             payment_refusals: Mutex::new(HashMap::new()),
             unavailable: Mutex::new(HashMap::new()),
@@ -5038,11 +5138,17 @@ impl ConsumerNode {
         }
     }
 
-    /// Fire the co-signed receipt for a completed request. Skips a provider that
-    /// advertised no usable public key; swallows all errors (trust settlement is
-    /// auxiliary to delivering the completion).
+    /// Settle a completed serve's co-signed receipt with its provider. Skips a provider that
+    /// advertised no usable public key; swallows all errors (trust settlement is auxiliary to
+    /// delivering the completion).
+    ///
+    /// G5: settlement is a *follow-up* round-trip to the provider, and `complete` emits the terminal
+    /// `Done`/`[DONE]` only after this returns, so nothing here waits on the network: the serve joins
+    /// its `(peer, model)` pair's queue, and one worker per pair settles what is queued, in order, a
+    /// batch at a time ([`ConsumerNode::settle_jobs`]). Credit is advisory, so a dropped settlement
+    /// never affects the completion.
     fn settle_receipt(self: &Arc<Self>, provider: &SelectedProvider, tokens: u64, nonce: [u8; 16], purpose: SettlePurpose) {
-        // Cheap up-front checks on the caller thread so an unkeyed provider costs no thread.
+        // Cheap up-front checks on the caller thread so an unkeyed provider costs nothing.
         let provider_pub = match hex::decode(&provider.public_key) {
             Ok(b) if b.len() == 32 => b,
             _ => return, // legacy / unkeyed provider — nothing to settle against
@@ -5051,24 +5157,12 @@ impl ConsumerNode {
             Ok(b) => b,
             Err(_) => return,
         };
-        // G5: settlement is a *follow-up* round-trip to the provider, and `complete` emits the
-        // terminal `Done`/`[DONE]` only after it returns. Run inline, it let a provider that
-        // served correctly but then black-holes the RECEIPT_REQUEST pin the consumer's response
-        // thread and withhold `[DONE]` for the full protocol timeout — a flood → unbounded
-        // parked threads. Move it fully off the response path (detached, like `maybe_audit`) and
-        // bound the transport with `SETTLE_TIMEOUT` so a dead provider can't park the thread
-        // indefinitely. Credit is advisory, so a dropped settlement never affects the completion.
-        let node = Arc::clone(self);
-        let provider_libp2p = provider.libp2p_peer_id.clone();
-        let model_id = provider.model_id.clone();
         // `canonical` is still carried in the receipt (records what the provider claimed, for future
         // fingerprint verification); `model_key` is the validated handle used for reputation + the
         // cost-weighted display credit (the identity the audit actually exercises — review H1/H3).
-        let canonical = provider.canonical_model_id.clone();
         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string();
         // The provider's 128-bit state id — keys the per-(peer, model) gated voucher + authenticity lookup.
         let peer_id = provider.state_id.clone();
-        let ledger_peer = provider.peer_id.clone();
         // The voucher is keyed by the provider's full public key — what the on-chain claim (and its
         // already-settled amount) is keyed by — not just its 64-bit OpenHydra id: two keys sharing an
         // id (a ~2^32 search) would otherwise share one running total, and each claim all of it
@@ -5079,166 +5173,314 @@ impl ConsumerNode {
         // On Base, by our wallet too: on-chain, what was paid so far is kept per wallet, so a new
         // wallet's running total starts from nothing (review round 3, S1).
         let vkey = format!("{}{}", voucher_key(&peer_id, &model_key, &provider_pub), self.voucher_scope());
-        // Review F1: serialize settlement for this `(peer, model)` across the whole
-        // read→co-sign→commit window (which spans a network round-trip), so concurrent settles to the
-        // same pair can't read the same base and emit non-monotonic / divergent co-signed cumulatives.
-        // Different pairs still settle in parallel. Taken here so its holders (the map's own
-        // reference aside) say how many settlements this pair already has running or queued.
-        let key_lock = node.settle_lock_for(&vkey);
-        let in_flight = node.settles_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let slot = SettleSlot(Arc::clone(&node.settles_in_flight));
-        if !settle_admitted(in_flight, Arc::strong_count(&key_lock).saturating_sub(2)) {
-            tracing::warn!(provider = %provider.peer_id, in_flight, tokens,
-                "too many settlements in flight; dropping this one (the serve stays unpaid)");
-            return;
+        let in_flight = self.settles_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let job = SettleJob {
+            provider_libp2p: provider.libp2p_peer_id.clone(),
+            provider_pub,
+            consumer_pub,
+            model_id: provider.model_id.clone(),
+            canonical: provider.canonical_model_id.clone(),
+            model_key,
+            peer_id,
+            ledger_peer: provider.peer_id.clone(),
+            tokens,
+            nonce,
+            purpose,
+            _slot: SettleSlot(Arc::clone(&self.settles_in_flight)),
+        };
+        // Review F1: a pair's settlements run one batch at a time (its worker), so its running total
+        // only ever rises in the order its receipts were signed. Different pairs settle in parallel.
+        let start_worker = {
+            let mut queues = self.settle_queues.lock().unwrap_or_else(|e| e.into_inner());
+            let queued = queues.get(&vkey).map(std::collections::VecDeque::len);
+            if !settle_admitted(in_flight, queued, queues.len()) {
+                drop(queues);
+                tracing::warn!(provider = %provider.peer_id, in_flight, tokens,
+                    "too many settlements in flight; dropping this one (the serve stays unpaid)");
+                return;
+            }
+            match queues.get_mut(&vkey) {
+                Some(queue) => {
+                    queue.push_back(job);
+                    false
+                }
+                None => {
+                    queues.insert(vkey.clone(), std::collections::VecDeque::from([job]));
+                    true
+                }
+            }
+        };
+        if start_worker {
+            let node = Arc::clone(self);
+            std::thread::spawn(move || node.run_settle_queue(vkey));
         }
-        std::thread::spawn(move || {
-            let _slot = slot;
-            let sign = |msg: &[u8]| node.net.sign(msg).unwrap_or_default();
+    }
+
+    /// A pair's settlement worker: settle what its queue holds, up to a batch at a time, until it is
+    /// empty, then retire (the next settlement for the pair starts a new one).
+    fn run_settle_queue(self: &Arc<Self>, vkey: String) {
+        // A worker that panics takes its queue with it, so the pair's next settlement starts afresh
+        // instead of queueing behind a worker that is gone.
+        struct Unjam<'a>(&'a ConsumerNode, &'a str);
+        impl Drop for Unjam<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.settle_queues.lock().unwrap_or_else(|e| e.into_inner()).remove(self.1);
+                }
+            }
+        }
+        let _unjam = Unjam(self, &vkey);
+        loop {
+            let batch: Vec<SettleJob> = {
+                let mut queues = self.settle_queues.lock().unwrap_or_else(|e| e.into_inner());
+                match queues.get_mut(&vkey) {
+                    Some(queue) if !queue.is_empty() => {
+                        let n = queue.len().min(crate::receipt::MAX_RECEIPT_BATCH);
+                        queue.drain(..n).collect()
+                    }
+                    _ => {
+                        queues.remove(&vkey);
+                        return;
+                    }
+                }
+            };
+            self.settle_jobs(&vkey, batch, None);
+        }
+    }
+
+    /// Settle `jobs` (one pair's, in the order they were queued): sign each receipt on top of the one
+    /// before it, send them together, and conclude each with the provider's answer. A receipt the
+    /// provider found behind its high-water is caught up on its own ([`Self::conclude_settlement`]);
+    /// the ones after it, which the provider never looked at, are signed again on the new base.
+    ///
+    /// `base` is what the first receipt builds on; `None` is [`Self::settle_base`].
+    fn settle_jobs(self: &Arc<Self>, vkey: &str, jobs: Vec<SettleJob>, base: Option<u64>) {
+        let Some(provider) = jobs.first().map(|j| j.provider_libp2p.clone()) else { return };
+        // Stamped once this batch's turn comes, not when its serves were queued: a receipt that
+        // waited behind others for its pair must still be fresh when the provider checks it.
+        let now = now_unix_ms();
+        // Built on the highest cumulative we ever signed for the pair (co-signed or not: anything
+        // signed can be claimed), so a lost reply or a lost voucher never shortchanges the provider.
+        let mut base = base.unwrap_or_else(|| self.settle_base(vkey));
+        let mut prepared = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let voucher = self.settle_voucher(&job, base, now);
+            match self.sign_settlement(&job, voucher, now) {
+                Ok(signed) => {
+                    let built_on = base;
+                    if let Some((_, cumulative)) = voucher {
+                        // Remembered before it is sent: once sent, it can be claimed.
+                        self.note_signed(vkey, cumulative);
+                        base = cumulative;
+                    }
+                    prepared.push(PreparedReceipt { job, base: built_on, voucher, signed });
+                }
+                Err(e) => tracing::warn!(provider = %job.ledger_peer, tokens = job.tokens, error = %e, "receipt not signed"),
+            }
+        }
+        let requests: Vec<&crate::receipt::SignedReceiptRequest> = prepared.iter().map(|p| &p.signed).collect();
+        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            self.net
+                .proxy_forward_timeout(provider.clone(), framed.to_vec(), SETTLE_TIMEOUT)
+                .map_err(AdapterError::Http)
+        };
+        let mut batches = !self.settle_batches_refused(&provider);
+        let redo_from = send_receipts(
+            &requests,
+            &mut transport,
+            &mut batches,
+            &SETTLE_RETRY_WAITS,
+            &mut std::thread::sleep,
+            &mut |i, outcome| self.conclude_settlement(vkey, &prepared[i], outcome, now),
+        );
+        if !batches {
+            if !self.settle_batches_refused(&provider) {
+                tracing::info!(provider = %provider, "provider predates receipt batches; settling its receipts one at a time");
+            }
+            self.note_settle_batches_refused(&provider);
+        }
+        tracing::debug!(provider = %provider, receipts = requests.len(), batched = batches && requests.len() > 1,
+            "receipts settled together");
+        drop(requests);
+        // Behind the provider's high-water, a batch stops at its first receipt (the provider answers
+        // in order and stops at a refusal), so the ones after it were never looked at. They are
+        // signed again on what the provider has now co-signed (the voucher, just caught up), not on
+        // the highest we signed: that includes these same serves, so building on it would pay them
+        // twice. The provider can claim at most what it holds signed, which stays below what is
+        // owed once these settle.
+        let redo: Vec<SettleJob> = prepared.into_iter().skip(redo_from).map(|p| p.job).collect();
+        if !redo.is_empty() {
+            self.settle_jobs(vkey, redo, Some(self.gated_cumulative_gross(vkey)));
+        }
+    }
+
+    /// The running total this serve's receipt carries when built on `base`, and its split (only with
+    /// a settlement peg configured, review F3): the serve's authenticity-gated amount on top of `base`.
+    /// No value moves.
+    fn settle_voucher(&self, job: &SettleJob, base: u64, now: u64) -> Option<(FeeSplit, u64)> {
+        self.settlement_peg.map(|peg| {
+            let split = self.gated_split_for(&job.peer_id, &job.model_key, job.tokens, now, peg);
+            (split, base.saturating_add(split.net_to_provider + split.protocol_fee))
+        })
+    }
+
+    /// Build and sign `job`'s receipt carrying `voucher` (and, on a settlement chain, its claim).
+    fn sign_settlement(&self, job: &SettleJob, voucher: Option<(FeeSplit, u64)>, now: u64) -> Result<crate::receipt::SignedReceiptRequest, AdapterError> {
+        let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
+        // On a settlement chain: the receipt's on-chain claim, valid for CLAIM_LIFETIME_SECS.
+        let chain = self.settlement_chain.as_ref();
+        let sign_claim = |claim: &openhydra_protocol::settlement::SettlementClaim| -> Vec<u8> {
+            use openhydra_protocol::settlement::ChainDomain;
+            match chain.map(|c| (&c.domain, c.evm_wallet.as_ref())) {
+                Some((d @ ChainDomain::Solana(_), _)) => self.net.sign(&d.claim_message(claim)).unwrap_or_default(),
+                Some((ChainDomain::Base(d), Some(wallet))) => {
+                    openhydra_protocol::settlement::sign_evm_claim(wallet, d, claim).to_vec()
+                }
+                _ => Vec::new(),
+            }
+        };
+        let expires_at = now / 1000 + openhydra_protocol::settlement::CLAIM_LIFETIME_SECS;
+        let claim_signer = chain.map(|_| {
+            (expires_at, &sign_claim as &dyn Fn(&openhydra_protocol::settlement::SettlementClaim) -> Vec<u8>)
+        });
+        crate::receipt::sign_receipt_request(
+            &sign,
+            &job.provider_pub,
+            &job.consumer_pub,
+            &job.model_id,
+            job.tokens,
+            job.nonce,
+            now,
+            &job.canonical,
+            voucher.map(|(_, cumulative)| cumulative),
+            // v5 denomination binding: when the crypto rail is on, stamp the asset (USDC today) + the
+            // exact peg used, so the provider co-signs — and can reject — the claim's units.
+            voucher.map(|_| SettlementAsset::Usdc),
+            self.settlement_peg,
+            claim_signer,
+        )
+    }
+
+    /// Sign `job`'s receipt carrying `voucher` and settle it on its own (retrying a failed round
+    /// trip).
+    fn settle_single(&self, vkey: &str, job: &SettleJob, voucher: Option<(FeeSplit, u64)>, now: u64) -> Result<openhydra_protocol::receipts::CoSignedReceipt, ReceiptFailure> {
+        let signed = self.sign_settlement(job, voucher, now)?;
+        if let Some((_, cumulative)) = voucher {
+            self.note_signed(vkey, cumulative);
+        }
+        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            self.net
+                .proxy_forward_timeout(job.provider_libp2p.clone(), framed.to_vec(), SETTLE_TIMEOUT)
+                .map_err(AdapterError::Http)
+        };
+        let mut outcome = None;
+        send_receipts(&[&signed], &mut transport, &mut false, &SETTLE_RETRY_WAITS, &mut std::thread::sleep, &mut |_, o| {
+            outcome = Some(o)
+        });
+        outcome.unwrap_or_else(|| Err(ReceiptFailure::Failed(AdapterError::Http("receipt not sent".into()))))
+    }
+
+    /// What follows the provider's answer to one receipt: catch up once to a receipt it holds
+    /// further along (behind its high-water), resend once in the oldest framing to a provider that
+    /// can't read the canonical id, then credit the provider for a co-signed one.
+    fn conclude_settlement(
+        &self,
+        vkey: &str,
+        prepared: &PreparedReceipt,
+        mut outcome: Result<openhydra_protocol::receipts::CoSignedReceipt, ReceiptFailure>,
+        now: u64,
+    ) {
+        let job = &prepared.job;
+        let mut voucher = prepared.voucher;
+        // Behind the provider's high-water: catch up to the receipt it sent back (ours, by its
+        // signature) and sign again on top of it — once.
+        let mut settled_earlier = false;
+        if let Err(ReceiptFailure::Behind(latest)) = &outcome {
+            let chain = self.settlement_chain.as_ref();
+            let signed_here = |l: &crate::receipt::LatestReceipt| signed_for_deployment(chain, l);
+            let cx = BehindContext {
+                consumer_pub: &job.consumer_pub,
+                provider_pub: &job.provider_pub,
+                model_id: &job.model_id,
+                nonce: &job.nonce,
+                base: prepared.base,
+                peg: self.settlement_peg,
+                signed_here: &signed_here,
+            };
+            match judge_behind_receipt(latest, &cx) {
+                BehindReceipt::ThisServe(c) => {
+                    self.raise_gated_voucher(vkey, c);
+                    settled_earlier = true;
+                }
+                BehindReceipt::Adopt(c) => {
+                    tracing::info!(provider = %job.peer_id, from = prepared.base, to = c,
+                        "settlement was behind the provider's last co-signed receipt; caught up");
+                    self.raise_gated_voucher(vkey, c);
+                    // On top of the provider's receipt, not of the one we just signed: that one
+                    // already holds this serve.
+                    voucher = self.settle_voucher(job, c, now);
+                    outcome = self.settle_single(vkey, job, voucher, now);
+                }
+                other => tracing::warn!(provider = %job.peer_id, ?other,
+                    "provider sent back a receipt this consumer can't adopt"),
+            }
+        }
+        // An older provider (v0.3.20) reads only the original framing, which can't carry the
+        // canonical id: a plain receipt it refused for its length is sent once more without it
+        // (round 8 X8-3).
+        let legacy_framing = matches!(&outcome, Err(ReceiptFailure::Failed(e)) if e.message().contains("length mismatch"));
+        if voucher.is_none() && self.settlement_chain.is_none() && !job.canonical.is_empty() && legacy_framing {
+            let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
             let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
-                node.net
-                    .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), SETTLE_TIMEOUT)
+                self.net
+                    .proxy_forward_timeout(job.provider_libp2p.clone(), framed.to_vec(), SETTLE_TIMEOUT)
                     .map_err(AdapterError::Http)
             };
-            let _settle_guard = key_lock.lock().unwrap_or_else(|e| e.into_inner());
-            // Stamped once this settlement's turn comes, not when it was queued: a receipt that
-            // waited behind others for its pair must still be fresh when the provider checks it.
-            let now = now_unix_ms();
-
-            // Crypto-rail (off-chain), only when a settlement peg is configured (review F3): compute
-            // this serve's authenticity-gated split and the resulting cumulative voucher amount
-            // (previous cumulative + this serve's gross), stamped BEFORE the consumer signs so both
-            // parties co-sign the same claim. The voucher is committed only after a successful
-            // co-sign, keeping it equal to the latest co-signed cumulative. No value moves.
-            // Built on the highest cumulative we ever signed for the pair (co-signed or not: anything
-            // signed can be claimed), so a lost reply or a lost voucher never shortchanges the provider.
-            let compute_voucher = |base: u64| {
-                node.settlement_peg.map(|peg| {
-                    let split = node.gated_split_for(&peer_id, &model_key, tokens, now, peg);
-                    (split, base.saturating_add(split.net_to_provider + split.protocol_fee))
-                })
-            };
-            // On a settlement chain: the receipt's on-chain claim, valid for CLAIM_LIFETIME_SECS.
-            let chain = node.settlement_chain.clone();
-            let sign_claim = |claim: &openhydra_protocol::settlement::SettlementClaim| -> Vec<u8> {
-                use openhydra_protocol::settlement::ChainDomain;
-                match chain.as_ref().map(|c| (&c.domain, c.evm_wallet.as_deref())) {
-                    Some((d @ ChainDomain::Solana(_), _)) => node.net.sign(&d.claim_message(claim)).unwrap_or_default(),
-                    Some((ChainDomain::Base(d), Some(wallet))) => {
-                        openhydra_protocol::settlement::sign_evm_claim(wallet, d, claim).to_vec()
-                    }
-                    _ => Vec::new(),
-                }
-            };
-            let expires_at = now / 1000 + openhydra_protocol::settlement::CLAIM_LIFETIME_SECS;
-            let claim_signer = chain.as_ref().map(|_| {
-                (expires_at, &sign_claim as &dyn Fn(&openhydra_protocol::settlement::SettlementClaim) -> Vec<u8>)
-            });
-            // Sent again (same receipt) when the round-trip fails or the provider asks us to retry.
-            let mut settle = |voucher: Option<(FeeSplit, u64)>| {
+            outcome = request_receipt(
+                &sign, &mut transport, &job.provider_pub, &job.consumer_pub, &job.model_id, job.tokens, job.nonce, now, "", None, None, None, None,
+            );
+        }
+        // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
+        // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
+        self.note_settled(&job.provider_libp2p, settled_earlier || outcome.is_ok());
+        match outcome {
+            _ if settled_earlier => {
+                self.record_contribution(&job.provider_libp2p, &job.peer_id, &job.model_key, job.tokens, &job.ledger_peer, &job.model_id, job.purpose);
+            }
+            Ok(receipt) => {
+                tracing::debug!(provider = %job.peer_id, tokens = job.tokens, cumulative = ?receipt.payload.cumulative_amount,
+                    "receipt co-signed");
+                self.record_contribution(&job.provider_libp2p, &job.peer_id, &job.model_key, job.tokens, &job.ledger_peer, &job.model_id, job.purpose);
                 if let Some((_, cumulative)) = voucher {
-                    node.note_signed(&vkey, cumulative);
-                }
-                let attempt = |transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>| request_receipt(
-                    &sign,
-                    transport,
-                    &provider_pub,
-                    &consumer_pub,
-                    &model_id,
-                    tokens,
-                    nonce,
-                    now,
-                    &canonical,
-                    voucher.map(|(_, cumulative)| cumulative),
-                    // v5 denomination binding: when the crypto rail is on, stamp the asset (USDC
-                    // today) + the exact peg used, so the provider co-signs — and can reject — the
-                    // claim's units.
-                    voucher.map(|_| SettlementAsset::Usdc),
-                    node.settlement_peg,
-                    claim_signer,
-                );
-                let mut outcome = attempt(&mut transport);
-                for wait in SETTLE_RETRY_WAITS {
-                    match &outcome {
-                        Err(ReceiptFailure::Failed(e)) if settle_retryable(e) => {
-                            std::thread::sleep(wait);
-                            outcome = attempt(&mut transport);
-                        }
-                        _ => break,
-                    }
-                }
-                outcome
-            };
-            let base = node.settle_base(&vkey);
-            let mut voucher = compute_voucher(base);
-            let mut outcome = settle(voucher);
-            // Behind the provider's high-water: catch up to the receipt it sent back (ours, by its
-            // signature) and sign again on top of it — once.
-            let mut settled_earlier = false;
-            if let Err(ReceiptFailure::Behind(latest)) = &outcome {
-                let signed_here = |l: &crate::receipt::LatestReceipt| signed_for_deployment(chain.as_ref(), l);
-                let cx = BehindContext {
-                    consumer_pub: &consumer_pub,
-                    provider_pub: &provider_pub,
-                    model_id: &model_id,
-                    nonce: &nonce,
-                    base,
-                    peg: node.settlement_peg,
-                    signed_here: &signed_here,
-                };
-                match judge_behind_receipt(latest, &cx) {
-                    BehindReceipt::ThisServe(c) => {
-                        node.raise_gated_voucher(&vkey, c);
-                        settled_earlier = true;
-                    }
-                    BehindReceipt::Adopt(c) => {
-                        tracing::info!(provider = %peer_id, from = base, to = c,
-                            "settlement was behind the provider's last co-signed receipt; caught up");
-                        node.raise_gated_voucher(&vkey, c);
-                        // On top of the provider's receipt, not of the one we just signed: that one
-                        // already holds this serve.
-                        voucher = compute_voucher(c);
-                        outcome = settle(voucher);
-                    }
-                    other => tracing::warn!(provider = %peer_id, ?other,
-                        "provider sent back a receipt this consumer can't adopt"),
+                    self.raise_gated_voucher(vkey, cumulative);
                 }
             }
-            // An older provider (v0.3.20) reads only the original framing, which can't carry the
-            // canonical id: a plain receipt it refused for its length is sent once more without it
-            // (round 8 X8-3).
-            let legacy_framing = |o: &Result<openhydra_protocol::receipts::CoSignedReceipt, ReceiptFailure>| {
-                matches!(o, Err(ReceiptFailure::Failed(e)) if e.message().contains("length mismatch"))
-            };
-            if voucher.is_none() && claim_signer.is_none() && !canonical.is_empty() && legacy_framing(&outcome) {
-                outcome = request_receipt(
-                    &sign, &mut transport, &provider_pub, &consumer_pub, &model_id, tokens, nonce, now, "", None, None, None, None,
-                );
+            Err(ReceiptFailure::Failed(e)) => {
+                tracing::warn!(provider = %job.peer_id, tokens = job.tokens, error = %e, "receipt not co-signed");
             }
-            // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
-            // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
-            node.note_settled(&provider_libp2p, settled_earlier || outcome.is_ok());
-            match outcome {
-                _ if settled_earlier => {
-                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id, purpose);
-                }
-                Ok(receipt) => {
-                    tracing::debug!(provider = %peer_id, tokens, cumulative = ?receipt.payload.cumulative_amount,
-                        "receipt co-signed");
-                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id, purpose);
-                    if let Some((_, cumulative)) = voucher {
-                        node.raise_gated_voucher(&vkey, cumulative);
-                    }
-                }
-                Err(ReceiptFailure::Failed(e)) => {
-                    tracing::warn!(provider = %peer_id, tokens, error = %e, "receipt not co-signed");
-                }
-                Err(ReceiptFailure::Behind(_)) if !settled_earlier => {
-                    tracing::warn!(provider = %peer_id, tokens, "receipt still behind the provider after catching up");
-                }
-                Err(ReceiptFailure::Behind(_)) => {}
+            Err(ReceiptFailure::Behind(_)) if !settled_earlier => {
+                tracing::warn!(provider = %job.peer_id, tokens = job.tokens, "receipt still behind the provider after catching up");
             }
-        });
+            Err(ReceiptFailure::Behind(_)) => {}
+        }
+    }
+
+    /// Whether `provider` answered a receipt batch as a provider that predates them, recently: its
+    /// receipts then go one at a time.
+    fn settle_batches_refused(&self, provider: &str) -> bool {
+        let map = self.settle_batch_refused.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(provider).is_some_and(|&until| now_unix_ms() < until)
+    }
+
+    fn note_settle_batches_refused(&self, provider: &str) {
+        let now = now_unix_ms();
+        let mut map = self.settle_batch_refused.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_SETTLE_BATCH_REFUSALS {
+            map.retain(|_, until| now < *until);
+        }
+        if map.contains_key(provider) || map.len() < MAX_SETTLE_BATCH_REFUSALS {
+            map.insert(provider.to_string(), now + SETTLE_BATCH_REFUSED_MS);
+        }
     }
 
     /// Record that a provider **served** us `tokens` (give-side, M2.3): the provider earns give/take
@@ -7217,35 +7459,264 @@ mod tests {
     }
 
     #[test]
-    fn settlements_are_bounded_overall_and_per_pair() {
-        assert!(settle_admitted(0, 0));
-        assert!(settle_admitted(MAX_SETTLES_IN_FLIGHT - 1, MAX_SETTLES_PER_PAIR - 1));
-        assert!(!settle_admitted(MAX_SETTLES_IN_FLIGHT, 0), "the global cap");
-        assert!(!settle_admitted(0, MAX_SETTLES_PER_PAIR), "a pair already queued deep enough");
+    fn settlements_are_bounded_overall_per_pair_and_in_workers() {
+        assert!(settle_admitted(0, None, 0), "the first settlement for a pair starts its worker");
+        assert!(settle_admitted(0, Some(0), 1));
+        assert!(settle_admitted(MAX_SETTLES_IN_FLIGHT - 1, Some(MAX_SETTLES_PER_PAIR - 1), MAX_SETTLE_WORKERS));
+        assert!(!settle_admitted(MAX_SETTLES_IN_FLIGHT, Some(0), 1), "the global cap");
+        assert!(!settle_admitted(0, Some(MAX_SETTLES_PER_PAIR), 1), "a pair already queued deep enough");
+        assert!(!settle_admitted(0, None, MAX_SETTLE_WORKERS), "no new worker past the cap");
+        assert!(settle_admitted(0, Some(5), MAX_SETTLE_WORKERS), "a pair with a worker still queues");
         // The slot gives its place back however the settlement ends.
         let n = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         drop(SettleSlot(Arc::clone(&n)));
         assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
+    /// An in-process provider for settlement tests, holding to the rules a real one does: a receipt
+    /// settles a recorded serve once, its running total never falls behind the last one co-signed
+    /// (behind → the latest receipt goes back), the same request bytes get the same answer from its
+    /// replay cache, and settlements are answered in order, a batch stopping at the first refusal.
+    struct SimProvider {
+        key: ed25519_dalek::SigningKey,
+        commitments: std::cell::RefCell<std::collections::HashSet<[u8; 16]>>,
+        last: std::cell::RefCell<Option<openhydra_protocol::receipts::CoSignedReceipt>>,
+        replies: std::cell::RefCell<HashMap<Vec<u8>, Vec<u8>>>,
+        /// Nonces whose first settlement is answered "rate limited, retry".
+        rate_limit_once: std::cell::RefCell<std::collections::HashSet<[u8; 16]>>,
+        /// Whether it predates batches.
+        old: bool,
+        /// Messages it received.
+        messages: std::cell::Cell<usize>,
+        /// Settle the next message, then lose its reply (once).
+        lose_next_reply: std::cell::Cell<bool>,
+    }
+
+    impl SimProvider {
+        fn new(old: bool, nonces: impl IntoIterator<Item = [u8; 16]>) -> Self {
+            Self {
+                key: ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+                commitments: std::cell::RefCell::new(nonces.into_iter().collect()),
+                last: std::cell::RefCell::new(None),
+                replies: std::cell::RefCell::new(HashMap::new()),
+                rate_limit_once: std::cell::RefCell::new(Default::default()),
+                old,
+                messages: std::cell::Cell::new(0),
+                lose_next_reply: std::cell::Cell::new(false),
+            }
+        }
+
+        fn public(&self) -> [u8; 32] {
+            self.key.verifying_key().to_bytes()
+        }
+
+        fn last_cumulative(&self) -> Option<u64> {
+            self.last.borrow().as_ref().and_then(|r| r.payload.cumulative_amount)
+        }
+
+        fn settle_one(&self, request: &[u8]) -> Vec<u8> {
+            use crate::receipt::{handle_receipt_inbound, BindRejection, LatestReceipt};
+            if let Some(reply) = self.replies.borrow().get(request) {
+                return reply.clone();
+            }
+            let sign = |m: &[u8]| ed25519_dalek::Signer::sign(&self.key, m).to_bytes().to_vec();
+            let bind = |p: &openhydra_protocol::receipts::ReceiptPayload, _: Option<&crate::receipt::ClaimSig>| {
+                if self.rate_limit_once.borrow_mut().remove(&p.nonce) {
+                    return Err(BindRejection::Reject("receipt rate limited, retry".into()));
+                }
+                if let Some(last) = self.last.borrow().as_ref() {
+                    if p.cumulative_amount < last.payload.cumulative_amount {
+                        return Err(BindRejection::Behind(Box::new(LatestReceipt { receipt: last.clone(), claim: None })));
+                    }
+                }
+                if !self.commitments.borrow_mut().remove(&p.nonce) {
+                    return Err(BindRejection::Reject("no serve commitment for this nonce".into()));
+                }
+                Ok(())
+            };
+            let (reply, accepted) = handle_receipt_inbound(request, &sign, &self.public(), &bind);
+            if let Some(receipt) = accepted {
+                *self.last.borrow_mut() = Some(receipt);
+                self.replies.borrow_mut().insert(request.to_vec(), reply.clone());
+            }
+            reply
+        }
+
+        fn transport(&self) -> impl FnMut(&[u8]) -> Result<Vec<u8>, AdapterError> + '_ {
+            move |message: &[u8]| {
+                self.messages.set(self.messages.get() + 1);
+                let reply = match message.first() {
+                    Some(&crate::receipt::RECEIPT_REQUEST) => self.settle_one(message),
+                    Some(&crate::receipt::RECEIPT_BATCH) if !self.old => {
+                        crate::receipt::handle_receipt_batch(message, &mut |r: &[u8]| self.settle_one(r))
+                    }
+                    // What a provider that predates batches answers: an "unsupported method" error frame.
+                    _ => crate::serve::frame_response(&[crate::serve::ServeChunk::Error("unsupported method".into()).encode()]),
+                };
+                if self.lose_next_reply.replace(false) {
+                    return Err(AdapterError::Http("timed out".into()));
+                }
+                Ok(reply)
+            }
+        }
+    }
+
+    /// `n` receipts from one consumer, each built on the one before (amounts 10 each, from `base`).
+    fn chained_receipts(provider: &SimProvider, base: u64, nonces: &[[u8; 16]]) -> Vec<crate::receipt::SignedReceiptRequest> {
+        let consumer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let sign = |m: &[u8]| ed25519_dalek::Signer::sign(&consumer, m).to_bytes().to_vec();
+        nonces
+            .iter()
+            .enumerate()
+            .map(|(i, nonce)| {
+                crate::receipt::sign_receipt_request(
+                    &sign,
+                    &provider.public(),
+                    &consumer.verifying_key().to_bytes(),
+                    "m",
+                    10,
+                    *nonce,
+                    1_700_000_000_000,
+                    "",
+                    Some(base + 10 * (i as u64 + 1)),
+                    Some(SettlementAsset::Usdc),
+                    Some(1_000),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn nonces(n: usize) -> Vec<[u8; 16]> {
+        (0..n).map(|i| { let mut b = [0u8; 16]; b[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes()); b }).collect()
+    }
+
+    /// What `send_receipts` concluded for each receipt: co-signed, behind, or refused (with why).
+    fn settle_all(
+        provider: &SimProvider,
+        requests: &[crate::receipt::SignedReceiptRequest],
+        batches: &mut bool,
+    ) -> (usize, Vec<Option<Result<u64, String>>>, Vec<Duration>) {
+        let refs: Vec<&crate::receipt::SignedReceiptRequest> = requests.iter().collect();
+        let mut outcomes = vec![None; requests.len()];
+        let mut slept = Vec::new();
+        let mut transport = provider.transport();
+        let redo = send_receipts(&refs, &mut transport, batches, &SETTLE_RETRY_WAITS, &mut |d| slept.push(d), &mut |i, o| {
+            assert!(outcomes[i].is_none(), "each receipt concludes once");
+            outcomes[i] = Some(match o {
+                Ok(r) => Ok(r.payload.cumulative_amount.unwrap()),
+                Err(ReceiptFailure::Behind(_)) => Err("behind".to_string()),
+                Err(ReceiptFailure::Failed(e)) => Err(e.to_string()),
+            });
+        });
+        (redo, outcomes, slept)
+    }
+
     #[test]
-    fn prune_idle_settle_locks_evicts_only_unheld_entries() {
-        // F1 follow-up: the settlement-lock map must stay bounded. An idle pair (only the map holds
-        // its Arc) is evicted; a pair with an in-flight settle (an extra Arc clone alive, as
-        // `settle_receipt` captures before locking) is retained so serialization is never broken.
-        let mut locks: HashMap<String, Arc<Mutex<()>>> = HashMap::new();
-        locks.insert("idle-a".to_string(), Arc::new(Mutex::new(())));
-        locks.insert("idle-b".to_string(), Arc::new(Mutex::new(())));
-        let held = Arc::new(Mutex::new(()));
-        locks.insert("busy".to_string(), held.clone()); // an in-flight settle holds this clone
+    fn a_full_batch_of_receipts_settles_in_one_round_trip() {
+        let n = nonces(crate::receipt::MAX_RECEIPT_BATCH);
+        let provider = SimProvider::new(false, n.clone());
+        let requests = chained_receipts(&provider, 0, &n);
+        let mut batches = true;
+        let (redo, outcomes, slept) = settle_all(&provider, &requests, &mut batches);
+        assert_eq!(redo, n.len());
+        assert_eq!(provider.messages.get(), 1, "one message for all of them");
+        assert!(outcomes.iter().enumerate().all(|(i, o)| o == &Some(Ok(10 * (i as u64 + 1)))), "{outcomes:?}");
+        assert_eq!(provider.last_cumulative(), Some(10 * n.len() as u64));
+        assert!(slept.is_empty() && batches);
+    }
 
-        prune_idle_settle_locks(&mut locks);
+    #[test]
+    fn a_provider_that_predates_batches_gets_the_same_receipts_one_at_a_time() {
+        let n = nonces(5);
+        let provider = SimProvider::new(true, n.clone());
+        let requests = chained_receipts(&provider, 0, &n);
+        let mut batches = true;
+        let (_, outcomes, slept) = settle_all(&provider, &requests, &mut batches);
+        assert!(!batches, "remembered: its receipts go one at a time");
+        assert_eq!(provider.messages.get(), 1 + 5, "the refused batch, then one each");
+        assert!(outcomes.iter().all(|o| matches!(o, Some(Ok(_)))), "{outcomes:?}");
+        assert_eq!(provider.last_cumulative(), Some(50));
+        assert!(slept.is_empty(), "a batch it can't read isn't a failure to wait out");
+    }
 
-        assert!(locks.contains_key("busy"), "a pair with an in-flight settle is never evicted");
-        assert!(!locks.contains_key("idle-a"), "idle entries are swept");
-        assert!(!locks.contains_key("idle-b"));
-        assert_eq!(locks.len(), 1);
-        drop(held);
+    #[test]
+    fn a_lost_reply_is_answered_again_from_the_same_bytes() {
+        let n = nonces(10);
+        let provider = SimProvider::new(false, n.clone());
+        provider.lose_next_reply.set(true); // settled, but the reply never arrives
+        let requests = chained_receipts(&provider, 0, &n);
+        let (_, outcomes, slept) = settle_all(&provider, &requests, &mut true);
+        // Had the retry been signed again, its serves' commitments (spent) would have refused it.
+        assert!(outcomes.iter().all(|o| matches!(o, Some(Ok(_)))), "{outcomes:?}");
+        assert_eq!(slept, vec![SETTLE_RETRY_WAITS[0]]);
+        assert_eq!(provider.messages.get(), 2);
+    }
+
+    #[test]
+    fn a_rate_limited_receipt_is_sent_again_with_the_ones_after_it() {
+        let n = nonces(6);
+        let provider = SimProvider::new(false, n.clone());
+        provider.rate_limit_once.borrow_mut().insert(n[2]);
+        let requests = chained_receipts(&provider, 0, &n);
+        let (_, outcomes, slept) = settle_all(&provider, &requests, &mut true);
+        assert!(outcomes.iter().enumerate().all(|(i, o)| o == &Some(Ok(10 * (i as u64 + 1)))), "{outcomes:?}");
+        assert_eq!(slept, vec![SETTLE_RETRY_WAITS[0]]);
+        assert_eq!(provider.messages.get(), 2, "the batch stopped at the third; the rest went again together");
+        assert_eq!(provider.last_cumulative(), Some(60));
+    }
+
+    #[test]
+    fn a_refused_receipt_doesnt_hold_up_the_ones_after_it() {
+        let n = nonces(4);
+        // The second serve's commitment is unknown to the provider (expired, say).
+        let provider = SimProvider::new(false, [n[0], n[2], n[3]]);
+        let requests = chained_receipts(&provider, 0, &n);
+        let (_, outcomes, slept) = settle_all(&provider, &requests, &mut true);
+        assert_eq!(outcomes[0], Some(Ok(10)));
+        assert!(matches!(&outcomes[1], Some(Err(e)) if e.contains("no serve commitment")), "{outcomes:?}");
+        assert_eq!(outcomes[2], Some(Ok(30)));
+        assert_eq!(outcomes[3], Some(Ok(40)));
+        assert!(slept.is_empty(), "a considered refusal isn't retried");
+    }
+
+    #[test]
+    fn behind_the_providers_high_water_the_rest_are_left_to_sign_again() {
+        let earlier = nonces(1);
+        let n: Vec<[u8; 16]> = nonces(4).into_iter().skip(1).collect();
+        let provider = SimProvider::new(false, earlier.iter().chain(n.iter()).copied());
+        // The provider co-signed a receipt at 1000 whose reply this consumer never got.
+        let (_, first, _) = settle_all(&provider, &chained_receipts(&provider, 990, &earlier), &mut true);
+        assert_eq!(first, vec![Some(Ok(1000))]);
+        let requests = chained_receipts(&provider, 0, &n);
+        let (redo, outcomes, _) = settle_all(&provider, &requests, &mut true);
+        assert_eq!(redo, 1, "the ones after it start over");
+        assert_eq!(outcomes[0], Some(Err("behind".into())));
+        assert!(outcomes[1..].iter().all(Option::is_none));
+        assert_eq!(provider.last_cumulative(), Some(1000));
+    }
+
+    #[test]
+    fn an_unreachable_provider_fails_the_batch_after_the_waits() {
+        let n = nonces(3);
+        let provider = SimProvider::new(false, n.clone());
+        let requests = chained_receipts(&provider, 0, &n);
+        let refs: Vec<&crate::receipt::SignedReceiptRequest> = requests.iter().collect();
+        let mut sent = 0;
+        let mut transport = |_: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            sent += 1;
+            Err(AdapterError::Http("no route".into()))
+        };
+        let mut slept = Vec::new();
+        let mut failed = Vec::new();
+        let redo = send_receipts(&refs, &mut transport, &mut true, &SETTLE_RETRY_WAITS, &mut |d| slept.push(d), &mut |i, o| {
+            failed.push((i, matches!(o, Err(ReceiptFailure::Failed(_)))))
+        });
+        assert_eq!(redo, 3);
+        assert_eq!(sent, 1 + SETTLE_RETRY_WAITS.len());
+        assert_eq!(slept, SETTLE_RETRY_WAITS.to_vec());
+        assert_eq!(failed, vec![(0, true), (1, true), (2, true)]);
     }
 
     /// A canned engine: emits fixed deltas (or fails).
