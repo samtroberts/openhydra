@@ -2174,10 +2174,23 @@ pub struct AutoCandidates {
     pub providers: Vec<openhydra_network::types::KnownProvider>,
     /// This machine's own provider (libp2p id), when it also serves.
     pub self_provider: Option<String>,
-    /// Models of imported, valid `.openhydra` cards.
+    /// Models of the imported, valid `.openhydra` cards this node can use: public cards, and private
+    /// cards of a swarm it holds a credential for (a private card of another swarm can't serve it).
+    /// For a swarm member ([`Self::swarm_only`]), the private ones only: a public card's provider is
+    /// on the public network.
     pub card_models: Vec<String>,
     /// The providers (libp2p ids) of those cards, by model.
     pub card_providers: HashMap<String, std::collections::HashSet<String>>,
+    /// The models of the usable private cards alone (the user's swarms): where a tool request goes
+    /// when this machine's own models are too small for it.
+    pub swarm_card_models: Vec<String>,
+    /// The caller is a member of a private swarm (holds a live membership credential) on the public
+    /// network: `auto` stays inside the swarm (this machine, the swarm's cards) and never falls
+    /// back to the public network (Sam, 11 Nov).
+    pub swarm_only: bool,
+    /// On a keyed private network: every provider is the organisation's, so the network's steps
+    /// count as the swarm.
+    pub private_network: bool,
     /// Reputation this node has earned with a provider on a model, decayed to now, keyed by
     /// (provider libp2p id, model id). Only pairs with history appear.
     pub earned: HashMap<(String, String), f64>,
@@ -3564,8 +3577,21 @@ impl ConsumerNode {
         requested: Option<AuthenticityTier>,
         now: u64,
     ) -> AutoCandidates {
-        let cards = self.cards.as_ref().map(|c| c.valid_cards(now)).unwrap_or_default();
+        let private_network = openhydra_network::transport::private_network_key().is_some();
+        let swarm_only = !private_network && self.creds.as_ref().is_some_and(|c| c.credential_for(now).is_some());
+        let member = |swarm: &str| self.creds.as_ref().is_some_and(|c| c.credential_for_swarm(swarm, now).is_some());
+        // Usable cards only (a private card of a swarm this node isn't in can't serve it); a swarm
+        // member's `auto` uses its swarms' private cards alone.
+        let cards: Vec<_> = self
+            .cards
+            .as_ref()
+            .map(|c| c.valid_cards(now))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|card| if card.swarm_public_key.is_empty() { !swarm_only } else { member(&card.swarm_public_key) })
+            .collect();
         let card_models = cards.iter().map(|card| card.model_id.clone()).collect();
+        let swarm_card_models = cards.iter().filter(|card| !card.swarm_public_key.is_empty()).map(|card| card.model_id.clone()).collect();
         let mut card_providers: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
         for card in cards {
             card_providers.entry(card.model_id).or_default().insert(card.libp2p_peer_id);
@@ -3598,7 +3624,19 @@ impl ConsumerNode {
         let policy = request_policy(self.assurance, requested);
         let floor = (policy.mode == PolicyMode::HardGate && policy.min_authenticity > AuthenticityTier::SelfReported)
             .then_some(policy.min_authenticity);
-        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, card_providers, earned, tiers, floor, seeds: self.seed_keys() }
+        AutoCandidates {
+            providers,
+            self_provider: self.self_provider.clone(),
+            card_models,
+            card_providers,
+            swarm_card_models,
+            swarm_only,
+            private_network,
+            earned,
+            tiers,
+            floor,
+            seeds: self.seed_keys(),
+        }
     }
 
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
@@ -7951,6 +7989,56 @@ mod tests {
         assert_eq!(ServedOn::PrivateNetwork.phrase().as_deref(), Some("in the private network"));
         assert_eq!(ServedOn::HostedApi("Anthropic".into()).phrase().as_deref(), Some("on Anthropic's hosted API"));
         assert_eq!(ServedOn::Unknown.key(), None, "provider-side: nothing shown");
+    }
+
+    /// What `auto` may draw on from imported cards: a non-member gets the public cards (never a
+    /// private card of a swarm it isn't in); a swarm member gets its swarms' private cards only,
+    /// and is marked swarm-only (no public fallback).
+    #[test]
+    fn auto_candidates_follow_swarm_membership() {
+        use openhydra_network::card::{sign_card, PricingMode};
+        let (dir, node) = test_node();
+        let provider = openhydra_network::identity::Identity::load_or_create(&dir.path().join("provider.key")).unwrap();
+        let owner_dir = dir.path().join("owner-swarms");
+        let acme = crate::swarms::create_swarm(&owner_dir, "Acme", 1_000).unwrap();
+        let other = crate::swarms::create_swarm(&owner_dir, "Other", 1_000).unwrap();
+        let now = now_unix_ms();
+        let detected = |m: &str| crate::adapter::DetectedModel {
+            engine_ref: m.into(), canonical_id: String::new(), family: String::new(), params: String::new(),
+            quant: String::new(), size_bytes: 0, weight_digest: String::new(),
+        };
+        let card = |m: &str, swarm: Option<String>| {
+            sign_card(crate::cards::build_card(&detected(m), m, &provider.openhydra_peer_id, now, 3_600, PricingMode::Reciprocal, None, swarm), &provider.keypair).unwrap()
+        };
+        let cards_path = dir.path().join("cards.json");
+        crate::cards::add_card(&cards_path, &card("public-model", None)).unwrap();
+        crate::cards::add_card(&cards_path, &card("acme-model", Some(acme.swarm_public_key.clone()))).unwrap();
+        crate::cards::add_card(&cards_path, &card("other-model", Some(other.swarm_public_key.clone()))).unwrap();
+        let sorted = |mut v: Vec<String>| { v.sort(); v };
+
+        // Not a member of anything.
+        let (_d, outsider) = test_node();
+        let outsider = outsider.with_cards(Some(crate::cards::CardStore::new(cards_path.clone())));
+        let c = outsider.auto_candidates_from(vec![], None, now);
+        assert!(!c.swarm_only);
+        assert_eq!(c.card_models, vec!["public-model".to_string()], "no private card it can't use");
+        assert!(c.swarm_card_models.is_empty());
+
+        // A member of Acme (enrolled before the store first reads the folder).
+        let member_dir = dir.path().join("member-swarms");
+        let member = openhydra_network::identity::Identity::load_or_create(&dir.path().join("member.key")).unwrap();
+        let req = crate::swarms::build_enrollment_request(&member, &acme.swarm_public_key, "me", now).unwrap();
+        let approved = crate::swarms::approve_member(&owner_dir, &acme.swarm_public_key, &req.magnet, "me", 3_600_000, now).unwrap();
+        crate::swarms::accept_credential(&member_dir, &member, &approved.magnet, "", now).unwrap();
+        let node = node
+            .with_cards(Some(crate::cards::CardStore::new(cards_path)))
+            .with_credentials(Some(crate::swarms::CredentialStore::new(member_dir)));
+        let c = node.auto_candidates_from(vec![], None, now);
+        assert!(c.swarm_only, "a member's auto stays in its swarm");
+        assert!(!c.private_network);
+        assert_eq!(sorted(c.card_models), vec!["acme-model".to_string()], "its swarm's card only: no public card, no other swarm's");
+        assert_eq!(c.swarm_card_models, vec!["acme-model".to_string()]);
+        assert_eq!(c.card_providers.len(), 1);
     }
 
     /// An owner-chosen swarm name, as `/model` and the app show it.

@@ -387,6 +387,9 @@ enum AutoMiss {
     /// The request offers tools and every model a trusted source serves is too small for them
     /// (sorted, deduplicated).
     TooSmallForTools(Vec<String>),
+    /// A swarm member's `auto` found nothing on this machine or in its swarms, and doesn't look on
+    /// the public network.
+    NothingInSwarm,
 }
 
 /// Too small to call tools reliably: a model whose name gives its size as 4B parameters or fewer
@@ -444,8 +447,13 @@ fn pick_auto(
         .map(String::as_str)
         .filter(|m| is_valid_model_id(m) && (c.floor.is_none() || served(m)))
         .collect();
+    let own_serves = |m: &str| {
+        c.self_provider.as_deref().is_some_and(|me| providers.iter().any(|k| k.libp2p_peer_id == me && k.model_id == m))
+    };
     if let Some(p) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
-        if cards.contains(p) || served(p) {
+        // A swarm member's preference counts only where the swarm reaches (this machine, its cards).
+        let reachable = if c.swarm_only { cards.contains(p) || own_serves(p) } else { cards.contains(p) || served(p) };
+        if reachable {
             return Ok((p.to_string(), AutoStep::Preferred));
         }
     }
@@ -471,17 +479,42 @@ fn pick_auto(
         }
         out.map(|(_, _, m)| m)
     }
-    // This machine's own models aren't held to the tools size rule: like the preferred model, the
-    // user chose to run them, and skipping them would send their code to someone else's machine.
+    // This machine first. For a request that offers tools, a model of its that is big enough for
+    // them; when all of them are too small, a fitting model inside the user's private world comes
+    // first (a swarm's card; on a keyed network, any of the organisation's providers), and this
+    // machine's best model after all only when there is none: a tool request never goes to the
+    // public network just because this machine's model is small (Sam, 11 Nov).
+    let mut own_fallback: Option<&str> = None;
     if let Some(me) = c.self_provider.as_deref().filter(|s| !s.is_empty()) {
         let own: Vec<&str> = providers.iter().filter(|k| k.libp2p_peer_id == me).map(|k| k.model_id.as_str()).collect();
-        if let Some(m) = best(own.into_iter().map(|m| ((), m))) {
+        let fitting: Vec<&str> = own.iter().copied().filter(|m| !(needs.tools && too_small_for_tools(m))).collect();
+        if let Some(m) = best(fitting.into_iter().map(|m| ((), m))) {
             return Ok((m.to_string(), AutoStep::OwnMachine));
+        }
+        own_fallback = best(own.into_iter().map(|m| ((), m)));
+    }
+    if let Some(small) = own_fallback {
+        // Only a tool request reaches here with own models (all too small for it).
+        let swarm_cards: Vec<&str> = c
+            .swarm_card_models
+            .iter()
+            .map(String::as_str)
+            .filter(|m| cards.contains(m) && !too_small_for_tools(m))
+            .collect();
+        if let Some(m) = best(swarm_cards.into_iter().map(|m| ((), m))) {
+            return Ok((m.to_string(), AutoStep::Card));
+        }
+        if !c.private_network {
+            return Ok((small.to_string(), AutoStep::OwnMachine));
         }
     }
     let carded: Vec<&str> = cards.iter().copied().filter(|m| fits(m)).collect();
     if let Some(m) = best(carded.into_iter().map(|m| ((), m))) {
         return Ok((m.to_string(), AutoStep::Card));
+    }
+    // A swarm member's `auto` never looks past its swarms (the steps below are the public network).
+    if c.swarm_only {
+        return Err(if too_small.is_empty() { AutoMiss::NothingInSwarm } else { AutoMiss::TooSmallForTools(too_small.into_iter().collect()) });
     }
     let neutral = openhydra_protocol::verify::NEUTRAL_REPUTATION;
     let reputed: Vec<(f64, &str)> = providers
@@ -508,6 +541,11 @@ fn pick_auto(
         .collect();
     if let Some(m) = best(seeded.into_iter().map(|m| ((), m))) {
         return Ok((m.to_string(), AutoStep::Seed));
+    }
+    // On a keyed network, a tool request with only too-small own models found nothing bigger among
+    // the organisation's providers: this machine's after all.
+    if let Some(small) = own_fallback {
+        return Ok((small.to_string(), AutoStep::OwnMachine));
     }
     if too_small.is_empty() {
         Err(AutoMiss::Nothing)
@@ -540,7 +578,16 @@ fn auto_providers(c: &crate::consumer::AutoCandidates, model: &str, step: AutoSt
     let of_model = c.providers.iter().filter(|k| k.model_id == model && c.floor.is_none_or(|f| tier_of(k) >= f));
     let neutral = openhydra_protocol::verify::NEUTRAL_REPUTATION;
     let ids: std::collections::HashSet<String> = match step {
-        AutoStep::Preferred => return None,
+        // The operator named it: any provider of it, except for a swarm member, whose request
+        // stays on this machine or with its swarm's card providers.
+        AutoStep::Preferred if !c.swarm_only => return None,
+        AutoStep::Preferred => {
+            let mut ids: std::collections::HashSet<String> = c.card_providers.get(model).cloned().unwrap_or_default();
+            if let Some(me) = c.self_provider.as_ref().filter(|me| c.providers.iter().any(|k| &k.libp2p_peer_id == *me && k.model_id == model)) {
+                ids.insert(me.clone());
+            }
+            ids
+        }
         AutoStep::OwnMachine => c.self_provider.iter().cloned().collect(),
         AutoStep::Card => c.card_providers.get(model).cloned().unwrap_or_default(),
         AutoStep::Reputation => of_model
@@ -564,6 +611,11 @@ fn auto_providers(c: &crate::consumer::AutoCandidates, model: &str, step: AutoSt
 pub(crate) fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
     pick_auto(c, preferred, AutoNeeds::default()).ok().map(|(m, _)| m)
 }
+
+/// The reply when a swarm member's `auto` found nothing on this machine or in its swarms.
+const NOTHING_IN_SWARM: &str = "openhydra/auto stays inside your private swarm, and found no model there: none \
+    on this machine and none from your swarm's cards. Share a model from this machine, ask your swarm \
+    to share one, or name a model to choose it yourself.";
 
 /// The reply when every model `auto` trusts is too small for a request's tools.
 fn too_small_for_tools_message(models: &[String]) -> String {
@@ -717,6 +769,7 @@ async fn resolve_model(
         }
         Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
         Err(AutoMiss::TooSmallForTools(small)) => Err(too_small_for_tools_message(&small)),
+        Err(AutoMiss::NothingInSwarm) => Err(NOTHING_IN_SWARM.to_string()),
     }
 }
 
@@ -3110,6 +3163,84 @@ mod tests {
 
     fn cands(providers: Vec<openhydra_network::types::KnownProvider>) -> crate::consumer::AutoCandidates {
         crate::consumer::AutoCandidates { providers, ..Default::default() }
+    }
+
+    /// A tool request: this machine first when its model is big enough; when this machine's
+    /// models are all too small, a fitting model from the user's swarm; else this machine's after
+    /// all, never the public network (Sam, 11 Nov).
+    #[test]
+    fn a_tool_request_falls_back_from_a_tiny_own_model_to_the_swarm_never_to_the_public() {
+        let tools = AutoNeeds { tools: true };
+        let pick = |c: &crate::consumer::AutoCandidates, n: AutoNeeds| pick_auto(c, None, n).map(|(m, s)| (m, s));
+        let mut c = cands(vec![
+            kp("qwen2.5:0.5b", "me", "12D3Me"),
+            kp("qwen2.5-coder:32b", "s", "12D3Swarm"),
+            kp("llama3.1:70b", "pub", "12D3Pub"),
+        ]);
+        c.self_provider = Some("12D3Me".into());
+        c.tiers.insert(("12D3Pub".into(), "llama3.1:70b".into()), openhydra_protocol::trust::AuthenticityTier::HardwareAttested);
+        // Not a tool request: this machine, however small.
+        assert_eq!(pick(&c, AutoNeeds::default()), Ok(("qwen2.5:0.5b".into(), AutoStep::OwnMachine)));
+        // A tool request, no swarm: this machine's small model still, not the public 70b.
+        assert_eq!(pick(&c, tools), Ok(("qwen2.5:0.5b".into(), AutoStep::OwnMachine)));
+        // A swarm card with a model big enough: the swarm.
+        c.card_models = vec!["qwen2.5-coder:32b".into()];
+        c.swarm_card_models = vec!["qwen2.5-coder:32b".into()];
+        c.card_providers.insert("qwen2.5-coder:32b".into(), ["12D3Swarm".to_string()].into());
+        assert_eq!(pick(&c, tools), Ok(("qwen2.5-coder:32b".into(), AutoStep::Card)));
+        assert_eq!(auto_providers(&c, "qwen2.5-coder:32b", AutoStep::Card), Some(["12D3Swarm".to_string()].into()));
+        // A public card's model never takes a tool request off this machine.
+        c.swarm_card_models.clear();
+        assert_eq!(pick(&c, tools), Ok(("qwen2.5:0.5b".into(), AutoStep::OwnMachine)));
+        // This machine has a big enough model: it stays here.
+        c.providers.push(kp("qwen2.5-coder:14b", "me", "12D3Me"));
+        c.swarm_card_models = vec!["qwen2.5-coder:32b".into()];
+        assert_eq!(pick(&c, tools), Ok(("qwen2.5-coder:14b".into(), AutoStep::OwnMachine)));
+    }
+
+    /// A swarm member's `auto` stays inside the swarm: this machine, then the swarm's cards, and
+    /// never the public network's reputation, verified or seed providers.
+    #[test]
+    fn a_swarm_members_auto_never_falls_back_to_the_public_network() {
+        use openhydra_protocol::trust::AuthenticityTier::*;
+        let mut c = cands(vec![kp("llama3.1:70b", "pub", "12D3Pub"), kp("qwen3:8b", "s", "12D3Swarm")]);
+        c.tiers.insert(("12D3Pub".into(), "llama3.1:70b".into()), HardwareAttested);
+        c.earned.insert(("12D3Pub".into(), "llama3.1:70b".into()), 90.0);
+        // Not a member: the public network's verified provider is fair game.
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("llama3.1:70b"));
+        // A member with nothing on this machine or in its swarm: refused, not sent to the public.
+        c.swarm_only = true;
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Err(AutoMiss::NothingInSwarm));
+        // The swarm's card serves: that.
+        c.card_models = vec!["qwen3:8b".into()];
+        c.swarm_card_models = vec!["qwen3:8b".into()];
+        c.card_providers.insert("qwen3:8b".into(), ["12D3Swarm".to_string()].into());
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Ok(("qwen3:8b".into(), AutoStep::Card)));
+        // The operator's preference counts only inside the swarm, and goes only to its providers.
+        c.card_models.clear();
+        c.swarm_card_models.clear();
+        assert_eq!(pick_auto(&c, Some("llama3.1:70b"), AutoNeeds::default()), Err(AutoMiss::NothingInSwarm));
+        c.card_models = vec!["qwen3:8b".into()];
+        c.swarm_card_models = vec!["qwen3:8b".into()];
+        assert_eq!(pick_auto(&c, Some("qwen3:8b"), AutoNeeds::default()), Ok(("qwen3:8b".into(), AutoStep::Preferred)));
+        assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::Preferred), Some(["12D3Swarm".to_string()].into()));
+        // The reply says why.
+        assert!(NOTHING_IN_SWARM.contains("stays inside your private swarm"));
+    }
+
+    /// On a keyed private network every provider is the organisation's: a tool request with only
+    /// too-small own models goes to a bigger model there, and to this machine's if there is none.
+    #[test]
+    fn on_a_keyed_network_a_tool_request_uses_the_organisations_bigger_model() {
+        use openhydra_protocol::trust::AuthenticityTier::*;
+        let tools = AutoNeeds { tools: true };
+        let mut c = cands(vec![kp("qwen2.5:0.5b", "me", "12D3Me"), kp("qwen2.5-coder:32b", "org", "12D3Org")]);
+        c.self_provider = Some("12D3Me".into());
+        c.private_network = true;
+        c.tiers.insert(("12D3Org".into(), "qwen2.5-coder:32b".into()), ReputationRedundant);
+        assert_eq!(pick_auto(&c, None, tools), Ok(("qwen2.5-coder:32b".into(), AutoStep::Verified)));
+        c.tiers.clear();
+        assert_eq!(pick_auto(&c, None, tools), Ok(("qwen2.5:0.5b".into(), AutoStep::OwnMachine)), "nobody bigger: this machine");
     }
 
     #[test]
