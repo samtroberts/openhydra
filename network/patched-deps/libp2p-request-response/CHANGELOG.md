@@ -1,10 +1,15 @@
 ## 0.27.0 (OpenHydra patch)
 
-- A request goes on one of the peer's *direct* connections when it has one: upstream round-robins over
-  every connection, so while a peer had both a relayed and a direct connection every other request
-  rode the relay circuit (OpenHydra live test, 11 Nov 2026: 885 ms, 8 ms, 885 ms on consecutive
-  requests between two machines on one LAN). Only relay circuits: round-robin as before. See
-  `pick_connection` in `src/lib.rs`.
+- A request goes on one of the peer's *direct* connections once that connection has carried a reply
+  (and not failed a request since): upstream round-robins over every connection, so while a peer had
+  both a relayed and a direct connection every other request rode the relay circuit (OpenHydra live
+  test, 11 Nov 2026: 885 ms, 8 ms, 885 ms on consecutive requests between two machines on one LAN).
+  Until a direct connection has answered, and again after a request on it fails, requests are shared
+  round-robin as upstream: preferring a fresh direct connection outright would be worse than upstream
+  when it is silently dead right after a hole punch (review, 11 Nov). See `pick_connection` and
+  `Connection::proven` in `src/lib.rs`.
+- Each connection records whether it runs through a relay circuit on either side: a connection a peer
+  opened to us through a relay (its local address is the circuit) was stored without an address.
 
 ## 0.27.0
 

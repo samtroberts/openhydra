@@ -50,6 +50,9 @@ jobs:
       # (libp2p-swarm-test) that isn't published, so they can't build from the crate.
       - name: Patched libp2p-dcutr tests
         run: cargo test --locked --lib --manifest-path patched-deps/libp2p-dcutr/Cargo.toml
+      # Its library tests cover the patch (a request goes on a direct connection when there is one).
+      - name: Patched libp2p-request-response tests
+        run: cargo test --locked --lib --manifest-path patched-deps/libp2p-request-response/Cargo.toml
 
   build-bootstrap:
     name: Build Bootstrap Binary (Linux x86_64)

@@ -545,7 +545,7 @@ where
             if connections.is_empty() {
                 return Some(request);
             }
-            let ix = pick_connection(connections.iter().map(|c| c.remote_address.as_ref()), request.request_id.0);
+            let ix = pick_connection(connections.iter().map(|c| (c.relayed, c.proven)), request.request_id.0);
             let conn = &mut connections[ix];
             conn.pending_outbound_responses.insert(request.request_id);
             self.pending_events.push_back(ToSwarm::NotifyHandler {
@@ -564,6 +564,14 @@ where
     /// Returns `true` if the provided connection to the given peer is still
     /// alive and the [`OutboundRequestId`] was previously present and is now removed.
     /// Returns `false` otherwise.
+    /// OpenHydra patch: a connection that just carried a reply has proven its path; one whose request
+    /// timed out or failed hasn't (see [`pick_connection`]).
+    fn set_proven(&mut self, peer: &PeerId, connection: ConnectionId, proven: bool) {
+        if let Some(c) = self.get_connection_mut(peer, connection) {
+            c.proven = proven;
+        }
+    }
+
     fn remove_pending_outbound_response(
         &mut self,
         peer: &PeerId,
@@ -616,6 +624,10 @@ where
             ConnectedPoint::Dialer { address, .. } => Some(address.clone()),
             ConnectedPoint::Listener { .. } => None,
         };
+        let relayed = match new {
+            ConnectedPoint::Dialer { address, .. } => is_circuit(address),
+            ConnectedPoint::Listener { local_addr, send_back_addr } => is_circuit(local_addr) || is_circuit(send_back_addr),
+        };
         let connections = self
             .connected
             .get_mut(&peer_id)
@@ -626,6 +638,7 @@ where
             .find(|c| c.id == connection_id)
             .expect("Address change can only happen on an established connection.");
         connection.remote_address = new_address;
+        connection.relayed = relayed;
     }
 
     fn on_connection_closed(
@@ -700,8 +713,9 @@ where
         peer: PeerId,
         connection_id: ConnectionId,
         remote_address: Option<Multiaddr>,
+        relayed: bool,
     ) {
-        let mut connection = Connection::new(connection_id, remote_address);
+        let mut connection = Connection::new(connection_id, remote_address, relayed);
 
         if let Some(pending_requests) = self.pending_outbound_requests.remove(&peer) {
             for request in pending_requests {
@@ -727,8 +741,8 @@ where
         &mut self,
         connection_id: ConnectionId,
         peer: PeerId,
-        _: &Multiaddr,
-        _: &Multiaddr,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         let mut handler = Handler::new(
             self.inbound_protocols.clone(),
@@ -738,7 +752,10 @@ where
             self.config.max_concurrent_streams,
         );
 
-        self.preload_new_handler(&mut handler, peer, connection_id, None);
+        // OpenHydra patch: a connection a peer opened to us through a relay has a `/p2p-circuit` local
+        // address (libp2p-relay's listener); it is relayed even though its remote address is unknown.
+        let relayed = is_circuit(local_addr) || is_circuit(remote_addr);
+        self.preload_new_handler(&mut handler, peer, connection_id, None, relayed);
 
         Ok(handler)
     }
@@ -787,6 +804,7 @@ where
             peer,
             connection_id,
             Some(remote_address.clone()),
+            is_circuit(remote_address),
         );
 
         Ok(handler)
@@ -817,6 +835,7 @@ where
                 response,
             } => {
                 let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
+                self.set_proven(&peer, connection, true);
                 debug_assert!(
                     removed,
                     "Expect request_id to be pending before receiving response.",
@@ -880,6 +899,7 @@ where
             }
             handler::Event::OutboundTimeout(request_id) => {
                 let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
+                self.set_proven(&peer, connection, false);
                 debug_assert!(
                     removed,
                     "Expect request_id to be pending before request times out."
@@ -894,6 +914,7 @@ where
             }
             handler::Event::OutboundUnsupportedProtocols(request_id) => {
                 let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
+                self.set_proven(&peer, connection, false);
                 debug_assert!(
                     removed,
                     "Expect request_id to be pending before failing to connect.",
@@ -908,6 +929,7 @@ where
             }
             handler::Event::OutboundStreamFailed { request_id, error } => {
                 let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
+                self.set_proven(&peer, connection, false);
                 debug_assert!(removed, "Expect request_id to be pending upon failure");
 
                 self.pending_events
@@ -971,21 +993,31 @@ where
 const EMPTY_QUEUE_SHRINK_THRESHOLD: usize = 100;
 
 /// Internal information tracked for an established connection.
-/// OpenHydra patch: which of a peer's connections a request goes on. Round-robin by request id, as
-/// upstream, but only over the *direct* connections when there is one: upstream's round-robin over
-/// every connection sent every other request through a relay circuit while a peer had both a relayed
-/// and a direct connection (live, 11 Nov: 885 ms, 8 ms, 885 ms on consecutive requests between two
-/// machines on one LAN). A connection whose address is unknown counts as direct.
-fn pick_connection<'a>(addresses: impl Iterator<Item = Option<&'a Multiaddr>>, request_id: u64) -> usize {
-    let relayed: Vec<bool> = addresses
-        .map(|a| a.is_some_and(|a| a.iter().any(|p| matches!(p, libp2p_core::multiaddr::Protocol::P2pCircuit))))
-        .collect();
-    let direct: Vec<usize> = (0..relayed.len()).filter(|&i| !relayed[i]).collect();
-    if direct.is_empty() {
-        (request_id as usize) % relayed.len()
+/// OpenHydra patch: which of a peer's connections a request goes on, from each connection's
+/// `(relayed, proven)` in order. When the peer has a *direct* connection that has carried a reply
+/// (and not failed a request since), round-robin over those alone; otherwise round-robin over every
+/// connection, as upstream.
+///
+/// Upstream's round-robin sent every other request through a relay circuit while a peer had both a
+/// relayed and a direct connection (live, 11 Nov: 885 ms, 8 ms, 885 ms on consecutive requests
+/// between two machines on one LAN). Preferring a direct connection as soon as it opens would be
+/// worse than upstream for one that is silently dead: right after a hole punch, every request would
+/// wait on it while the relay sat idle (review 11 Nov). A new direct connection therefore gets its
+/// share of requests as upstream gives it, takes them all once one has come back on it, and loses
+/// them again when one fails.
+fn pick_connection(conns: impl Iterator<Item = (bool, bool)>, request_id: u64) -> usize {
+    let conns: Vec<(bool, bool)> = conns.collect();
+    let proven_direct: Vec<usize> = (0..conns.len()).filter(|&i| !conns[i].0 && conns[i].1).collect();
+    if proven_direct.is_empty() {
+        (request_id as usize) % conns.len()
     } else {
-        direct[(request_id as usize) % direct.len()]
+        proven_direct[(request_id as usize) % proven_direct.len()]
     }
+}
+
+/// OpenHydra patch: whether `addr` runs through a relay circuit (`/p2p-circuit`).
+fn is_circuit(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, libp2p_core::multiaddr::Protocol::P2pCircuit))
 }
 
 #[cfg(test)]
@@ -993,27 +1025,100 @@ mod pick_connection_tests {
     use super::*;
 
     #[test]
-    fn a_direct_connection_is_preferred_over_a_relay_circuit() {
+    fn a_proven_direct_connection_is_preferred_over_a_relay_circuit() {
+        // (relayed, proven). A direct connection that has carried a reply takes every request.
+        for id in 0..6 {
+            assert_eq!(pick_connection([(true, true), (false, true)].into_iter(), id), 1);
+        }
+        // Two proven directs: round-robin between them, never the relay.
+        let picks: Vec<usize> = (0..4).map(|id| pick_connection([(false, true), (true, true), (false, true)].into_iter(), id)).collect();
+        assert_eq!(picks, vec![0, 2, 0, 2]);
+        // A direct connection not yet proven (just hole-punched, or its last request failed): upstream's
+        // round-robin, so the relay keeps half the requests while it may still be dead.
+        let picks: Vec<usize> = (0..4).map(|id| pick_connection([(true, true), (false, false)].into_iter(), id)).collect();
+        assert_eq!(picks, vec![0, 1, 0, 1]);
+        // Only relays: round-robin as upstream.
+        let picks: Vec<usize> = (0..4).map(|id| pick_connection([(true, false), (true, true)].into_iter(), id)).collect();
+        assert_eq!(picks, vec![0, 1, 0, 1]);
+    }
+
+    /// The bookkeeping end to end on the real behaviour: a relayed and a fresh direct connection
+    /// share requests as upstream does; once a reply comes back on the direct one it takes them all;
+    /// when a request on it times out, they are shared again.
+    #[test]
+    fn a_direct_connection_takes_over_once_it_has_answered_and_gives_way_when_it_fails() {
+        use futures::{AsyncRead, AsyncWrite};
+        #[derive(Clone, Default)]
+        struct Nop;
+        #[async_trait::async_trait]
+        impl crate::Codec for Nop {
+            type Protocol = &'static str;
+            type Request = ();
+            type Response = ();
+            async fn read_request<T: AsyncRead + Unpin + Send>(&mut self, _: &&'static str, _: &mut T) -> std::io::Result<()> { Ok(()) }
+            async fn read_response<T: AsyncRead + Unpin + Send>(&mut self, _: &&'static str, _: &mut T) -> std::io::Result<()> { Ok(()) }
+            async fn write_request<T: AsyncWrite + Unpin + Send>(&mut self, _: &&'static str, _: &mut T, _: ()) -> std::io::Result<()> { Ok(()) }
+            async fn write_response<T: AsyncWrite + Unpin + Send>(&mut self, _: &&'static str, _: &mut T, _: ()) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut b: Behaviour<Nop> = Behaviour::with_codec(Nop, [("/t/1", ProtocolSupport::Full)], Config::default());
+        let peer: PeerId = "12D3KooWDs9HYT9nUGR3RNH1asiyc9uc98i2gXTvRktk316B2v79".parse().unwrap();
         let relay: Multiaddr = "/ip4/3.0.0.1/tcp/4001/p2p/12D3KooWDs9HYT9nUGR3RNH1asiyc9uc98i2gXTvRktk316B2v79/p2p-circuit".parse().unwrap();
         let direct: Multiaddr = "/ip4/192.168.0.5/tcp/4301".parse().unwrap();
-        // Relay first, direct second: every request goes direct.
-        for id in 0..6 {
-            assert_eq!(pick_connection([Some(&relay), Some(&direct)].into_iter(), id), 1);
+        let (r, d) = (ConnectionId::new_unchecked(1), ConnectionId::new_unchecked(2));
+        let _ = b.handle_established_outbound_connection(r, peer, &relay, Endpoint::Dialer, PortUse::Reuse);
+        let _ = b.handle_established_outbound_connection(d, peer, &direct, Endpoint::Dialer, PortUse::Reuse);
+        let mut send = |b: &mut Behaviour<Nop>| -> (OutboundRequestId, ConnectionId) {
+            let id = b.send_request(&peer, ());
+            loop {
+                match b.pending_events.pop_front() {
+                    Some(ToSwarm::NotifyHandler { handler: NotifyHandler::One(c), .. }) => return (id, c),
+                    Some(_) => continue,
+                    None => panic!("no request sent"),
+                }
+            }
+        };
+        let fresh: Vec<ConnectionId> = (0..4).map(|_| send(&mut b).1).collect();
+        assert!(fresh.contains(&r) && fresh.contains(&d), "a fresh direct connection shares with the relay, as upstream: {fresh:?}");
+        let (id, _) = loop {
+            let (id, c) = send(&mut b);
+            if c == d {
+                break (id, c);
+            }
+        };
+        b.on_connection_handler_event(peer, d, handler::Event::Response { request_id: id, response: () });
+        let proven: Vec<(OutboundRequestId, ConnectionId)> = (0..6).map(|_| send(&mut b)).collect();
+        assert!(proven.iter().all(|(_, c)| *c == d), "once it answered, every request goes direct: {proven:?}");
+        b.on_connection_handler_event(peer, d, handler::Event::OutboundTimeout(proven[0].0));
+        let after: Vec<ConnectionId> = (0..4).map(|_| send(&mut b).1).collect();
+        assert!(after.contains(&r), "after a failure on it, the relay shares again: {after:?}");
+    }
+
+    /// Review 11 Nov: a connection a peer opened to us through a relay must count as relayed (its
+    /// remote address is unknown; its local address is the relay circuit).
+    #[test]
+    fn circuits_are_told_apart_on_both_sides() {
+        let dialled: Multiaddr = "/ip4/3.0.0.1/tcp/4001/p2p/12D3KooWDs9HYT9nUGR3RNH1asiyc9uc98i2gXTvRktk316B2v79/p2p-circuit".parse().unwrap();
+        let listened: Multiaddr = "/ip4/3.0.0.1/tcp/4001/p2p/12D3KooWDs9HYT9nUGR3RNH1asiyc9uc98i2gXTvRktk316B2v79/p2p-circuit".parse().unwrap();
+        let direct: Multiaddr = "/ip4/192.168.0.5/tcp/4301".parse().unwrap();
+        assert!(is_circuit(&dialled) && is_circuit(&listened) && !is_circuit(&direct));
+        let mut conns = [Connection::new(ConnectionId::new_unchecked(1), None, is_circuit(&listened)), Connection::new(ConnectionId::new_unchecked(2), None, false)];
+        conns[0].proven = true;
+        conns[1].proven = true;
+        for id in 0..4 {
+            assert_eq!(pick_connection(conns.iter().map(|c| (c.relayed, c.proven)), id), 1, "the inbound relayed one is not picked");
         }
-        // Two directs: round-robin between them, never the relay.
-        let picks: Vec<usize> = (0..4).map(|id| pick_connection([Some(&direct), Some(&relay), Some(&direct)].into_iter(), id)).collect();
-        assert_eq!(picks, vec![0, 2, 0, 2]);
-        // Only relays: round-robin as upstream.
-        let picks: Vec<usize> = (0..4).map(|id| pick_connection([Some(&relay), Some(&relay)].into_iter(), id)).collect();
-        assert_eq!(picks, vec![0, 1, 0, 1]);
-        // An unknown address counts as direct.
-        assert_eq!(pick_connection([Some(&relay), None].into_iter(), 0), 1);
     }
 }
 
 struct Connection {
     id: ConnectionId,
     remote_address: Option<Multiaddr>,
+    /// OpenHydra patch: whether this connection runs through a relay circuit, on either side
+    /// (see [`pick_connection`]).
+    relayed: bool,
+    /// OpenHydra patch: a reply has come back on this connection since it opened or last failed a
+    /// request (see [`pick_connection`]).
+    proven: bool,
     /// Pending outbound responses where corresponding inbound requests have
     /// been received on this connection and emitted via `poll` but have not yet
     /// been answered.
@@ -1024,10 +1129,12 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(id: ConnectionId, remote_address: Option<Multiaddr>) -> Self {
+    fn new(id: ConnectionId, remote_address: Option<Multiaddr>, relayed: bool) -> Self {
         Self {
             id,
             remote_address,
+            relayed,
+            proven: false,
             pending_outbound_responses: Default::default(),
             pending_inbound_responses: Default::default(),
         }
