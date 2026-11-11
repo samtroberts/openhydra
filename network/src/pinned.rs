@@ -35,6 +35,28 @@ pub fn kad_allows(pinned: &PinnedPeers, peer: &PeerId, addr: &Multiaddr) -> bool
     !loopback || !pinned.read().unwrap_or_else(|e| e.into_inner()).contains_key(peer)
 }
 
+/// Remove from `kad`'s routing table every address of `peer` that [`kad_allows`] refuses (one
+/// restored from the routing cache or added before the pin, any loopback port or family). Returns
+/// how many went. The filter keeps new ones out; this clears what was there before.
+pub fn purge_refused<S: libp2p::kad::store::RecordStore + Send + 'static>(
+    kad: &mut libp2p::kad::Behaviour<S>,
+    pinned: &PinnedPeers,
+    peer: PeerId,
+) -> usize {
+    let mut refused = Vec::new();
+    for bucket in kad.kbuckets() {
+        for entry in bucket.iter() {
+            if *entry.node.key.preimage() == peer {
+                refused.extend(entry.node.value.iter().filter(|a| !kad_allows(pinned, &peer, a)).cloned());
+            }
+        }
+    }
+    for a in &refused {
+        kad.remove_address(&peer, a);
+    }
+    refused.len()
+}
+
 /// Pinned addresses per peer, at most.
 pub const MAX_PINNED_ADDRS: usize = 4;
 

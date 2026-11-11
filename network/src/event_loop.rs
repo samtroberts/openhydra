@@ -6347,19 +6347,9 @@ fn purge_refused_kad_addrs(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state:
     if state.bootstrap_peers.iter().any(|(b, _)| *b == peer) {
         return;
     }
-    let mut refused = Vec::new();
-    for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
-        for entry in bucket.iter() {
-            if *entry.node.key.preimage() == peer {
-                refused.extend(entry.node.value.iter().filter(|a| !crate::pinned::kad_allows(&state.pinned, &peer, a)).cloned());
-            }
-        }
-    }
-    for a in &refused {
-        swarm.behaviour_mut().kademlia.remove_address(&peer, a);
-    }
-    if !refused.is_empty() {
-        info!(%peer, n = refused.len(), "removed the pinned peer's loopback addresses from the routing table");
+    let n = crate::pinned::purge_refused(&mut swarm.behaviour_mut().kademlia, &state.pinned, peer);
+    if n > 0 {
+        info!(%peer, n, "removed the pinned peer's loopback addresses from the routing table");
     }
 }
 

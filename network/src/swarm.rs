@@ -124,6 +124,22 @@ pub fn routable_on_public_network(addr: &Multiaddr) -> bool {
     }
 }
 
+/// The Kademlia address filter of a node: on the public network no private address
+/// ([`routable_on_public_network`]); on every network no loopback address of a pinned peer
+/// ([`crate::pinned::kad_allows`]), except for a configured bootstrap (the user gave that address: a
+/// one-machine network whose gateway bootstraps from its own provider, where without it the DHT
+/// would have nobody to ask). Public so the leak-guard test runs the node's own filter.
+pub fn kad_address_filter(
+    public_network: bool,
+    bootstraps: std::collections::HashSet<PeerId>,
+    pinned: crate::pinned::PinnedPeers,
+) -> kad::AddressFilter {
+    kad::AddressFilter::new(move |peer, addr| {
+        (!public_network || routable_on_public_network(addr))
+            && (bootstraps.contains(peer) || crate::pinned::kad_allows(&pinned, peer, addr))
+    })
+}
+
 /// Build and configure a libp2p Swarm with the OpenHydra behaviour.
 pub fn build_swarm(
     identity: &Identity,
@@ -260,16 +276,8 @@ pub fn build_swarm(
     // On the public network, no private address enters the routing table by any path (an mDNS dial
     // to a LAN peer included), so none is handed out in a DHT answer. The filter lives in the
     // vendored libp2p-kad, the one place every address passes (review 2026-10-29).
-    // On every network, a pinned peer's loopback address stays out too ([`crate::pinned::kad_allows`]),
-    // except for a configured bootstrap: the user gave that address (a one-machine network whose
-    // gateway bootstraps from its own provider), and without it the DHT would have nobody to ask.
-    let public_network = opts.public_network;
-    let pinned = opts.pinned.clone();
-    let bootstraps: std::collections::HashSet<PeerId> = opts.bootstrap_peers.iter().map(|(p, _)| *p).collect();
-    kad_config.set_address_filter(kad::AddressFilter::new(move |peer, addr| {
-        (!public_network || routable_on_public_network(addr))
-            && (bootstraps.contains(peer) || crate::pinned::kad_allows(&pinned, peer, addr))
-    }));
+    let bootstraps = opts.bootstrap_peers.iter().map(|(p, _)| *p).collect();
+    kad_config.set_address_filter(kad_address_filter(opts.public_network, bootstraps, opts.pinned.clone()));
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);

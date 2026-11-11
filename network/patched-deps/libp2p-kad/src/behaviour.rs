@@ -1235,6 +1235,13 @@ where
             .collect()
     }
 
+    /// OpenHydra patch, for tests: the peers (with their addresses) this node would answer a
+    /// FIND_NODE for `target` from `source` with.
+    #[doc(hidden)]
+    pub fn closest_answer_for_test(&mut self, target: &PeerId, source: &PeerId) -> Vec<(PeerId, Vec<Multiaddr>)> {
+        self.find_closest(&kbucket::Key::from(*target), source).into_iter().map(|p| (p.node_id, p.multiaddrs)).collect()
+    }
+
     /// Collects all peers who are known to be providers of the value for a given `Multihash`.
     /// OpenHydra patch, for tests: the providers (with their addresses) this node would answer a
     /// GET_PROVIDERS for `key` from `source` with.
