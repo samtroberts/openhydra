@@ -83,7 +83,7 @@ fn windows_bin_dir() -> PathBuf {
 /// fall back to `resolve_program`'s common-dir hits (already absolute).
 fn resolved_path() -> Option<PathBuf> {
     let probe = if cfg!(windows) { "where" } else { "which" };
-    if let Ok(out) = std::process::Command::new(probe).arg(CLI_NAME).output() {
+    if let Ok(out) = crate::proc::command(probe).arg(CLI_NAME).output() {
         if out.status.success() {
             if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
                 let p = line.trim();
@@ -239,7 +239,7 @@ fn install_macos(source: &Path) -> Result<InstallReport, String> {
 
 #[cfg(target_os = "macos")]
 fn run_osascript(script: &str) -> Result<(), String> {
-    let out = std::process::Command::new("osascript")
+    let out = crate::proc::command("osascript")
         .arg("-e")
         .arg(script)
         .output()
@@ -320,7 +320,7 @@ fn install_windows(source: &Path) -> Result<InstallReport, String> {
     // Add the bin dir to the USER PATH (no admin) via PowerShell's Environment API, then broadcast so
     // new shells pick it up. Idempotent — only appends when absent.
     let ps = build_win_path_add(&bindir.display().to_string());
-    let status = std::process::Command::new("powershell")
+    let status = crate::proc::command("powershell")
         .args(["-NoProfile", "-Command", &ps])
         .status()
         .map_err(|e| format!("powershell failed: {e}"))?;
@@ -432,7 +432,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let payload = format!("/tmp/x'; touch {}; echo '", marker.display());
         let script = format!("set cmd to \"echo \" & {}\ndo shell script cmd", as_quoted_shell_arg(&payload));
-        let out = std::process::Command::new("osascript").arg("-e").arg(&script).output().unwrap();
+        let out = crate::proc::command("osascript").arg("-e").arg(&script).output().unwrap();
         assert!(out.status.success(), "osascript failed: {}", String::from_utf8_lossy(&out.stderr));
         // And the whole payload should come back echoed as one literal line.
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), payload, "path must be echoed literally");

@@ -149,8 +149,8 @@ export async function ensureImportSection() {
   setHTML(host, html`<div class="card">
       <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Add a model by card</div></div>
       <div style="padding:0 16px 14px">
-        <div class="mut" style="font-size:11.5px;margin-bottom:8px">Paste an <b>openhydra:card:…</b> magnet (or a <b>.openhydra</b> file's contents) to add someone's model. You connect to them directly by peer id — no discovery needed.</div>
-        <textarea id="cardinput" class="input mono" rows="3" placeholder="openhydra:card:…   or the .openhydra JSON" style="width:100%;font-size:11px"></textarea>
+        <div class="mut" style="font-size:11.5px;margin-bottom:8px">Double-click a <b>.openhydra</b> file or open an <b>openhydra:card:…</b> link to add someone's model, or paste one here (or drop the file in). You connect to them directly by peer id — no discovery needed.</div>
+        <textarea id="cardinput" class="input mono" rows="3" placeholder="openhydra:card:…   or drop a .openhydra file" style="width:100%;font-size:11px"></textarea>
         <div class="row" style="margin-top:8px;gap:8px"><button class="btn outline sm" id="cardpreviewbtn">Preview</button><button class="btn brand sm" id="cardaddbtn" style="display:none">Add model</button></div>
         <div id="cardpreviewout" style="margin-top:8px"></div>
       </div>

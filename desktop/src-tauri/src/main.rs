@@ -23,7 +23,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +36,9 @@ mod cli;
 mod hostinfo;
 mod connectors;
 mod installer;
+mod proc;
+#[cfg(windows)]
+mod winjob;
 
 // ── Child-pid registry (crash/kill safety) ──
 //
@@ -75,10 +78,19 @@ fn sweep_stale_agents() {
         if pid == 0 {
             continue;
         }
-        let is_agent = Command::new("ps")
+        #[cfg(unix)]
+        let is_agent = crate::proc::command("ps")
             .args(["-p", &pid.to_string(), "-o", "comm="])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("openhydra-agent"))
+            .unwrap_or(false);
+        // Windows: `tasklist` names the process at that pid (11 Nov: the sweep was Unix-only, so an
+        // agent left by a crash or an update kept the ports and the new app couldn't start its own).
+        #[cfg(windows)]
+        let is_agent = crate::proc::command("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("\"openhydra-agent.exe\""))
             .unwrap_or(false);
         if is_agent {
             eprintln!("openhydra-desktop: reaping stale agent pid {pid} from a previous run");
@@ -86,6 +98,8 @@ fn sweep_stale_agents() {
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
             }
+            #[cfg(windows)]
+            let _ = crate::proc::command("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
         }
     }
     let _ = std::fs::remove_file(pidfile());
@@ -571,7 +585,7 @@ fn save_stats(data: String) -> Result<(), String> {
 
 // ── #9: OS device name, used as the default until the user edits it. ──
 fn hostname_cmd() -> Option<String> {
-    Command::new("hostname")
+    crate::proc::command("hostname")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -585,7 +599,7 @@ fn device_hostname() -> String {
     #[cfg(windows)]
     let name = std::env::var("COMPUTERNAME").ok();
     #[cfg(target_os = "macos")]
-    let name = Command::new("scutil")
+    let name = crate::proc::command("scutil")
         .args(["--get", "ComputerName"])
         .output()
         .ok()
@@ -626,19 +640,62 @@ fn desktop_entry_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".local/share/applications/openhydra.desktop"))
 }
 
+/// The card file type and the `openhydra:` link scheme the launcher registers, so double-clicking a
+/// `.openhydra` file or opening an `openhydra:card:` link starts (or reaches) the app, as the
+/// .deb/.rpm and the macOS/Windows installers already do.
+const CARD_MIME: &str = "application/x-openhydra+json";
+
+/// One `Exec` argument, quoted per the Desktop Entry spec: inside double quotes, `"` `` ` `` `$` `\`
+/// take a backslash, and since string values unescape `\\` first, each of those backslashes is
+/// doubled again; `%` is a field code, so it's doubled. `None` for a path a launcher can't hold.
+fn exec_arg(path: &str) -> Option<String> {
+    if path.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let mut out = String::from("\"");
+    for c in path.chars() {
+        match c {
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(c);
+            }
+            '\\' => out.push_str("\\\\\\\\"),
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    Some(out)
+}
+
 /// The `.desktop` launcher body pointing at this AppImage. Pure (no I/O) so it's unit-testable.
-/// `Exec` is double-quoted because an AppImage path can contain spaces.
-fn desktop_entry(appimage: &str, icon: &str) -> String {
-    format!(
+fn desktop_entry(appimage: &str, icon: &str) -> Option<String> {
+    let exec = exec_arg(appimage)?;
+    Some(format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=OpenHydra\n\
          Comment=Share your machine's inference engines and use the OpenHydra network.\n\
-         Exec=\"{appimage}\" %U\n\
+         Exec={exec} %U\n\
          Icon={icon}\n\
          Categories=Utility;Network;\n\
+         MimeType={CARD_MIME};x-scheme-handler/openhydra;\n\
          Terminal=false\n\
          StartupWMClass=OpenHydra\n"
+    ))
+}
+
+/// shared-mime-info definition: `*.openhydra` files are OpenHydra cards (JSON).
+fn card_mime_xml() -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <mime-info xmlns=\"http://www.freedesktop.org/standards/shared-mime-info\">\n  \
+         <mime-type type=\"{CARD_MIME}\">\n    \
+         <comment>OpenHydra card</comment>\n    \
+         <sub-class-of type=\"application/json\"/>\n    \
+         <glob pattern=\"*.openhydra\"/>\n  \
+         </mime-type>\n\
+         </mime-info>\n"
     )
 }
 
@@ -683,10 +740,23 @@ fn integrate_appimage() -> Result<(), String> {
         }
     }
 
+    let entry = desktop_entry(&appimage, &icon).ok_or("the AppImage's path can't go in a launcher")?;
     let path = apps_dir.join("openhydra.desktop");
-    std::fs::write(&path, desktop_entry(&appimage, &icon)).map_err(|e| e.to_string())?;
-    // Best-effort refresh of the menu database (harmless if the tool is absent).
-    let _ = Command::new("update-desktop-database").arg(&apps_dir).status();
+    std::fs::write(&path, entry).map_err(|e| e.to_string())?;
+    // The `.openhydra` file type (best effort: without it the launcher still works, the file just
+    // doesn't open on a double-click).
+    let mime_dir = PathBuf::from(&home).join(".local/share/mime");
+    if std::fs::create_dir_all(mime_dir.join("packages")).is_ok()
+        && std::fs::write(mime_dir.join("packages/openhydra.xml"), card_mime_xml()).is_ok()
+    {
+        let _ = crate::proc::command("update-mime-database").arg(&mime_dir).status();
+    }
+    // Best-effort refresh of the menu database (harmless if the tool is absent), then make this
+    // launcher the handler for cards and `openhydra:` links.
+    let _ = crate::proc::command("update-desktop-database").arg(&apps_dir).status();
+    let _ = crate::proc::command("xdg-mime")
+        .args(["default", "openhydra.desktop", CARD_MIME, "x-scheme-handler/openhydra"])
+        .status();
     Ok(())
 }
 
@@ -1128,7 +1198,7 @@ fn spawn_role(
     let dir = openhydra_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::proc::command(&bin);
     cmd.arg("--identity")
         .arg(dir.join(identity))
         .arg("--listen")
@@ -1171,6 +1241,9 @@ fn spawn_role(
         }
     }
     let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", bin.display()))?;
+    // Windows: the agent ends with the app however the app ends (see `winjob`).
+    #[cfg(windows)]
+    crate::winjob::adopt(&child);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -1264,11 +1337,11 @@ fn open_external(url: String) -> Result<(), String> {
         return Err("only web and email links can be opened".into());
     }
     #[cfg(target_os = "macos")]
-    let r = Command::new("open").arg(u).status();
+    let r = crate::proc::command("open").arg(u).status();
     #[cfg(target_os = "windows")]
-    let r = Command::new("rundll32").args(["url.dll,FileProtocolHandler", u]).status();
+    let r = crate::proc::command("rundll32").args(["url.dll,FileProtocolHandler", u]).status();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let r = Command::new("xdg-open").arg(u).status();
+    let r = crate::proc::command("xdg-open").arg(u).status();
     r.map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -1316,16 +1389,16 @@ fn reveal_path(path: String) -> Result<(), String> {
         return Err("only files OpenHydra wrote can be shown".into());
     }
     #[cfg(target_os = "macos")]
-    let r = Command::new("open").arg("-R").arg(&p).status();
+    let r = crate::proc::command("open").arg("-R").arg(&p).status();
     #[cfg(target_os = "windows")]
     let r = {
         // canonicalize gives a `\\?\C:\…` path, which Explorer doesn't accept.
         let shown = p.display().to_string();
         let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
-        Command::new("explorer").arg(format!("/select,{shown}")).status()
+        crate::proc::command("explorer").arg(format!("/select,{shown}")).status()
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let r = Command::new("xdg-open").arg(p.parent().unwrap_or(&root)).status();
+    let r = crate::proc::command("xdg-open").arg(p.parent().unwrap_or(&root)).status();
     r.map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -1533,7 +1606,7 @@ fn provider_peer_id() -> Option<String> {
 fn peer_id_of(key_name: &str) -> Option<String> {
     let bin = agent_binary()?;
     let key = openhydra_dir().join(key_name);
-    let out = Command::new(&bin).arg("--identity").arg(&key).arg("peer-id").output().ok()?;
+    let out = crate::proc::command(&bin).arg("--identity").arg(&key).arg("peer-id").output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1557,7 +1630,7 @@ fn export_card(
         "openhydra-agent binary not found (bundle missing its sidecar, or no dev build)".to_string()
     })?;
     let key = openhydra_dir().join("desktop-provider.key");
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::proc::command(&bin);
     cmd.arg("--identity")
         .arg(&key)
         .arg("card")
@@ -1703,7 +1776,8 @@ fn read_card_file(url: &url::Url) -> Option<String> {
 /// no-op there). Route the first `openhydra:` URL or `.openhydra` file path found in `args`.
 fn deliver_card_from_args<I: IntoIterator<Item = String>>(app: &tauri::AppHandle, args: I) {
     for arg in args {
-        let url = if arg.starts_with("openhydra:") {
+        // `file://` too: a Linux launcher's `%U` hands a double-clicked file over as a URL.
+        let url = if arg.starts_with("openhydra:") || arg.starts_with("file://") {
             arg.parse::<url::Url>().ok()
         } else if arg.to_ascii_lowercase().ends_with(".openhydra") {
             std::fs::canonicalize(&arg).ok().and_then(|p| url::Url::from_file_path(p).ok())
@@ -2065,7 +2139,7 @@ fn swarm_remote_scope(
         swarm_public_key.trim(),
         &[swarm_control_identity_path(), swarm_identity_path()],
     )?;
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::proc::command(&bin);
     cmd.arg("--identity").arg(identity);
     let settings = load_settings();
     for b in effective_bootstraps(&settings) {
@@ -3015,12 +3089,12 @@ fn open_gui(key: String) -> Result<(), String> {
     // fall back to macOS `open -a <app>`. App tools: `open -a <app>`.
     if matches!(spec.kind, openhydra_agent::connect::Kind::ContinueYaml | openhydra_agent::connect::Kind::ClaudeSettings) {
         if let Some(code) = crate::installer::resolve_program("code") {
-            return run(Command::new(code), "launch VS Code".into());
+            return run(crate::proc::command(code), "launch VS Code".into());
         }
     }
     #[cfg(target_os = "macos")]
     {
-        let mut c = Command::new("open");
+        let mut c = crate::proc::command("open");
         c.args(["-a", app]);
         run(c, format!("open {app}"))
     }
@@ -3995,13 +4069,25 @@ mod tests {
     #[test]
     fn desktop_entry_quotes_exec_and_sets_fields() {
         // An AppImage path can contain spaces, so Exec must be quoted or the launcher breaks.
-        let d = desktop_entry("/home/me/My Apps/OpenHydra.AppImage", "openhydra");
+        let d = desktop_entry("/home/me/My Apps/OpenHydra.AppImage", "openhydra").unwrap();
         assert!(d.contains("Exec=\"/home/me/My Apps/OpenHydra.AppImage\" %U"));
+        assert!(d.contains("MimeType=application/x-openhydra+json;x-scheme-handler/openhydra;"));
         assert!(d.contains("Name=OpenHydra"));
         assert!(d.contains("Icon=openhydra"));
         assert!(d.contains("Type=Application"));
         assert!(d.contains("Categories=Utility;Network;"));
         assert!(d.starts_with("[Desktop Entry]"));
+    }
+
+    #[test]
+    fn desktop_entry_escapes_what_a_launcher_would_misread() {
+        // A path with ", $, `, \ or % must reach the app intact (spec: backslash inside quotes,
+        // doubled again for the string layer; % doubled), and a control character is refused.
+        let d = desktop_entry(r#"/home/me/a"b$c`d\e%f.AppImage"#, "openhydra").unwrap();
+        assert!(d.contains(r#"Exec="/home/me/a\\"b\\$c\\`d\\\\e%%f.AppImage" %U"#), "{d}");
+        assert!(desktop_entry("/home/me/a\nExec=evil", "openhydra").is_none());
+        let x = card_mime_xml();
+        assert!(x.contains(r#"<glob pattern="*.openhydra"/>"#) && x.contains(CARD_MIME));
     }
 
     #[test]

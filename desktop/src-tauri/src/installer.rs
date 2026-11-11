@@ -22,7 +22,7 @@
 //! `download_binary`/`download_archive` primitive is the v2 upgrade.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::io::BufRead;
 
 use serde::Serialize;
@@ -666,7 +666,7 @@ fn comfyui_plan(os: Os, p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> 
 /// download link) rather than the asset `name`/`url` fields, so it survives compact JSON.
 fn latest_github_dmg_url(owner_repo: &str) -> Option<String> {
     let api = format!("https://api.github.com/repos/{owner_repo}/releases/latest");
-    let out = Command::new("curl")
+    let out = crate::proc::command("curl")
         .args(["-sL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "-H", "User-Agent: openhydra-desktop", "-H", "Accept: application/vnd.github+json", &api])
         .output()
         .ok()?;
@@ -786,7 +786,7 @@ fn exo_plan(_os: Os, p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> {
 /// absolute path sidesteps that. On Windows we only trust `where` (no fixed install dir).
 pub fn resolve_program(program: &str) -> Option<PathBuf> {
     let probe = if cfg!(windows) { "where" } else { "which" };
-    let on_path = Command::new(probe)
+    let on_path = crate::proc::command(probe)
         .arg(program)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -921,7 +921,7 @@ pub fn emit_error(app: &AppHandle, engine: &str, message: impl Into<String>) {
 #[cfg(target_os = "macos")]
 fn install_dmg(app: &AppHandle, engine: &str, dmg: &Path) -> Result<(), String> {
     emit(app, engine, "phase", "mounting the disk image".to_string());
-    let out = Command::new("hdiutil")
+    let out = crate::proc::command("hdiutil")
         .args(["attach", &dmg.to_string_lossy(), "-nobrowse", "-noverify"])
         .output()
         .map_err(|e| format!("hdiutil attach: {e}"))?;
@@ -950,7 +950,7 @@ fn install_dmg(app: &AppHandle, engine: &str, dmg: &Path) -> Result<(), String> 
         // Gatekeeper's verdict on the app as downloaded (copying it removes nothing it would check,
         // but a curl download is never quarantined, so macOS wouldn't ask on its own).
         emit(app, engine, "phase", format!("checking {name}'s signature"));
-        let assess = Command::new("spctl")
+        let assess = crate::proc::command("spctl")
             .args(["--assess", "--type", "execute", "-vv"])
             .arg(&app_bundle)
             .output()
@@ -962,7 +962,7 @@ fn install_dmg(app: &AppHandle, engine: &str, dmg: &Path) -> Result<(), String> 
         emit(app, engine, "phase", format!("copying {name} → /Applications"));
         let _ = std::fs::remove_dir_all(&dest); // replace any stale copy
         // `ditto` preserves the code signature + xattrs (a plain `cp -R` can strip them).
-        let cp = Command::new("ditto").arg(&app_bundle).arg(&dest).status().map_err(|e| e.to_string())?;
+        let cp = crate::proc::command("ditto").arg(&app_bundle).arg(&dest).status().map_err(|e| e.to_string())?;
         if !cp.success() {
             return Err(format!(
                 "couldn't copy {name} to /Applications — you may need admin rights, or drag it in manually"
@@ -970,11 +970,11 @@ fn install_dmg(app: &AppHandle, engine: &str, dmg: &Path) -> Result<(), String> 
         }
         Ok(name)
     })();
-    let _ = Command::new("hdiutil").args(["detach", &mount, "-quiet"]).status();
+    let _ = crate::proc::command("hdiutil").args(["detach", &mount, "-quiet"]).status();
     let name = installed?;
     emit(app, engine, "log", format!("installed {name} to /Applications"));
     emit(app, engine, "phase", format!("launching {name}"));
-    let _ = Command::new("open").arg(Path::new("/Applications").join(&name)).status();
+    let _ = crate::proc::command("open").arg(Path::new("/Applications").join(&name)).status();
     Ok(())
 }
 
@@ -1028,7 +1028,7 @@ fn gatekeeper_origin(accepted: bool, report: &str) -> Option<String> {
 fn download_with_progress(app: &AppHandle, engine: &str, url: &str, path: &Path) -> Result<(), String> {
     let path_s = path.to_string_lossy().into_owned();
     // Total size from a HEAD that follows redirects (`-I -L`); some CDNs omit it → indeterminate.
-    let total: Option<u64> = Command::new("curl")
+    let total: Option<u64> = crate::proc::command("curl")
         .args(["-sIL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", url])
         .output()
         .ok()
@@ -1039,7 +1039,7 @@ fn download_with_progress(app: &AppHandle, engine: &str, url: &str, path: &Path)
                 .filter_map(|l| l.split(':').nth(1)?.trim().parse::<u64>().ok())
                 .next_back()
         });
-    let mut child = Command::new("curl")
+    let mut child = crate::proc::command("curl")
         .args(["-fL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "--silent", "--show-error", url, "-o", &path_s])
         .stderr(Stdio::piped())
         .spawn()
@@ -1089,7 +1089,7 @@ fn run_step(app: &AppHandle, engine: &str, step: &Step) -> Result<(), String> {
     match step {
         Step::Run { program, args } => {
             emit(app, engine, "phase", format!("running: {program} {}", args.join(" ")));
-            let mut child = Command::new(program)
+            let mut child = crate::proc::command(program)
                 .args(args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -1139,7 +1139,7 @@ fn run_step(app: &AppHandle, engine: &str, step: &Step) -> Result<(), String> {
             {
                 emit(app, engine, "phase", "checking the installer's signature".to_string());
                 let quoted = path_s.replace('\'', "''");
-                let status = Command::new("powershell")
+                let status = crate::proc::command("powershell")
                     .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-AuthenticodeSignature -LiteralPath '{quoted}').Status")])
                     .output()
                     .map_err(|e| format!("check the installer's signature: {e}"))?;
@@ -1149,7 +1149,7 @@ fn run_step(app: &AppHandle, engine: &str, step: &Step) -> Result<(), String> {
                     return Err(format!("the downloaded installer isn't validly signed ({status}); not running it"));
                 }
                 emit(app, engine, "phase", "launching the installer".to_string());
-                let run = Command::new("cmd")
+                let run = crate::proc::command("cmd")
                     .args(["/C", "start", "", &path_s])
                     .status()
                     .map_err(|e| format!("launch installer: {e}"))?;
@@ -1168,7 +1168,7 @@ fn run_step(app: &AppHandle, engine: &str, step: &Step) -> Result<(), String> {
                     let _ = std::fs::set_permissions(&path, perm);
                 }
                 emit(app, engine, "phase", "launching the AppImage".to_string());
-                let run = Command::new(&path_s)
+                let run = crate::proc::command(&path_s)
                     .status()
                     .map_err(|e| format!("launch AppImage: {e}"))?;
                 if !run.success() {
@@ -1240,7 +1240,7 @@ fn start_lm_studio_core(wait_cli_secs: u64) -> Result<(), String> {
     // `lms server start` prints "Success! Server is now running on port 1234" and returns. The CLI
     // lingers after an app uninstall and will exit non-zero, so DON'T trust its exit alone — the
     // arbiter is whether :1234 actually serves.
-    let out = Command::new(&lms).args(["server", "start"]).output().map_err(|e| format!("lms server start: {e}"))?;
+    let out = crate::proc::command(&lms).args(["server", "start"]).output().map_err(|e| format!("lms server start: {e}"))?;
     if let Ok(client) = openhydra_agent::ReqwestClient::new() {
         for _ in 0..12 {
             if client.get(health_url("lm-studio")).is_ok() {
@@ -1343,7 +1343,7 @@ fn docker_image_present(image: &str) -> bool {
     }
     let mut timed_out = false;
     let present = resolve_program("docker").is_some_and(|docker| {
-        let mut cmd = Command::new(docker);
+        let mut cmd = crate::proc::command(docker);
         cmd.args(["image", "inspect", "--format", "{{.Id}}", image])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1409,7 +1409,7 @@ pub fn run_engine(engine: &str) -> Result<(), String> {
                     .to_string()
             })?;
             // Idempotent: if the launch agent already serves :11434 this exits fast; harmless.
-            Command::new(&bin)
+            crate::proc::command(&bin)
                 .arg("serve")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

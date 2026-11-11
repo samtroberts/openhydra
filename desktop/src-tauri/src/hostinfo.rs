@@ -16,7 +16,6 @@
 //! Apple Silicon has **unified memory** (the GPU shares system RAM), so its GPU entry is
 //! flagged `unified: true` with `vram_bytes = ram_bytes` rather than a separate pool.
 
-use std::process::Command;
 
 use serde::Serialize;
 
@@ -79,7 +78,7 @@ fn parse_python_version(s: &str) -> Option<String> {
 }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
+    let out = crate::proc::command(program).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }

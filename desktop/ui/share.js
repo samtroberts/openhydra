@@ -500,7 +500,7 @@ import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter, swarmChoices } fr
       // Global opens the consent gate; Private clears the model's consent. Distinct from the on/off
       // share switch so the two are never confused. `device`/unknown highlights Private.
       const reachPill = sharedIntent
-        ? html`<span class="reach-pill" title="How far this model reaches"><button class="rp ${gl ? "" : "sel"}" data-reach="${m}" data-to="private" title="${SCOPE_META.private.title}">🔒 Private</button><button class="rp ${gl ? "sel" : ""}" data-reach="${m}" data-to="global" title="${SCOPE_META.global.title}">🌐 Global</button></span>`
+        ? html`<span class="reach-pill" title="How far this model reaches"><button class="rp ${gl ? "" : "sel"}" data-reach="${m}" data-to="private" title="${SCOPE_META.private.title}">🔒<span class="rpl"> Private</span></button><button class="rp ${gl ? "sel" : ""}" data-reach="${m}" data-to="global" title="${SCOPE_META.global.title}">🌐<span class="rpl"> Global</span></button></span>`
         : "";
       // M2/M4: export a signed `.openhydra` card. A GLOBAL model → a public card (a link anyone can
       // use). A PRIVATE model (M4) → a private card bound to a swarm you own (only members can serve
@@ -514,7 +514,7 @@ import { SWARM_BINDING_ASKED, modelsToAskAbout, bindingsAfter, swarmChoices } fr
       const netName = pub !== m && pub !== displayModelName(m)
         ? html` <span class="mut" title="Other machines and connected tools use this name">· on the network as ${pub}</span>`
         : "";
-      rows.push(html`<tr><td>${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b>${netName}</td><td>${engineFor(m) || "—"}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${m}" data-name="Share ${displayModelName(m)}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
+      rows.push(html`<tr><td class="shmodel">${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b>${netName}</td><td>${engineFor(m) || "—"}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td><div class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${m}" data-name="Share ${displayModelName(m)}" title="${swTitle}"></div>${reachPill}${cardBtn}</div></td></tr>`);
     }
     // The table is rebuilt on every refresh: a model's switch that had keyboard focus keeps it.
     const focused = document.activeElement?.closest?.("#servetable [data-share]")?.dataset.share;
