@@ -1198,12 +1198,9 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
         "provider_authenticity": summary.authenticity.map(|t| t.label()),
         // The model's card provider couldn't serve and another provider of the same version did:
         // never silent (the app shows it under the reply).
-        "card": summary.card_fallback.as_ref().map(|reason| json!({ "fell_back": true, "reason": reason })),
+        "card": card_fallback_value(summary),
         // `openhydra/auto`'s earlier choices that failed before answering: never silent.
-        "auto_fallback": (!summary.auto_skipped.is_empty()).then(|| json!({
-            "tried": summary.auto_skipped.iter().map(|(m, why)| json!({ "model": m, "error": why })).collect::<Vec<_>>(),
-            "text": auto_fallback_text(&summary.auto_skipped),
-        })),
+        "auto_fallback": auto_fallback_value(summary),
         // Where it was served (this machine, a private swarm, the private or the public network):
         // shown under the reply, so a person always knows where their prompt went.
         "served_on": summary.served_on.key(),
@@ -2233,6 +2230,25 @@ fn anthropic_openhydra(summary: &ServeSummary) -> Value {
         "provider_authenticity": summary.authenticity.map(|t| t.label()),
         "served_on": summary.served_on.key(),
         "served_on_text": summary.served_on.phrase(),
+        // As on the OpenAI surface: a fallback is never silent, whichever API asked.
+        "card": card_fallback_value(summary),
+        "auto_fallback": auto_fallback_value(summary),
+    })
+}
+
+/// A card's provider couldn't serve and another provider of the same version did; else null.
+fn card_fallback_value(summary: &ServeSummary) -> Value {
+    summary.card_fallback.as_ref().map(|reason| json!({ "fell_back": true, "reason": reason })).unwrap_or(Value::Null)
+}
+
+/// `openhydra/auto`'s earlier choices that failed before answering, and the line about them; else null.
+fn auto_fallback_value(summary: &ServeSummary) -> Value {
+    if summary.auto_skipped.is_empty() {
+        return Value::Null;
+    }
+    json!({
+        "tried": summary.auto_skipped.iter().map(|(m, why)| json!({ "model": m, "error": why })).collect::<Vec<_>>(),
+        "text": auto_fallback_text(&summary.auto_skipped),
     })
 }
 
@@ -3852,6 +3868,11 @@ mod tests {
         assert_eq!(v["model"], "next-model");
         assert_eq!(v["openhydra"]["auto_fallback"]["tried"][0]["model"], "first-model");
         assert!(v["openhydra"]["auto_fallback"]["text"].as_str().unwrap().contains("first chose `first-model`"));
+        // The Anthropic surface says the same.
+        let mut s = summary(1, 2);
+        s.auto_skipped = vec![("first-model".into(), "refused".into())];
+        assert_eq!(anthropic_openhydra(&s)["auto_fallback"]["tried"][0]["model"], "first-model");
+        assert!(anthropic_openhydra(&summary(1, 2))["auto_fallback"].is_null());
     }
 
     #[tokio::test]
