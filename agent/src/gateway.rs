@@ -606,6 +606,12 @@ fn auto_providers(c: &crate::consumer::AutoCandidates, model: &str, step: AutoSt
     Some(ids)
 }
 
+/// Whether a `/model` pin may be used under `c`'s rules (the Preferred step's: a swarm member's pin
+/// only where its swarm reaches).
+fn pin_reachable(c: &crate::consumer::AutoCandidates, pin: &str) -> bool {
+    matches!(pick_auto(c, Some(pin), AutoNeeds::default()), Ok((m, AutoStep::Preferred)) if m == pin)
+}
+
 /// [`pick_auto`] for a request with no special needs: just the model.
 #[cfg(test)]
 pub(crate) fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
@@ -616,6 +622,18 @@ pub(crate) fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Op
 const NOTHING_IN_SWARM: &str = "openhydra/auto stays inside your private swarm, and found no model there: none \
     on this machine and none from your swarm's cards. Share a model from this machine, ask your swarm \
     to share one, or name a model to choose it yourself.";
+
+/// Added to [`NOTHING_IN_SWARM`] when the member's credentials have all expired.
+const SWARM_CREDENTIAL_EXPIRED: &str = "Your swarm membership has expired: ask the swarm's owner to \
+    renew it (Swarms), or leave the swarm to use the public network.";
+
+/// Added to a `/model` reply when the chosen model isn't on this machine or one of the swarm's cards.
+fn pin_outside_swarm_note(model: &str) -> String {
+    format!(
+        "Note: you're in a private swarm, so `{model}` is used only while it's on this machine or on one \
+         of your swarm's cards. Until then `auto` keeps choosing inside your swarm."
+    )
+}
 
 /// The reply when every model `auto` trusts is too small for a request's tools.
 fn too_small_for_tools_message(models: &[String]) -> String {
@@ -738,17 +756,21 @@ async fn resolve_model(
     // Now we're picking (request said `auto`, or an unservable id on the Anthropic surface):
     // a `/model <id>` session pin wins next — but only if it's a concrete model currently served
     // (a stale/typo'd pin falls through to the auto default rather than erroring).
-    if let Some(sel) = session_override.map(str::trim).filter(|s| !s.is_empty()) {
-        if !is_auto_model(sel) && known.iter().any(|m| m == sel) {
-            return Ok((sel.to_string(), Route::SessionPin, None));
-        }
-    }
-    // …else the auto default (see `pick_auto_model` for the order).
+    let pin = session_override.map(str::trim).filter(|s| !s.is_empty() && !is_auto_model(s) && known.iter().any(|m| m == *s));
     let preferred = std::env::var("OPENHYDRA_AUTO_MODEL").ok();
     let node = state.node.clone();
     let mut candidates = tokio::task::spawn_blocking(move || node.auto_candidates(min_authenticity))
         .await
         .map_err(|_| "model resolution failed".to_string())??;
+    // The pin follows the same rules as the operator's preferred model: in a private swarm it counts
+    // only where the swarm reaches (this machine, the swarm's cards) and is served only by those
+    // providers; elsewhere any provider, this machine's own first (audit 11 Nov, finding 5).
+    if let Some(sel) = pin {
+        if pin_reachable(&candidates, sel) {
+            return Ok((sel.to_string(), Route::SessionPin, auto_providers(&candidates, sel, AutoStep::Preferred)));
+        }
+    }
+    // …else the auto default (see `pick_auto_model` for the order).
     let mut picked = pick_auto(&candidates, preferred.as_deref(), needs);
     // Nothing trusted yet (a node that just started hasn't heard the announcements): ask the
     // bootstraps for the seed models once, then pick again.
@@ -769,6 +791,7 @@ async fn resolve_model(
         }
         Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
         Err(AutoMiss::TooSmallForTools(small)) => Err(too_small_for_tools_message(&small)),
+        Err(AutoMiss::NothingInSwarm) if candidates.swarm_credential_expired => Err(format!("{NOTHING_IN_SWARM} {SWARM_CREDENTIAL_EXPIRED}")),
         Err(AutoMiss::NothingInSwarm) => Err(NOTHING_IN_SWARM.to_string()),
     }
 }
@@ -783,16 +806,35 @@ async fn resolve_model(
 // settle no receipt.
 
 /// The session identity a `/model` pin is stored under: the caller's API key (Bearer or the
-/// Anthropic `x-api-key`), else a single shared `local` session for the open loopback default.
-/// Matches how a coding-tool session behaves (one fixed key ⇒ one selection).
+/// Anthropic `x-api-key`), else a single shared `local` session for the open loopback default,
+/// plus the client's name from its `User-Agent`. Every tool the app connects shares one gateway
+/// key, so the key alone gave them one shared pin: a `/model` typed in OpenCode steered Claude
+/// Code too (audit 11 Nov, finding 5).
 fn session_key(headers: &axum::http::HeaderMap) -> String {
-    headers
+    let base = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .map(|k| format!("key:{k}"))
-        .unwrap_or_else(|| "local".to_string())
+        .unwrap_or_else(|| "local".to_string());
+    match headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).and_then(client_name) {
+        Some(client) => format!("{base}|{client}"),
+        None => base,
+    }
+}
+
+/// A client's name from its `User-Agent`: the first product token, lower-cased, without its
+/// version (`claude-cli/2.0.1 (external, cli)` → `claude-cli`, `opencode/0.15` → `opencode`).
+fn client_name(user_agent: &str) -> Option<String> {
+    let token = user_agent.split(['/', ' ']).next()?.trim();
+    let name: String = token
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (!name.is_empty()).then_some(name)
 }
 
 /// The plain text of the latest user turn, iff it's an ordinary user message (not a tool result
@@ -912,8 +954,15 @@ async fn handle_slash(state: &AppState, skey: &str, cmd: SlashCommand) -> String
     };
     let current = state.sessions.get(skey);
     let last_auto = state.last_auto.get(skey);
-    let result = slash::render(&cmd, &known, current.as_deref(), last_auto.as_deref());
+    let mut result = slash::render(&cmd, &known, current.as_deref(), last_auto.as_deref());
     if let Some(model) = result.set_model {
+        // In a private swarm the choice only applies where the swarm reaches: say so now, rather
+        // than letting `auto` quietly keep choosing something else.
+        let node = state.node.clone();
+        let candidates = tokio::task::spawn_blocking(move || node.auto_candidates(None)).await.ok().and_then(Result::ok);
+        if candidates.is_some_and(|c| c.swarm_only && !is_auto_model(&model) && !pin_reachable(&c, &model)) {
+            result.reply.push_str(&format!("\n\n{}", pin_outside_swarm_note(&model)));
+        }
         state.sessions.set(skey, model);
     }
     result.reply
@@ -3224,8 +3273,16 @@ mod tests {
         c.swarm_card_models = vec!["qwen3:8b".into()];
         assert_eq!(pick_auto(&c, Some("qwen3:8b"), AutoNeeds::default()), Ok(("qwen3:8b".into(), AutoStep::Preferred)));
         assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::Preferred), Some(["12D3Swarm".to_string()].into()));
+        // A `/model` pin follows the same rule (audit 11 Nov, finding 5): a public model pinned by a
+        // swarm member isn't used, and the `/model` reply says so.
+        assert!(pin_reachable(&c, "qwen3:8b"));
+        assert!(!pin_reachable(&c, "llama3.1:70b"), "a pinned public model isn't used inside a swarm");
+        assert!(pin_outside_swarm_note("llama3.1:70b").contains("private swarm"));
         // The reply says why.
         assert!(NOTHING_IN_SWARM.contains("stays inside your private swarm"));
+        // Outside a swarm the pin is used as before.
+        c.swarm_only = false;
+        assert!(pin_reachable(&c, "llama3.1:70b"));
     }
 
     /// On a keyed private network every provider is the organisation's: a tool request with only
@@ -3870,6 +3927,18 @@ mod tests {
         h.insert("x-api-key", "xyz".parse().unwrap());
         assert_eq!(session_key(&h), "key:xyz");
         assert_eq!(session_key(&HeaderMap::new()), "local");
+        // Tools sharing one key get a pin each, told apart by their client name.
+        let with = |ua: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::AUTHORIZATION, "Bearer abc".parse().unwrap());
+            h.insert(axum::http::header::USER_AGENT, ua.parse().unwrap());
+            session_key(&h)
+        };
+        assert_eq!(with("claude-cli/2.0.1 (external, cli)"), "key:abc|claude-cli");
+        assert_eq!(with("opencode/0.15.3 ai-sdk/5"), "key:abc|opencode");
+        assert_ne!(with("claude-cli/2.0.1"), with("opencode/0.15.3"));
+        assert_eq!(with("claude-cli/2.0.1"), with("claude-cli/2.0.9"), "a version bump keeps the pin");
+        assert_eq!(with("///"), "key:abc", "no usable name: the key alone");
     }
 
     #[tokio::test]

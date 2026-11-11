@@ -739,11 +739,21 @@ impl CredentialStore {
     }
 
     /// Whether this node is in a private swarm: it owns one (it created it; the app keeps owner
-    /// records in the same folder) or holds a live membership credential for one.
-    pub fn in_a_swarm(&self, now_ms: u64) -> bool {
+    /// records in the same folder) or holds a membership credential for one, live or expired. An
+    /// expired credential still counts until the user leaves the swarm: otherwise `auto` would
+    /// silently go public the moment it lapsed (audit 11 Nov, finding 7).
+    pub fn in_a_swarm(&self) -> bool {
         self.refresh();
         let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        c.owns || c.creds.iter().any(|cr| now_ms < cr.expires_at)
+        c.owns || !c.creds.is_empty()
+    }
+
+    /// In a swarm only through credentials that have all expired (owns none): the swarm's models
+    /// can't be used until the owner renews one.
+    pub fn only_expired_credentials(&self, now_ms: u64) -> bool {
+        self.refresh();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        !c.owns && !c.creds.is_empty() && c.creds.iter().all(|cr| now_ms >= cr.expires_at)
     }
 
     /// The best membership credential to present right now — the first that hasn't expired. `None`

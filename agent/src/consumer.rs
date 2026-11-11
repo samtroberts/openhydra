@@ -2188,6 +2188,9 @@ pub struct AutoCandidates {
     /// on the public network: `auto` stays inside the swarm (this machine, the swarm's cards) and never falls
     /// back to the public network (Sam, 11 Nov).
     pub swarm_only: bool,
+    /// [`Self::swarm_only`] through membership credentials that have all expired: the swarm's
+    /// models can't be used until the owner renews one, and `auto` says so.
+    pub swarm_credential_expired: bool,
     /// On a keyed private network: every provider is the organisation's, so the network's steps
     /// count as the swarm.
     pub private_network: bool,
@@ -3583,7 +3586,8 @@ impl ConsumerNode {
     ) -> AutoCandidates {
         let private_network = openhydra_network::transport::private_network_key().is_some();
         // In a swarm: a member (a live credential) or its owner (Sam, 11 Nov: owners too).
-        let swarm_only = !private_network && self.creds.as_ref().is_some_and(|c| c.in_a_swarm(now));
+        let swarm_only = !private_network && self.creds.as_ref().is_some_and(|c| c.in_a_swarm());
+        let swarm_credential_expired = swarm_only && self.creds.as_ref().is_some_and(|c| c.only_expired_credentials(now));
         let member = |swarm: &str| self.creds.as_ref().is_some_and(|c| c.credential_for_swarm(swarm, now).is_some());
         // Usable cards only (a private card of a swarm this node isn't in can't serve it); a swarm
         // member's `auto` uses its swarms' private cards alone.
@@ -3636,6 +3640,7 @@ impl ConsumerNode {
             card_providers,
             swarm_card_models,
             swarm_only,
+            swarm_credential_expired,
             private_network,
             earned,
             tiers,
@@ -8047,6 +8052,7 @@ mod tests {
             .with_credentials(Some(crate::swarms::CredentialStore::new(owner_dir.clone())));
         let c = owner.auto_candidates_from(vec![], None, now);
         assert!(c.swarm_only, "an owner's auto stays in its swarm too");
+        assert!(!c.swarm_credential_expired);
         assert!(c.card_models.is_empty(), "no public card for it");
 
         // Not a member of anything.
@@ -8072,6 +8078,14 @@ mod tests {
         assert_eq!(sorted(c.card_models), vec!["acme-model".to_string()], "its swarm's card only: no public card, no other swarm's");
         assert_eq!(c.swarm_card_models, vec!["acme-model".to_string()]);
         assert_eq!(c.card_providers.len(), 1);
+        assert!(!c.swarm_credential_expired);
+
+        // Its credential expired: still swarm-only (it hasn't left), and the refusal can say why.
+        let later = now + 3_600_000 * 1_000 + 1; // the credential's TTL above is in seconds
+        let c = node.auto_candidates_from(vec![], None, later);
+        assert!(c.swarm_only, "an expired credential never turns swarm-only off");
+        assert!(c.swarm_credential_expired);
+        assert!(c.swarm_card_models.is_empty(), "an expired credential can't use the swarm's cards");
     }
 
     /// An owner-chosen swarm name, as `/model` and the app show it.
