@@ -2999,7 +2999,13 @@ fn stream_events(chunk: &serde_json::Value) -> Vec<serde_json::Value> {
     }
     let choice = &chunk["choices"][0];
     if let Some(t) = choice["delta"]["content"].as_str().filter(|t| !t.is_empty()) {
-        out.push(serde_json::json!({ "kind": "delta", "text": t }));
+        // The chunk's model: after `auto` moved to its next choice, the model actually answering, so a
+        // reply that's stopped before its final chunk still names it (review 11 Nov).
+        let mut ev = serde_json::json!({ "kind": "delta", "text": t });
+        if let Some(m) = chunk.get("model").and_then(serde_json::Value::as_str) {
+            ev["model"] = serde_json::json!(m);
+        }
+        out.push(ev);
     }
     if let Some(t) = choice["delta"]["reasoning_content"].as_str().filter(|t| !t.is_empty()) {
         out.push(serde_json::json!({ "kind": "reasoning", "text": t }));
@@ -4381,6 +4387,9 @@ mod tests {
     fn stream_chunks_become_ui_events() {
         let delta = serde_json::json!({ "choices": [{ "delta": { "content": "Hel" }, "finish_reason": null }] });
         assert_eq!(stream_events(&delta), vec![serde_json::json!({ "kind": "delta", "text": "Hel" })]);
+        // A chunk naming its model passes it on (after `auto`'s next choice took over, that model).
+        let named = serde_json::json!({ "model": "qwen2.5-coder:1.5b", "choices": [{ "delta": { "content": "Hi" }, "finish_reason": null }] });
+        assert_eq!(stream_events(&named), vec![serde_json::json!({ "kind": "delta", "text": "Hi", "model": "qwen2.5-coder:1.5b" })]);
         // A card's provider that couldn't serve: its own message and the details the chat acts on.
         let card = serde_json::json!({ "error": { "type": "card_provider_unavailable", "message": "qwen: the card's provider is offline.",
             "openhydra": { "private": false, "reason": "offline", "alternatives": 2, "fallback": "ask" } } });

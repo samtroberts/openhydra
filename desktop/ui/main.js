@@ -365,7 +365,7 @@ async function sendOne(text, fromHome) {
     const tr = $("[data-label='tempk']"), tv = +(tr?.dataset.val);
     const temperature = tr?.dataset.touched && Number.isFinite(tv) ? Math.round(tv * 100) / 100 : undefined;
     const resp = await completeChat({ model, messages, maxTokens: tokLimit, temperature, fallback }, th, wait, slow);
-    if (resp?.stopped) { s.m.push(["ai", resp.text || "", { model, tok: "—", tps: "—", rtt: "—", tier: null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), stopped: resp.why || "stopped" }, resp.reasoning || null]); saveSessions(); renderChat(); return; }
+    if (resp?.stopped) { s.m.push(["ai", resp.text || "", { model: resp.model || model, tok: "—", tps: "—", rtt: "—", tier: null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), stopped: resp.why || "stopped" }, resp.reasoning || null]); saveSessions(); renderChat(); return; }
     clearTimeout(slow); wait.remove();
     const msg = resp?.choices?.[0]?.message || {};
     const split = splitThink(msg.content || "");                 // pull inline <think> out of the answer
@@ -443,7 +443,7 @@ async function completeChat(args, th, wait, slow) {
   const live = document.createElement("div"); live.className = "msg ai"; live.style.whiteSpace = "pre-wrap";
   const view = { chat: curChat, live, wait, started: false };
   liveView = view;
-  let text = "", reasoning = "", done = null, error = null, stopped = false, incomplete = false, errorDetails = null;
+  let text = "", reasoning = "", done = null, error = null, stopped = false, incomplete = false, errorDetails = null, answering = "";
   // The last event is "end": large messages (an image as a data URL) can arrive after the command
   // itself has returned, so the reply is complete only once "end" is seen.
   let ended; const endSeen = new Promise((r) => (ended = r));
@@ -459,7 +459,7 @@ async function completeChat(args, th, wait, slow) {
   };
   ch.onmessage = (ev) => {
     if (ev.kind === "delta" || ev.kind === "reasoning") {
-      if (ev.kind === "delta") text += ev.text; else reasoning += ev.text;
+      if (ev.kind === "delta") { text += ev.text; if (typeof ev.model === "string" && ev.model) answering = ev.model; } else reasoning += ev.text;
       if (!view.started) { view.started = true; clearTimeout(slow); wait.remove(); }
       if (!frame) frame = requestAnimationFrame(paint);
     } else if (ev.kind === "done") done = ev;
@@ -481,7 +481,7 @@ async function completeChat(args, th, wait, slow) {
   const sp = splitThink(text);
   // A stopped, failed or cut-off reply keeps what arrived (and says so) instead of losing it.
   if (stopped || ((error || incomplete) && (sp.answer || sp.reasoning || reasoning))) {
-    return { stopped: true, why: stopped ? "stopped" : error ? `ended with an error: ${error}` : "ended early", text: sp.answer, reasoning: [reasoning, sp.reasoning].filter(Boolean).join("\n") };
+    return { stopped: true, why: stopped ? "stopped" : error ? `ended with an error: ${error}` : "ended early", text: sp.answer, reasoning: [reasoning, sp.reasoning].filter(Boolean).join("\n"), model: answering };
   }
   // The details (a card's provider that couldn't serve) ride along: String(e) is still the message.
   if (error) throw errorDetails ? Object.assign(new String(error), { details: errorDetails }) : error;
