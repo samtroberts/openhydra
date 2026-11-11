@@ -198,6 +198,9 @@ enum GatewayEvent {
     /// The error's text, its HTTP status and OpenAI error `type` ([`error_class`]), and details a
     /// client can act on ([`error_details`]; a card's provider that couldn't serve).
     Error(String, ErrorClass, Option<Value>),
+    /// `openhydra/auto`'s choice failed before answering and its next choice, this model, is being
+    /// tried: what the reply reports as its model from here on. Sent before any text.
+    Rerouted(String),
 }
 
 /// An error's HTTP status and OpenAI error `type`.
@@ -606,6 +609,56 @@ fn auto_providers(c: &crate::consumer::AutoCandidates, model: &str, step: AutoSt
     Some(ids)
 }
 
+/// What model resolution settled on: the model, how it was chosen, the providers it may go to
+/// (`None`: any), and for `openhydra/auto` its next choices in order, should this one fail.
+type Resolved = (String, Route, Option<std::collections::HashSet<String>>, Vec<AutoAlternate>);
+
+/// One of `openhydra/auto`'s next choices: the model, its step, the providers it may go to.
+type AutoAlternate = (String, AutoStep, Option<std::collections::HashSet<String>>);
+
+/// How many further choices `openhydra/auto` tries when its first fails before answering.
+const MAX_AUTO_ALTERNATES: usize = 2;
+
+/// `c` without any of `models`: no provider, card or swarm card of them.
+fn without_models(c: &crate::consumer::AutoCandidates, models: &[String]) -> crate::consumer::AutoCandidates {
+    let gone = |m: &String| models.contains(m);
+    let mut c = c.clone();
+    c.providers.retain(|k| !gone(&k.model_id));
+    c.card_models.retain(|m| !gone(m));
+    c.swarm_card_models.retain(|m| !gone(m));
+    c.card_providers.retain(|m, _| !gone(m));
+    c
+}
+
+/// `openhydra/auto`'s next choices after `first`, by the same rules (a swarm member's stay inside
+/// its swarm, this machine first, tools need a big enough model), each with the providers its
+/// step allows: what the gateway tries, in order, when a choice fails before answering (a revoked
+/// swarm card, this machine's engine down). Review 11 Nov: `auto` used to fail on its first choice.
+fn auto_alternates(
+    c: &crate::consumer::AutoCandidates,
+    preferred: Option<&str>,
+    needs: AutoNeeds,
+    first: &str,
+    max: usize,
+) -> Vec<AutoAlternate> {
+    let mut tried = vec![first.to_string()];
+    let mut out = Vec::new();
+    while out.len() < max {
+        let rest = without_models(c, &tried);
+        let Ok((model, step)) = pick_auto(&rest, preferred, needs) else { break };
+        let only = auto_providers(&rest, &model, step);
+        tried.push(model.clone());
+        out.push((model, step, only));
+    }
+    out
+}
+
+/// The line under a reply when `openhydra/auto` answered with a later choice.
+fn auto_fallback_text(skipped: &[(String, String)]) -> String {
+    let names: Vec<String> = skipped.iter().map(|(m, _)| format!("`{m}`")).collect();
+    format!("openhydra/auto first chose {}, which couldn't answer; this is its next choice", names.join(", then "))
+}
+
 /// Whether a `/model` pin may be used under `c`'s rules (the Preferred step's: a swarm member's pin
 /// only where its swarm reaches).
 fn pin_reachable(c: &crate::consumer::AutoCandidates, pin: &str) -> bool {
@@ -732,17 +785,17 @@ async fn resolve_model(
     session_override: Option<&str>,
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
     needs: AutoNeeds,
-) -> Result<(String, Route, Option<std::collections::HashSet<String>>), String> {
+) -> Result<Resolved, String> {
     let auto = is_auto_model(requested);
     // A concrete BYOK-mapped model is served directly (never announced on the swarm) — pass it
     // through untouched, and skip the discovery query entirely.
     if !auto && state.byok.provider_for(requested).is_some() {
-        return Ok((requested.to_string(), Route::Byok, None));
+        return Ok((requested.to_string(), Route::Byok, None, Vec::new()));
     }
     // Fast path: a concrete model on the strict (OpenAI) surface needs no discovery query.
     // An explicit concrete model in the request always wins over any `/model` session pin.
     if !auto && !fallback_unservable {
-        return Ok((requested.to_string(), Route::Requested, None));
+        return Ok((requested.to_string(), Route::Requested, None, Vec::new()));
     }
     let node = state.node.clone();
     let known = tokio::task::spawn_blocking(move || node.known_models())
@@ -751,7 +804,7 @@ async fn resolve_model(
         .map_err(|e| e)?;
     // A concrete model that's actually served is used as-is (also wins over a session pin).
     if !auto && served_as_named(requested, fallback_unservable, &known) {
-        return Ok((requested.to_string(), Route::Requested, None));
+        return Ok((requested.to_string(), Route::Requested, None, Vec::new()));
     }
     // Now we're picking (request said `auto`, or an unservable id on the Anthropic surface):
     // a `/model <id>` session pin wins next — but only if it's a concrete model currently served
@@ -770,7 +823,7 @@ async fn resolve_model(
     // pin being skipped for another model without a word (review 11 Nov).
     if let Some(sel) = pin {
         if !candidates.swarm_only || pin_reachable(&candidates, sel) {
-            return Ok((sel.to_string(), Route::SessionPin, auto_providers(&candidates, sel, AutoStep::Preferred)));
+            return Ok((sel.to_string(), Route::SessionPin, auto_providers(&candidates, sel, AutoStep::Preferred), Vec::new()));
         }
     }
     // …else the auto default (see `pick_auto_model` for the order).
@@ -790,7 +843,8 @@ async fn resolve_model(
     match picked {
         Ok((model, step)) => {
             let only = auto_providers(&candidates, &model, step);
-            Ok((model, Route::Auto(step, needs), only))
+            let next = auto_alternates(&candidates, preferred.as_deref(), needs, &model, MAX_AUTO_ALTERNATES);
+            Ok((model, Route::Auto(step, needs), only, next))
         }
         Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
         Err(AutoMiss::TooSmallForTools(small)) if candidates.swarm_credential_expired => {
@@ -1145,6 +1199,11 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
         // The model's card provider couldn't serve and another provider of the same version did:
         // never silent (the app shows it under the reply).
         "card": summary.card_fallback.as_ref().map(|reason| json!({ "fell_back": true, "reason": reason })),
+        // `openhydra/auto`'s earlier choices that failed before answering: never silent.
+        "auto_fallback": (!summary.auto_skipped.is_empty()).then(|| json!({
+            "tried": summary.auto_skipped.iter().map(|(m, why)| json!({ "model": m, "error": why })).collect::<Vec<_>>(),
+            "text": auto_fallback_text(&summary.auto_skipped),
+        })),
         // Where it was served (this machine, a private swarm, the private or the public network):
         // shown under the reply, so a person always knows where their prompt went.
         "served_on": summary.served_on.key(),
@@ -1284,19 +1343,23 @@ fn filter_tool_calls(
     (kept, dropped)
 }
 
+/// One model for the worker to try: the model, the providers it may go to (`None`: any), and
+/// whether that is this machine's own provider alone (`auto`'s own-machine step).
+type WorkerChoice = (String, Option<std::collections::HashSet<String>>, bool);
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker(
     node: Arc<ConsumerNode>,
-    model: String,
+    first: WorkerChoice,
+    next: Vec<WorkerChoice>,
     messages: Vec<ChatMessage>,
     max_tokens: Option<u32>,
     temperature: Option<f64>,
     tools: Vec<Value>,
     think: Option<bool>,
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
-    only: Option<std::collections::HashSet<String>>,
     fallback: Option<crate::cards::CardFallback>,
     gen_permit: OwnedSemaphorePermit,
-    own_machine: bool,
     remember: Option<(Arc<SessionModels>, String)>,
 ) -> (
     EventRx,
@@ -1311,7 +1374,7 @@ fn spawn_worker(
         // Set once the client is gone (its receiver dropped): the serve stops reading, closes the
         // stream and pays for what was read, instead of reading (and paying for) the rest (S8).
         let gone = std::sync::atomic::AtomicBool::new(false);
-        let mut on_delta = |d: &str| {
+        let on_delta = |d: &str| {
             if tx.blocking_send(GatewayEvent::Delta(d.to_string())).is_err() {
                 gone.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1319,21 +1382,46 @@ fn spawn_worker(
         // Or gone before any delta (during discovery or prefill): its receiver is already dropped.
         let cancel = || gone.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed();
         let offered = offered_tool_names(&tools);
-        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, only.as_ref(), fallback, &cancel, &mut on_delta) {
-            Ok(mut summary) => {
-                let (kept, dropped) = filter_tool_calls(std::mem::take(&mut summary.tool_calls), &offered);
-                if dropped > 0 {
-                    tracing::warn!(%model, dropped, kept = kept.len(), "dropped tool calls the request didn't offer or that were malformed");
+        // `openhydra/auto`'s choices in order: the next is tried only when one failed before any
+        // text reached the client (nothing can be taken back once it has), and the client is still
+        // there. A named model, a pin or a card has no next choice.
+        let mut skipped: Vec<(String, String)> = Vec::new();
+        let mut choices = std::iter::once(first).chain(next).peekable();
+        while let Some((model, only, own_machine)) = choices.next() {
+            let delivered = std::cell::Cell::new(false);
+            let mut track = |d: &str| {
+                delivered.set(true);
+                on_delta(d)
+            };
+            let result = node.complete(&model, messages.clone(), max_tokens, temperature, tools.clone(), think, min_authenticity, only.as_ref(), fallback, &cancel, &mut track);
+            match result {
+                Ok(mut summary) => {
+                    let (kept, dropped) = filter_tool_calls(std::mem::take(&mut summary.tool_calls), &offered);
+                    if dropped > 0 {
+                        tracing::warn!(%model, dropped, kept = kept.len(), "dropped tool calls the request didn't offer or that were malformed");
+                    }
+                    summary.tool_calls = kept;
+                    summary.auto_skipped = std::mem::take(&mut skipped);
+                    if let (Some((last_auto, key)), Some(place)) = (&remember, summary.served_on.phrase()) {
+                        last_auto.set(key, auto_choice_text(&model, &place));
+                    }
+                    let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
+                    return;
                 }
-                summary.tool_calls = kept;
-                if let (Some((last_auto, key)), Some(place)) = (&remember, summary.served_on.phrase()) {
-                    last_auto.set(key, auto_choice_text(&model, &place));
+                Err(e) => {
+                    let e = if own_machine { own_machine_failure(&model, e) } else { e };
+                    let cancelled = cancel() || matches!(e, crate::adapter::AdapterError::Cancelled(_));
+                    if let Some((next_model, _, _)) = choices.peek().filter(|_| !delivered.get() && !cancelled) {
+                        tracing::warn!(%model, next = %next_model, error = %e, "openhydra/auto: choice failed before answering; trying the next");
+                        skipped.push((model.clone(), e.message().to_string()));
+                        if tx.blocking_send(GatewayEvent::Rerouted(next_model.clone())).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e), error_details(&e)));
+                    return;
                 }
-                let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
-            }
-            Err(e) => {
-                let e = if own_machine { own_machine_failure(&model, e) } else { e };
-                let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e), error_details(&e)));
             }
         }
     });
@@ -1524,7 +1612,7 @@ async fn spawn_dispatch(
     // Resolve `openhydra/auto` (and, on the Anthropic surface, an unservable id) to a concrete
     // model. BYOK-mapped ids are recognised inside `resolve_model` so they're never rewritten.
     let needs = AutoNeeds { tools: !tools.is_empty() };
-    let (model, route, only) = resolve_model(state, requested_model, fallback_unservable, session_override, min_authenticity, needs)
+    let (model, route, only, next) = resolve_model(state, requested_model, fallback_unservable, session_override, min_authenticity, needs)
         .await
         .map_err(DispatchErr::NoModels)?;
     // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing the
@@ -1549,7 +1637,9 @@ async fn spawn_dispatch(
         let own_machine = matches!(route, Route::Auto(AutoStep::OwnMachine, _));
         // An `auto` choice is remembered for the session once it served, for `/model` to report.
         let remember = matches!(route, Route::Auto(..)).then(|| (state.last_auto.clone(), session_key(headers)));
-        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, gen_permit, own_machine, remember)
+        let first = (model.clone(), only, own_machine);
+        let next = next.into_iter().map(|(m, step, only)| (m, only, step == AutoStep::OwnMachine)).collect();
+        spawn_worker(state.node.clone(), first, next, messages, max_tokens, temperature, tools, think, min_authenticity, fallback, gen_permit, remember)
     };
     Ok((model, route, rx, started))
 }
@@ -1670,6 +1760,7 @@ fn spawn_byok_worker(
                     served_model: String::new(),
                     card_fallback: None,
                     served_on: crate::serve::ServedOn::HostedApi(byok_display_name(provider).into()),
+                    auto_skipped: Vec::new(),
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -1704,12 +1795,17 @@ fn stream_response(
         let data = stream_chunk(&id, &model, created, json!({ "role": "assistant" }), None);
         tokio_stream::once(Ok::<Event, std::convert::Infallible>(Event::default().data(data)))
     };
-    let (id_s, model_s) = (id.clone(), model.clone());
+    let (id_s, mut model_s) = (id.clone(), model.clone());
     // P1 streaming: stamp the first delta so `ttft_ms` reflects real time-to-first-token — the
     // whole point of streaming is that this lands far ahead of `wall`.
     let mut ttft: Option<std::time::Duration> = None;
     let body = ReceiverStream::new(rx).map(move |ev| {
         let data = match ev {
+            // `auto`'s next choice: later chunks carry its name (an SSE comment, which clients ignore).
+            GatewayEvent::Rerouted(m) => {
+                model_s = m;
+                return Ok::<Event, std::convert::Infallible>(Event::default().comment("openhydra/auto: next choice"));
+            }
             GatewayEvent::Delta(t) => {
                 ttft.get_or_insert_with(|| started.elapsed());
                 stream_chunk(&id_s, &model_s, created, json!({ "content": t }), None)
@@ -1770,7 +1866,7 @@ fn stream_response(
 /// `chat.completion` object, or a proper HTTP error if the route failed.
 async fn buffered_response(
     id: String,
-    model: String,
+    mut model: String,
     created: u64,
     mut rx: EventRx,
     started: std::time::Instant,
@@ -1793,6 +1889,8 @@ async fn buffered_response(
             }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
             GatewayEvent::Error(m, class, details) => outcome = Some(Err((m, class, details))),
+            // `auto`'s next choice answers: the reply carries its name.
+            GatewayEvent::Rerouted(m) => model = m,
         }
     }
     match outcome {
@@ -2209,7 +2307,7 @@ async fn messages(
 
 async fn anthropic_buffered_response(
     id: String,
-    model: String,
+    mut model: String,
     mut rx: EventRx,
     started: std::time::Instant,
     metrics: Arc<Metrics>,
@@ -2229,6 +2327,8 @@ async fn anthropic_buffered_response(
             }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
             GatewayEvent::Error(m, class, details) => outcome = Some(Err((m, class, details))),
+            // `auto`'s next choice answers: the reply carries its name.
+            GatewayEvent::Rerouted(m) => model = m,
         }
     }
     match outcome {
@@ -2299,9 +2399,18 @@ async fn anthropic_stream_worker(
     // The client leaving (the SSE body dropped, so `out` closes) ends the worker, which drops `rx`:
     // the serve then sees its client gone, stops reading and settles for what was read (S8; review
     // round 4 M1). Watched while waiting too, so a client that leaves during prefill is seen.
-    let first = tokio::select! {
-        f = rx.recv() => f,
-        _ = out.closed() => return,
+    // `auto`'s next choice, when its first failed before answering, comes before any frame: the
+    // message carries its name.
+    let mut model = model;
+    let first = loop {
+        let f = tokio::select! {
+            f = rx.recv() => f,
+            _ = out.closed() => return,
+        };
+        match f {
+            Some(GatewayEvent::Rerouted(m)) => model = m,
+            other => break other,
+        }
     };
     let first = match first {
         Some(GatewayEvent::Error(m, (_, etype), details)) => {
@@ -2339,6 +2448,8 @@ async fn anthropic_stream_worker(
     let mut ttft: Option<std::time::Duration> = None;
     'drain: loop {
         match ev {
+            // Only ever sent before the first frame (handled above).
+            GatewayEvent::Rerouted(_) => {}
             GatewayEvent::Delta(t) => {
                 ttft.get_or_insert_with(|| started.elapsed());
                 if out.send((
@@ -3021,6 +3132,7 @@ mod tests {
             served_model: String::new(),
             card_fallback: None,
             served_on: Default::default(),
+            auto_skipped: Vec::new(),
         }
     }
 
@@ -3261,6 +3373,54 @@ mod tests {
 
     fn cands(providers: Vec<openhydra_network::types::KnownProvider>) -> crate::consumer::AutoCandidates {
         crate::consumer::AutoCandidates { providers, ..Default::default() }
+    }
+
+    /// `auto`'s next choices when its first fails before answering (review 11 Nov, live on AWS: a
+    /// revoked swarm card failed every tool request; this machine's engine down failed every
+    /// request), by the same rules: a swarm member's never leave the swarm.
+    #[test]
+    fn auto_has_next_choices_by_the_same_rules() {
+        use openhydra_protocol::trust::AuthenticityTier::*;
+        let tools = AutoNeeds { tools: true };
+        // A member: this machine's small model, two swarm cards, and a public model it must not use.
+        let mut c = cands(vec![
+            kp("qwen2.5:0.5b", "me", "12D3Me"),
+            kp("Qwen/Qwen2.5-7B-Instruct", "lt", "12D3Lt"),
+            kp("qwen2.5-coder:1.5b", "mt", "12D3Mt"),
+            kp("llama3.1:70b", "pub", "12D3Pub"),
+        ]);
+        c.self_provider = Some("12D3Me".into());
+        c.swarm_only = true;
+        c.tiers.insert(("12D3Pub".into(), "llama3.1:70b".into()), HardwareAttested);
+        c.earned.insert(("12D3Pub".into(), "llama3.1:70b".into()), 90.0);
+        for (m, p) in [("Qwen/Qwen2.5-7B-Instruct", "12D3Lt"), ("qwen2.5-coder:1.5b", "12D3Mt")] {
+            c.card_models.push(m.into());
+            c.swarm_card_models.push(m.into());
+            c.card_providers.insert(m.into(), [p.to_string()].into());
+        }
+        let names = |alts: &[AutoAlternate]| alts.iter().map(|(m, s, _)| (m.clone(), *s)).collect::<Vec<_>>();
+
+        // A tool request goes to the swarm's 7B; if that card fails (revoked), this machine's after all.
+        assert_eq!(pick_auto(&c, None, tools), Ok(("Qwen/Qwen2.5-7B-Instruct".into(), AutoStep::Card)));
+        let next = auto_alternates(&c, None, tools, "Qwen/Qwen2.5-7B-Instruct", MAX_AUTO_ALTERNATES);
+        assert_eq!(names(&next), vec![("qwen2.5:0.5b".to_string(), AutoStep::OwnMachine)]);
+        assert_eq!(next[0].2, Some(["12D3Me".to_string()].into()), "only this machine's provider");
+
+        // No tools: this machine first; if its engine is down, the swarm's cards, never the public model.
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Ok(("qwen2.5:0.5b".into(), AutoStep::OwnMachine)));
+        let next = auto_alternates(&c, None, AutoNeeds::default(), "qwen2.5:0.5b", MAX_AUTO_ALTERNATES);
+        assert_eq!(next.len(), 2);
+        assert!(next.iter().all(|(m, s, only)| *s == AutoStep::Card && m != "llama3.1:70b" && only.as_ref().is_some_and(|o| !o.contains("12D3Pub"))), "{next:?}");
+
+        // Not in a swarm: the public network's trusted provider is a next choice.
+        c.swarm_only = false;
+        let next = auto_alternates(&c, None, AutoNeeds::default(), "qwen2.5:0.5b", 3);
+        assert_eq!(next.iter().filter(|(m, _, _)| m == "llama3.1:70b").count(), 1, "{next:?}");
+        // Nothing else to choose: no next choice.
+        let lone = cands(vec![kp("qwen2.5:0.5b", "me", "12D3Me")]);
+        let lone = crate::consumer::AutoCandidates { self_provider: Some("12D3Me".into()), ..lone };
+        assert!(auto_alternates(&lone, None, AutoNeeds::default(), "qwen2.5:0.5b", MAX_AUTO_ALTERNATES).is_empty());
+        assert!(auto_fallback_text(&[("a".into(), "x".into()), ("b".into(), "y".into())]).contains("`a`, then `b`"));
     }
 
     /// A tool request: this machine first when its model is big enough; when this machine's
@@ -3661,6 +3821,37 @@ mod tests {
         // An error as the FIRST frame → a single `error` frame, never a `message_start`.
         let names = stream_names(vec![GatewayEvent::Error("no provider".into(), (StatusCode::SERVICE_UNAVAILABLE, "no_provider"), None)]).await;
         assert_eq!(names, vec!["error"]);
+    }
+
+    /// `auto`'s next choice answers (review 11 Nov): the reply names it, on both APIs and both
+    /// shapes, and the failed first choice leaves no error behind.
+    #[tokio::test]
+    async fn a_reply_from_autos_next_choice_carries_its_name() {
+        // Anthropic stream: the message starts with the next choice's name, as a normal message.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        for e in [GatewayEvent::Rerouted("next-model".into()), GatewayEvent::Delta("hi".into()), GatewayEvent::Done(Box::new(summary(1, 2)))] {
+            tx.try_send(e).unwrap();
+        }
+        drop(tx);
+        let (otx, mut orx) = tokio::sync::mpsc::channel(64);
+        anthropic_stream_worker("msg_x".into(), "first-model".into(), rx, std::time::Instant::now(), Arc::new(Metrics::new()), otx).await;
+        let (name, start) = orx.try_recv().unwrap();
+        assert_eq!((name, start["message"]["model"].as_str()), ("message_start", Some("next-model")));
+
+        // OpenAI buffered: the completion's model is the next choice, and the block says what failed.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut s = summary(1, 2);
+        s.auto_skipped = vec![("first-model".into(), "the swarm's provider refused the request".into())];
+        for e in [GatewayEvent::Rerouted("next-model".into()), GatewayEvent::Delta("hi".into()), GatewayEvent::Done(Box::new(s))] {
+            tx.try_send(e).unwrap();
+        }
+        drop(tx);
+        let resp = buffered_response("id".into(), "first-model".into(), 0, rx, std::time::Instant::now(), Arc::new(Metrics::new())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["model"], "next-model");
+        assert_eq!(v["openhydra"]["auto_fallback"]["tried"][0]["model"], "first-model");
+        assert!(v["openhydra"]["auto_fallback"]["text"].as_str().unwrap().contains("first chose `first-model`"));
     }
 
     #[tokio::test]

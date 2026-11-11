@@ -375,7 +375,11 @@ async function sendOne(text, fromHome) {
     const meta = { model: resp?.model || model, tok: resp?.usage?.completion_tokens ?? "—", claimed: Number.isFinite(oh.claimed_tokens) ? oh.claimed_tokens : null, tps: oh.engine?.native_tps ? Math.round(oh.engine.native_tps) : "—", rtt: oh.hops_ms?.network_rtt ?? "—", tier: oh.provider_authenticity || null, where: oh.served_on_text || null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) };
     pushSample(tpsSamples, oh.engine?.native_tps, "oh_tps");   // rolling throughput for Activity
     pushSample(rttSamples, oh.hops_ms?.network_rtt, "oh_rtt"); // rolling latency for Activity
-    const note = fellBackNote(oh.card);
+    // `auto`'s first choice couldn't answer and its next choice did (a revoked swarm card, this
+    // machine's engine down): never silent, as with a card's fallback.
+    const tried = (oh.auto_fallback?.tried || []).map((t) => displayModelName(t.model));
+    const autoNote = tried.length ? `Auto's first choice (${tried.join(", then ")}) couldn't answer, so its next choice did.` : "";
+    const note = [fellBackNote(oh.card), autoNote].filter(Boolean).join(" ");
     if (note) meta.note = note;
     s.m.push(["ai", reply, meta, reasoning || null]); saveSessions(); renderChat();
     if (note) toast(note);

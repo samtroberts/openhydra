@@ -542,6 +542,9 @@ pub struct ServeSummary {
     /// Consumer-side: where the reply was served, for people to see (the app under each reply,
     /// `/model` in a coding tool). `Unknown` provider-side.
     pub served_on: ServedOn,
+    /// Gateway-side: `openhydra/auto`'s earlier choices that failed before answering, as
+    /// (model, reason), when a later choice answered. Empty otherwise.
+    pub auto_skipped: Vec<(String, String)>,
 }
 
 /// Where a reply was served, as a person would put it: on this machine, in a private swarm, inside
@@ -645,6 +648,7 @@ pub fn handle_serve_request(
                 served_model: String::new(),
                 card_fallback: None,
                 served_on: Default::default(),
+                auto_skipped: Vec::new(),
             };
         }
     };
@@ -797,6 +801,7 @@ pub fn handle_serve_request_watched(
                 served_model: String::new(),
                 card_fallback: None,
                 served_on: Default::default(),
+                auto_skipped: Vec::new(),
             }
         }
         Err(e) => {
@@ -819,6 +824,7 @@ pub fn handle_serve_request_watched(
 
                 card_fallback: None,
                 served_on: Default::default(),
+                auto_skipped: Vec::new(),
             }
         }
     }

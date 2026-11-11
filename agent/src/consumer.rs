@@ -1271,6 +1271,7 @@ pub fn request_completion(
                     served_model: String::new(),
                     card_fallback: None,
                     served_on: Default::default(),
+                    auto_skipped: Vec::new(),
                 })
             }
         }
@@ -1797,6 +1798,7 @@ fn dispatch_stream_slice(
                     served_model: String::new(),
                     card_fallback: None,
                     served_on: Default::default(),
+                    auto_skipped: Vec::new(),
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
