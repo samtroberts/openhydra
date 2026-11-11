@@ -27,6 +27,9 @@ libp2p-kad = { path = "../../network/patched-deps/libp2p-kad" }
 libp2p-dcutr = { path = "../../network/patched-deps/libp2p-dcutr" }
 # A bounded gossip send queue (see its CHANGELOG.md); same reason.
 libp2p-gossipsub = { path = "../../network/patched-deps/libp2p-gossipsub" }
+# Requests go on a direct connection when the peer has one, never alternating with a relay
+# circuit (see its CHANGELOG.md).
+libp2p-request-response = { path = "../../network/patched-deps/libp2p-request-response" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
