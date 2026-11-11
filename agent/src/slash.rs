@@ -183,6 +183,9 @@ pub fn render(cmd: &SlashCommand, known: &[String], current: Option<&str>, last_
 /// Per-session sticky `/model` selections, keyed by the caller's API-key identity (see
 /// `gateway::session_key`). Entries expire after `ttl` of inactivity and are never persisted;
 /// a read refreshes the idle timer so an active session stays pinned.
+/// Sessions a [`SessionModels`] keeps at most.
+pub const MAX_SESSIONS: usize = 4096;
+
 pub struct SessionModels {
     inner: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
@@ -214,10 +217,17 @@ impl SessionModels {
         }
     }
 
-    /// Pin `model` for `key`, opportunistically evicting expired entries to bound memory.
+    /// Pin `model` for `key`, opportunistically evicting expired entries to bound memory, and past
+    /// [`MAX_SESSIONS`] the least recently touched (the gateway writes here on every `auto`
+    /// completion, so the map must not grow with the number of API keys ever seen).
     pub fn set(&self, key: &str, model: String) {
         let mut m = self.inner.lock().unwrap();
         m.retain(|_, e| e.touched.elapsed() <= self.ttl);
+        if !m.contains_key(key) && m.len() >= MAX_SESSIONS {
+            if let Some(oldest) = m.iter().min_by_key(|(_, e)| e.touched).map(|(k, _)| k.clone()) {
+                m.remove(&oldest);
+            }
+        }
         m.insert(key.to_string(), Entry { model, touched: Instant::now() });
     }
 }
@@ -305,6 +315,17 @@ mod tests {
         // A pin wins: auto's last choice is beside the point then.
         let pinned = render(&SlashCommand::ModelShow, &[], Some("qwen2.5:7b"), Some("`x` on your machine"));
         assert!(!pinned.reply.contains("last chose"), "{}", pinned.reply);
+    }
+
+    #[test]
+    fn session_store_is_bounded() {
+        let s = SessionModels::new(Duration::from_secs(3600));
+        for i in 0..MAX_SESSIONS + 10 {
+            s.set(&format!("k{i}"), "m".into());
+        }
+        assert_eq!(s.inner.lock().unwrap().len(), MAX_SESSIONS);
+        assert_eq!(s.get("k0"), None, "the oldest went");
+        assert!(s.get(&format!("k{}", MAX_SESSIONS + 9)).is_some());
     }
 
     #[test]

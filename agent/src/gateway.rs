@@ -1440,6 +1440,14 @@ fn dispatch_err_openai(e: DispatchErr) -> Response {
 /// `GatewayEvent` stream the SSE/buffered responders consume. Runs on a plain OS thread (the
 /// adapters are blocking).
 #[allow(clippy::too_many_arguments)]
+/// A BYOK backend as people name it, for "on Anthropic's hosted API".
+fn byok_display_name(provider: ByokProvider) -> &'static str {
+    match provider {
+        ByokProvider::Anthropic => "Anthropic",
+        ByokProvider::Gemini => "Google",
+    }
+}
+
 fn spawn_byok_worker(
     provider: ByokProvider,
     base_url: String,
@@ -1512,7 +1520,7 @@ fn spawn_byok_worker(
                     provider: String::new(),
                     served_model: String::new(),
                     card_fallback: None,
-                    served_on: Default::default(),
+                    served_on: crate::serve::ServedOn::HostedApi(byok_display_name(provider).into()),
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -2821,6 +2829,22 @@ mod tests {
         t.metrics.engine.eval_count = 20;
         t.metrics.engine.eval_duration_ns = 1_000_000_000;
         assert_eq!(openhydra_block(&t, one, one)["engine"]["native_tps"], 20.0);
+    }
+
+    #[test]
+    fn every_reply_says_where_it_was_served() {
+        use crate::serve::ServedOn;
+        let one = std::time::Duration::from_secs(1);
+        let mut s = summary(3, 5);
+        s.served_on = ServedOn::ThisMachine;
+        let b = openhydra_block(&s, one, one);
+        assert_eq!((b["served_on"].as_str(), b["served_on_text"].as_str()), (Some("this_machine"), Some("on your machine")));
+        s.served_on = ServedOn::PrivateSwarm("Acme".into());
+        assert_eq!(anthropic_openhydra(&s)["served_on_text"], "in the private swarm “Acme”");
+        s.served_on = ServedOn::Unknown;
+        assert!(openhydra_block(&s, one, one)["served_on"].is_null(), "unknown: nothing claimed");
+        assert_eq!(byok_display_name(ByokProvider::Anthropic), "Anthropic");
+        assert_eq!(auto_choice_text("qwen2.5-coder:1.5b", "on your machine"), "`qwen2.5-coder:1.5b` on your machine");
     }
 
     fn summary(tokens: u64, prompt: u64) -> ServeSummary {

@@ -544,20 +544,26 @@ pub struct ServeSummary {
     pub served_on: ServedOn,
 }
 
-/// Where a reply was served, as a person would put it: on this machine, in one of their private
-/// swarms, inside their private (keyed) network, or by someone on the public network.
+/// Where a reply was served, as a person would put it: on this machine, in a private swarm, inside
+/// the private (keyed) network, by someone on the public network, or by a hosted API.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ServedOn {
     #[default]
     Unknown,
-    /// By this machine's own provider: nothing left the machine.
+    /// By this machine's own provider, on a gateway only this machine reaches: nothing left it.
     ThisMachine,
-    /// By a provider of an imported private card: inside that swarm (its label, "" if not known).
+    /// By the gateway's own provider, on a gateway other machines reach: the caller may be
+    /// elsewhere, so "your machine" would be wrong.
+    GatewayMachine,
+    /// On the private route to a private card's provider (the request carried the swarm's
+    /// membership credential): inside that swarm, named from the credential ("" if unnamed).
     PrivateSwarm(String),
     /// On a keyed private network: by one of the organisation's nodes.
     PrivateNetwork,
     /// By a provider on OpenHydra's public network.
     PublicNetwork,
+    /// By a hosted API through a BYOK key (its name, e.g. "Anthropic").
+    HostedApi(String),
 }
 
 impl ServedOn {
@@ -566,30 +572,41 @@ impl ServedOn {
         match self {
             ServedOn::Unknown => None,
             ServedOn::ThisMachine => Some("this_machine"),
+            ServedOn::GatewayMachine => Some("gateway_machine"),
             ServedOn::PrivateSwarm(_) => Some("private_swarm"),
             ServedOn::PrivateNetwork => Some("private_network"),
             ServedOn::PublicNetwork => Some("public_network"),
+            ServedOn::HostedApi(_) => Some("hosted_api"),
         }
     }
 
-    /// Where, in words: "on your machine", "in your private swarm “Acme”", "in your private
-    /// network", "on the public network". A swarm's name is its owner's choice, so it's shown
-    /// without control characters and cut to 40 characters.
+    /// Where, in words: "on your machine", "in the private swarm “Acme”", "in the private network",
+    /// "on the public network", "on Anthropic's hosted API". A swarm's name is its owner's choice:
+    /// shown cleaned ([`clean_label`]).
     pub fn phrase(&self) -> Option<String> {
         Some(match self {
             ServedOn::Unknown => return None,
             ServedOn::ThisMachine => "on your machine".into(),
-            ServedOn::PrivateSwarm(label) => {
-                let name: String = label.chars().filter(|c| !c.is_control()).take(40).collect();
-                match name.trim() {
-                    "" => "in your private swarm".into(),
-                    n => format!("in your private swarm “{n}”"),
-                }
-            }
-            ServedOn::PrivateNetwork => "in your private network".into(),
+            ServedOn::GatewayMachine => "on the gateway's own machine".into(),
+            ServedOn::PrivateSwarm(label) => match clean_label(label).as_str() {
+                "" => "in a private swarm".into(),
+                n => format!("in the private swarm “{n}”"),
+            },
+            ServedOn::PrivateNetwork => "in the private network".into(),
             ServedOn::PublicNetwork => "on the public network".into(),
+            ServedOn::HostedApi(name) => format!("on {name}'s hosted API"),
         })
     }
+}
+
+/// An owner-chosen name, safe to show inside a sentence (the app escapes it anyway, but `/model`
+/// puts it in text a coding tool, and its model, reads): only letters, digits, spaces and plain
+/// punctuation that means nothing in Markdown, at most 40 characters. Invisible and direction
+/// characters, line breaks, quotes, backticks and Markdown syntax all go.
+pub fn clean_label(label: &str) -> String {
+    let ok = |c: char| c.is_alphanumeric() || c == ' ' || matches!(c, '-' | '.' | ',' | ':' | ';' | '/' | '&' | '+' | '\'' | '@');
+    let kept: String = label.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|&c| ok(c)).take(40).collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each

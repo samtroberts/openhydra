@@ -6344,10 +6344,8 @@ fn pin_peer_addrs(
 /// goes: one restored from the routing cache or added before the pin (any loopback port or family,
 /// not just the pinned ones). A configured bootstrap is exempt, as in the filter.
 fn purge_refused_kad_addrs(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &LoopState, peer: PeerId) {
-    if state.bootstrap_peers.iter().any(|(b, _)| *b == peer) {
-        return;
-    }
-    let n = crate::pinned::purge_refused(&mut swarm.behaviour_mut().kademlia, &state.pinned, peer);
+    let bootstraps = state.bootstrap_peers.iter().map(|(b, _)| *b).collect();
+    let n = crate::pinned::purge_refused(&mut swarm.behaviour_mut().kademlia, &state.pinned, &bootstraps, peer);
     if n > 0 {
         info!(%peer, n, "removed the pinned peer's loopback addresses from the routing table");
     }

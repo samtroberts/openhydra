@@ -37,12 +37,17 @@ pub fn kad_allows(pinned: &PinnedPeers, peer: &PeerId, addr: &Multiaddr) -> bool
 
 /// Remove from `kad`'s routing table every address of `peer` that [`kad_allows`] refuses (one
 /// restored from the routing cache or added before the pin, any loopback port or family). Returns
-/// how many went. The filter keeps new ones out; this clears what was there before.
+/// how many went. The filter keeps new ones out; this clears what was there before. A peer in
+/// `bootstraps` keeps everything, as the node's filter lets it ([`crate::swarm::kad_address_filter`]).
 pub fn purge_refused<S: libp2p::kad::store::RecordStore + Send + 'static>(
     kad: &mut libp2p::kad::Behaviour<S>,
     pinned: &PinnedPeers,
+    bootstraps: &std::collections::HashSet<PeerId>,
     peer: PeerId,
 ) -> usize {
+    if bootstraps.contains(&peer) {
+        return 0;
+    }
     let mut refused = Vec::new();
     for bucket in kad.kbuckets() {
         for entry in bucket.iter() {
