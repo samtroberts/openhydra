@@ -53,7 +53,7 @@ export function metaRow(m) {
     ? html`<span class="num" title="The provider billed more tokens than its answer holds; your gateway pays only what was delivered">Charged ${m.tok} tokens (provider asked for ${m.claimed}, corrected)</span>`
     : "";
   // A card's model another provider served (its card's provider couldn't): said under the reply.
-  const note = m.note ? html`<span class="mut" title="The card you imported names another provider">${m.note}</span>` : "";
+  const note = m.note ? html`<span class="mut" title="Why another provider or model answered this time">${m.note}</span>` : "";
   const where = m.where ? html`<span title="Where your prompt was answered">${m.where}</span>` : "";
   return html`<div class="msgmeta"><span>${m.model}</span>${where}${known(m.at) ? html`<span>${m.at}</span>` : ""}${m.tier ? html`<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${charged}${details ? html`<span class="num det">${details}</span>` : ""}${note}</div>`;
 }
