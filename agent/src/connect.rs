@@ -458,6 +458,22 @@ fn backup_path(path: &Path) -> PathBuf {
     ))
 }
 
+/// Beside the backup: the SHA-256 of the config exactly as OpenHydra last wrote it. Disconnect
+/// restores the backup only while the file still matches it; once the user has edited the file
+/// since, restoring would throw their edits away, so it strips our block instead (audit 11 Nov,
+/// finding 9).
+fn written_mark_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}.openhydra.sum",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ))
+}
+
+fn content_digest(content: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(content.as_bytes()))
+}
+
 /// Write the OpenHydra block into `key`'s config, backing up any existing file first.
 pub fn apply(key: &str, origin: &str) -> Result<ConnectReport, String> {
     apply_with_models(key, origin, &[])
@@ -487,9 +503,15 @@ pub fn apply_with_models(key: &str, origin: &str, models: &[String]) -> Result<C
     } else {
         None
     };
-    std::fs::write(&path, new_content).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::write(&path, &new_content).map_err(|e| format!("write {}: {e}", path.display()))?;
     // The config now carries the gateway key: readable by its owner only.
     owner_only(&path);
+    if backup.is_some() {
+        let mark = written_mark_path(&path);
+        if std::fs::write(&mark, content_digest(&new_content)).is_ok() {
+            owner_only(&mark);
+        }
+    }
     Ok(ConnectReport { key: key.into(), path: path.display().to_string(), backup, action: action.into() })
 }
 
@@ -769,17 +791,21 @@ pub fn disconnect(key: &str) -> Result<DisconnectReport, String> {
         return Ok(report("not-connected"));
     }
 
-    // Prefer the pristine backup (exact bytes). Only trust it if it doesn't itself contain our block.
+    // Prefer the pristine backup (exact bytes), but only while the file is exactly what we last
+    // wrote (no edits of the user's since) and the backup doesn't itself contain our block.
     let bak = backup_path(&path);
+    let mark = written_mark_path(&path);
+    let unchanged_since_we_wrote = std::fs::read_to_string(&mark).is_ok_and(|m| m.trim() == content_digest(&existing));
+    let _ = std::fs::remove_file(&mark);
     if bak.exists() {
-        if let Ok(original) = std::fs::read_to_string(&bak) {
+        if let Some(original) = std::fs::read_to_string(&bak).ok().filter(|_| unchanged_since_we_wrote) {
             if !has_openhydra_block(spec.kind, &original) {
                 std::fs::write(&path, &original).map_err(|e| format!("restore {}: {e}", path.display()))?;
                 let _ = std::fs::remove_file(&bak);
                 return Ok(report("restored"));
             }
         }
-        let _ = std::fs::remove_file(&bak); // non-pristine/unreadable — discard and strip instead
+        let _ = std::fs::remove_file(&bak); // edited since, non-pristine or unreadable: strip instead
     }
 
     // No pristine backup: surgically remove only our block, keeping any user content.
@@ -961,6 +987,30 @@ mod tests {
         let rep = disconnect("claude").unwrap();
         assert_eq!(rep.action, "not-connected");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), user, "the user's settings.json is untouched");
+    }
+
+    /// Audit 11 Nov, finding 9: the user edits the config after connecting. Disconnect must keep the
+    /// edit (strip our block) rather than restore the backup taken before it.
+    #[test]
+    fn disconnect_keeps_edits_made_after_connecting() {
+        let (_sb, _lock) = sandbox_home("edit-after");
+        let origin = "http://127.0.0.1:16527";
+        let path = config_path(Kind::OpencodeJson).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        apply("opencode", origin).unwrap();
+        assert!(backup_path(&path).exists() && written_mark_path(&path).exists());
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().insert("autoupdate".into(), json!(false));
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+        let rep = disconnect("opencode").unwrap();
+        assert_eq!(rep.action, "stripped");
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["autoupdate"], false, "the later edit is kept");
+        assert_eq!(after["theme"], "dark", "the original content is kept");
+        assert!(!is_connected("opencode"));
+        assert!(!backup_path(&path).exists() && !written_mark_path(&path).exists(), "nothing left behind");
     }
 
     /// Finding 2: if we created the file and the user then added their OWN content, Disconnect strips

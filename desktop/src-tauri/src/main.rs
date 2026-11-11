@@ -330,6 +330,35 @@ fn openhydra_dir() -> PathBuf {
     PathBuf::from(home).join(".openhydra")
 }
 
+/// Keep the app's data folder private to this account: the folder 0700 and what's directly in it
+/// without group/other bits (an executable stays executable for the owner). It holds chat history,
+/// keys and ledgers, and was 0755 with `sessions.json` 0644, readable by every account on the
+/// machine (audit 11 Nov, finding 8). The folder's own mode is what protects anything deeper;
+/// deeper files (installed engines) aren't walked, to keep start-up cheap. Symlinks are skipped.
+#[cfg(unix)]
+fn make_private(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fn tighten(p: &std::path::Path) {
+        let Ok(meta) = std::fs::symlink_metadata(p) else { return };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        let mode = meta.permissions().mode() & 0o7777;
+        if mode & 0o077 != 0 {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode & !0o077));
+        }
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    tighten(dir);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            tighten(&e.path());
+        }
+    }
+}
+
 fn settings_path() -> PathBuf {
     openhydra_dir().join("desktop.json")
 }
@@ -3650,6 +3679,8 @@ fn main() {
             // a second launch exits inside the single-instance plugin before `setup` runs, so it
             // can't kill the running app's agents (their pids are in the same pidfile).
             sweep_stale_agents();
+            #[cfg(unix)]
+            make_private(&openhydra_dir());
             // The local gateway key, before anything connects a tool or starts the gateway; then
             // re-wire tools connected by an older build (or with an older key), which the gateway
             // would now refuse. Off the main thread: it reads and writes a few config files.
@@ -4088,6 +4119,35 @@ mod tests {
         assert!(desktop_entry("/home/me/a\nExec=evil", "openhydra").is_none());
         let x = card_mime_xml();
         assert!(x.contains(r#"<glob pattern="*.openhydra"/>"#) && x.contains(CARD_MIME));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_data_folder_is_made_private_to_this_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".openhydra");
+        std::fs::create_dir(&dir).unwrap();
+        let set = |p: &std::path::Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let mode = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        set(&dir, 0o755);
+        std::fs::write(dir.join("sessions.json"), "{}").unwrap();
+        set(&dir.join("sessions.json"), 0o644);
+        std::fs::write(dir.join("tool"), "#!/bin/sh").unwrap();
+        set(&dir.join("tool"), 0o755);
+        std::fs::create_dir(dir.join("swarms")).unwrap();
+        set(&dir.join("swarms"), 0o755);
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        set(&outside, 0o644);
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+
+        make_private(&dir);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("sessions.json")), 0o600);
+        assert_eq!(mode(&dir.join("tool")), 0o700, "an executable stays executable for its owner");
+        assert_eq!(mode(&dir.join("swarms")), 0o700);
+        assert_eq!(mode(&outside), 0o644, "a symlink's target outside the folder is left alone");
     }
 
     #[test]
