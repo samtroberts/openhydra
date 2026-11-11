@@ -121,6 +121,11 @@ pub struct OwnModels {
     pub public_key: String,
     /// The models it shares, by the name it serves them under.
     pub models: Vec<String>,
+    /// Those of [`Self::models`] it also announces to the public network (reach Global): others may
+    /// serve them too, so the gateway beside it can fall back to them. An older provider sends none,
+    /// which reads as "this machine only" (the private side).
+    #[serde(default)]
+    pub global: Vec<String>,
 }
 
 /// How long a completed (or in-flight) serve result stays fetchable. Must comfortably exceed
@@ -2135,6 +2140,7 @@ impl<A: EngineAdapter> Provider<A> {
             peer_id: self.net.openhydra_peer_id().to_string(),
             public_key: self.net.public_key_hex().to_string(),
             models: Vec::new(),
+            global: Vec::new(),
         };
         if !self.own_peers().contains(&source_peer) {
             return reply;
@@ -2145,7 +2151,12 @@ impl<A: EngineAdapter> Provider<A> {
             detected.iter().filter(|e| self.policy.is_shared(e)).map(|e| names.public(e).to_string()).collect();
         models.sort();
         models.dedup();
+        let mut global: Vec<String> =
+            detected.iter().filter(|e| self.policy.announce_globally(e)).map(|e| names.public(e).to_string()).collect();
+        global.sort();
+        global.dedup();
         reply.models = models;
+        reply.global = global;
         reply
     }
 

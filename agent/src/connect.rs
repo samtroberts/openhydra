@@ -494,6 +494,15 @@ pub fn apply_with_models(key: &str, origin: &str, models: &[String]) -> Result<C
     // NOT already contain our block (so the backup can never capture an already-wired state, e.g. from a
     // second apply on a file we created), AND we haven't backed it up before. `disconnect` restores it.
     let bak = backup_path(&path);
+    // A backup stands for the user's file only while the config is still exactly what we last wrote.
+    // Once they've edited it (or removed our block, or the file), it's stale: drop it, so Disconnect
+    // strips our block instead of restoring it over their edits (review 11 Nov: a re-wire used to
+    // re-mark their edited file as ours, and Disconnect then restored the old backup).
+    let mark = written_mark_path(&path);
+    if bak.exists() && !std::fs::read_to_string(&mark).is_ok_and(|m| m.trim() == content_digest(&existing)) {
+        let _ = std::fs::remove_file(&bak);
+        let _ = std::fs::remove_file(&mark);
+    }
     let backup = if !existing.trim().is_empty() && !bak.exists() && !has_openhydra_block(spec.kind, &existing) {
         std::fs::write(&bak, &existing).map_err(|e| format!("backup {}: {e}", bak.display()))?;
         owner_only(&bak);
@@ -507,7 +516,6 @@ pub fn apply_with_models(key: &str, origin: &str, models: &[String]) -> Result<C
     // The config now carries the gateway key: readable by its owner only.
     owner_only(&path);
     if backup.is_some() {
-        let mark = written_mark_path(&path);
         if std::fs::write(&mark, content_digest(&new_content)).is_ok() {
             owner_only(&mark);
         }
@@ -1011,6 +1019,44 @@ mod tests {
         assert_eq!(after["theme"], "dark", "the original content is kept");
         assert!(!is_connected("opencode"));
         assert!(!backup_path(&path).exists() && !written_mark_path(&path).exists(), "nothing left behind");
+    }
+
+    /// Review 11 Nov: an edit followed by a re-wire (`launch`, a key refresh, new models) must not
+    /// let Disconnect restore the old backup; nor may a backup outlive the user removing our block.
+    #[test]
+    fn a_rewire_after_an_edit_never_brings_the_old_backup_back() {
+        let (_sb, _lock) = sandbox_home("rewire-after-edit");
+        let origin = "http://127.0.0.1:16527";
+        let path = config_path(Kind::OpencodeJson).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        apply("opencode", origin).unwrap();
+        // A re-wire with nothing edited keeps the exact restore.
+        apply_with_models("opencode", origin, &["qwen2.5:7b".into()]).unwrap();
+        assert!(backup_path(&path).exists());
+        // The user edits, then something re-wires.
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().insert("autoupdate".into(), json!(false));
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        apply_with_models("opencode", origin, &["qwen2.5:3b".into()]).unwrap();
+        assert!(!backup_path(&path).exists(), "the backup no longer stands for the user's file");
+        let rep = disconnect("opencode").unwrap();
+        assert_eq!(rep.action, "stripped");
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((after["autoupdate"].clone(), after["theme"].clone()), (json!(false), json!("dark")));
+
+        // The user removes our block by hand, edits, and connects again: the new backup is that file.
+        std::fs::write(&path, r#"{"theme":"light"}"#).unwrap();
+        apply("opencode", origin).unwrap();
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("provider");
+        v.as_object_mut().unwrap().insert("share".into(), json!("manual"));
+        std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+        apply("opencode", origin).unwrap();
+        assert_eq!(disconnect("opencode").unwrap().action, "restored");
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["share"], "manual", "restored to the file as it was before this connect");
+        assert!(!is_connected("opencode"));
     }
 
     /// Finding 2: if we created the file and the user then added their OWN content, Disconnect strips

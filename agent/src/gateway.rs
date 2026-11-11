@@ -765,8 +765,11 @@ async fn resolve_model(
     // The pin follows the same rules as the operator's preferred model: in a private swarm it counts
     // only where the swarm reaches (this machine, the swarm's cards) and is served only by those
     // providers; elsewhere any provider, this machine's own first (audit 11 Nov, finding 5).
+    // Outside a swarm the pin is used as before, whatever `auto`'s own steps would trust: an
+    // authenticity floor is then enforced when it's served (a refusal that says why), rather than the
+    // pin being skipped for another model without a word (review 11 Nov).
     if let Some(sel) = pin {
-        if pin_reachable(&candidates, sel) {
+        if !candidates.swarm_only || pin_reachable(&candidates, sel) {
             return Ok((sel.to_string(), Route::SessionPin, auto_providers(&candidates, sel, AutoStep::Preferred)));
         }
     }
@@ -790,6 +793,9 @@ async fn resolve_model(
             Ok((model, Route::Auto(step, needs), only))
         }
         Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
+        Err(AutoMiss::TooSmallForTools(small)) if candidates.swarm_credential_expired => {
+            Err(format!("{}. {SWARM_CREDENTIAL_EXPIRED}", too_small_for_tools_message(&small)))
+        }
         Err(AutoMiss::TooSmallForTools(small)) => Err(too_small_for_tools_message(&small)),
         Err(AutoMiss::NothingInSwarm) if candidates.swarm_credential_expired => Err(format!("{NOTHING_IN_SWARM} {SWARM_CREDENTIAL_EXPIRED}")),
         Err(AutoMiss::NothingInSwarm) => Err(NOTHING_IN_SWARM.to_string()),

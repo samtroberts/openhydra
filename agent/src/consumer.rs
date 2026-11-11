@@ -3720,12 +3720,21 @@ impl ConsumerNode {
         })
     }
 
-    /// Whether this machine's own provider, dialled on its pinned loopback address, shares `model`: the
-    /// request then goes to it alone ([`Self::own_peer_for`]), and a failed dial means it isn't
-    /// running, so one pass is enough.
+    /// Whether this machine's own provider also announces `model` to the public network (reach
+    /// Global), so other providers of it are a fallback rather than strangers.
+    fn own_shares_globally(&self, model: &str, now: u64) -> bool {
+        self.own_models(now).is_some_and(|m| m.global.iter().any(|g| g == model))
+    }
+
+    /// Whether this machine's own provider, dialled on its pinned loopback address, shares `model` on
+    /// this machine only (Device or Private): the request then goes to it (and to an imported card's
+    /// providers, none here) and nobody else, and a failed dial means it isn't running, so one pass
+    /// is enough. A Global model takes the usual passes: other providers are its fallback.
     fn own_pinned_serves(&self, model: &str) -> bool {
+        let now = now_unix_ms();
         self.self_provider.as_deref().is_some_and(|me| self.net.is_pinned(me))
-            && self.own_peer_for(model, now_unix_ms()).is_some()
+            && self.own_peer_for(model, now).is_some()
+            && !self.own_shares_globally(model, now)
     }
 
     /// Whether `only` restricts a request to this machine's own provider, and that provider is dialled
@@ -4102,13 +4111,16 @@ impl ConsumerNode {
         // those providers, not for the model name.
         let allowed = |p: &DiscoveredPeer| only.is_none_or(|o| o.contains(&p.libp2p_peer_id));
         let t_discover = std::time::Instant::now();
-        // This machine's own provider shares the model: it serves it, and nobody else does. No
-        // network lookup (a Private or Device model is announced nowhere, so the lookup waited ~10 s
-        // for nothing on every request, and asked the bootstrap for the name in the clear), and no
-        // stranger announcing the same name takes the request (11 Nov audit, A4/A5).
+        // This machine's own provider shares the model: it goes first (11 Nov audit, A4/A5/finding 6).
+        // Shared on this machine only (Device or Private): no network lookup (such a model is
+        // announced nowhere, so the lookup waited ~10 s for nothing on every request, and asked the
+        // bootstrap for the name in the clear) and no stranger announcing the same name; an imported
+        // card's providers (below) are its only fallback. Shared Global: the usual lookup (quick, it
+        // is announced), and the model's other providers fall back behind this machine's.
         let own_peer = self.own_peer_for(model, now).filter(|p| allowed(p));
-        let mut peers = if let Some(own) = &own_peer {
-            vec![own.clone()]
+        let own_only = own_peer.is_some() && !self.own_shares_globally(model, now);
+        let mut peers = if own_only {
+            Vec::new()
         } else if no_discovery {
             // A private card's model: only the card's providers (added below), never the network.
             Vec::new()
@@ -4131,7 +4143,7 @@ impl ConsumerNode {
         // bootstrap's provider registry, which has retained the verified adverts it saw. This is
         // a best-effort supplement: only when passive discovery found nothing, and a failed query
         // (no bootstrap, transport error) just leaves `peers` empty for the normal Retryable path.
-        if peers.is_empty() && !no_discovery && own_peer.is_none() {
+        if peers.is_empty() && !no_discovery && !own_only {
             let _span = tracing::info_span!("registry_query", model = %model).entered();
             match self.net.query_registry(model) {
                 Ok(reg) if reg.iter().any(allowed) => {
@@ -4146,7 +4158,13 @@ impl ConsumerNode {
         // with no live discovery. Merge them in (deduped by libp2p id) so an imported model routes
         // even when passive discovery + the bootstrap registry are both silent. The store re-verifies
         // + expiry-checks on read, so only currently-valid cards are added.
-        if let Some(cards) = self.cards.as_ref().filter(|_| own_peer.is_none()) {
+        // This machine's own provider, when the lookup didn't already list it.
+        if let Some(own) = &own_peer {
+            if !peers.iter().any(|p| p.libp2p_peer_id == own.libp2p_peer_id) {
+                peers.insert(0, own.clone());
+            }
+        }
+        if let Some(cards) = self.cards.as_ref() {
             let pinned = cards.providers_for(model, now);
             if !pinned.is_empty() {
                 let known: std::collections::HashSet<&str> =
@@ -4172,7 +4190,7 @@ impl ConsumerNode {
         // Phase 0.3: our own provider, for a model it shares at any reach. Its Device and Private
         // models are never announced (and a Device one has no card), so without this the gateway
         // beside it could never use them; its scope gate lets this machine in.
-        // (Already the only candidate when it shares the model: see `own_peer` above.)
+        // (Added above, and put first below.)
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
         // a provider that has failed this consumer ranks below an untried one. Increment 3: the
@@ -4254,6 +4272,18 @@ impl ConsumerNode {
             tracing::debug!(model, has_sticky = sticky.is_some(), stuck, "spread: affinity");
             if !stuck {
                 spread_load(&mut candidates, eligible, &cost, &mut |n| rng.gen_range(0..n));
+            }
+        }
+        // This machine's own provider goes first when it shares the model, unless it just refused
+        // or shed us (then it stays where the sort above put it: last).
+        if let Some(own) = &own_peer {
+            if let Some(i) = candidates.iter().position(|c| {
+                c.libp2p_peer_id == own.libp2p_peer_id
+                    && !self.refused_payment(&c.libp2p_peer_id, &c.model_id, now)
+                    && !self.briefly_unavailable(&c.libp2p_peer_id, &c.model_id, now)
+            }) {
+                let mine = candidates.remove(i);
+                candidates.insert(0, mine);
             }
         }
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
@@ -8304,6 +8334,7 @@ mod tests {
             public_key: "pk-12D3Me".into(),
             // Global (already known), Private and Device (never announced).
             models: vec!["qwen2.5:0.5b".into(), "qwen2.5-coder:1.5b".into(), "device-only:7b".into()],
+            global: vec!["qwen2.5:0.5b".into()],
         };
         add_own_models(&mut providers, "12D3Me", &own);
         let mine: Vec<&str> = providers.iter().filter(|k| k.libp2p_peer_id == "12D3Me").map(|k| k.model_id.as_str()).collect();
@@ -8320,10 +8351,12 @@ mod tests {
         drop(dir);
     }
 
-    /// A model this machine's own provider shares is served by it alone, with no network lookup
-    /// (11 Nov audit: a Private model's lookup waited ~10 s per request and leaked its name).
+    /// A model this machine's own provider shares goes to it first; one it shares on this machine
+    /// only goes nowhere else on the network, with no lookup (11 Nov audit: a Private model's lookup
+    /// waited ~10 s per request and leaked its name), and one it shares Global keeps the network's
+    /// other providers as its fallback (review 11 Nov).
     #[test]
-    fn a_model_this_machine_shares_goes_to_its_own_provider_alone() {
+    fn a_model_this_machine_shares_goes_to_its_own_provider_first() {
         let (dir, node) = test_node();
         let me = openhydra_network::identity::Identity::load_or_create(&dir.path().join("me.key")).unwrap().libp2p_peer_id.to_base58();
         let node = node.with_self_provider(Some(me.clone()));
@@ -8331,7 +8364,8 @@ mod tests {
         *node.own_models.lock().unwrap() = Some((now, crate::provider::OwnModels {
             peer_id: "oh-me".into(),
             public_key: "pk-me".into(),
-            models: vec!["qwen2.5-coder:1.5b".into()],
+            models: vec!["qwen2.5-coder:1.5b".into(), "qwen2.5:0.5b".into()],
+            global: vec!["qwen2.5:0.5b".into()],
         }));
         let own = node.own_peer_for("qwen2.5-coder:1.5b", now).expect("shared here");
         assert_eq!((own.libp2p_peer_id.as_str(), own.peer_id.as_str(), own.model_id.as_str()), (me.as_str(), "oh-me", "qwen2.5-coder:1.5b"));
@@ -8341,6 +8375,10 @@ mod tests {
         node.net.pin_peer_addrs(&me, &["/ip4/127.0.0.1/tcp/9".to_string()]).unwrap();
         assert!(node.own_pinned_serves("qwen2.5-coder:1.5b"));
         assert!(!node.own_pinned_serves("llama3.1:70b"));
+        // Shared Global: still this machine first, but not alone (the usual passes and fallback).
+        assert!(node.own_peer_for("qwen2.5:0.5b", now).is_some());
+        assert!(node.own_shares_globally("qwen2.5:0.5b", now) && !node.own_shares_globally("qwen2.5-coder:1.5b", now));
+        assert!(!node.own_pinned_serves("qwen2.5:0.5b"), "a Global model keeps the network as its fallback");
     }
 
     #[test]
