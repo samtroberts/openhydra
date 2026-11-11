@@ -3031,6 +3031,16 @@ fn open_gui(key: String) -> Result<(), String> {
     }
 }
 
+/// What the Test button reports from a gateway reply: the model that answered and where it ran
+/// ("qwen2.5-coder:1.5b on your machine"), or just the model from a gateway that doesn't say where.
+fn answered_by(reply: &serde_json::Value) -> String {
+    let model = reply.get("model").and_then(|m| m.as_str()).unwrap_or("ok");
+    match reply.pointer("/openhydra/served_on_text").and_then(|w| w.as_str()).filter(|w| !w.is_empty()) {
+        Some(place) => format!("{model} {place}"),
+        None => model.to_string(),
+    }
+}
+
 /// "Test" button: a bounded 1-token `openhydra/auto` completion through the local gateway; returns
 /// the model that served it, or an actionable error (gateway down / no provider).
 #[tauri::command]
@@ -3055,7 +3065,7 @@ async fn connector_test(state: tauri::State<'_, AppState>) -> Result<String, Str
         if !(200..300).contains(&status) {
             return Err(format!("gateway answered {status}"));
         }
-        Ok(v.get("model").and_then(|m| m.as_str()).unwrap_or("ok").to_string())
+        Ok(answered_by(&v))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3768,6 +3778,14 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_test_button_says_which_model_answered_and_where() {
+        let reply = serde_json::json!({ "model": "qwen2.5-coder:1.5b", "openhydra": { "served_on": "this_machine", "served_on_text": "on your machine" } });
+        assert_eq!(super::answered_by(&reply), "qwen2.5-coder:1.5b on your machine");
+        // An older gateway that doesn't say where: the model alone, as before.
+        assert_eq!(super::answered_by(&serde_json::json!({ "model": "qwen3:8b" })), "qwen3:8b");
+    }
+
     #[test]
     fn the_gateway_is_told_where_the_apps_provider_listens() {
         assert_eq!(

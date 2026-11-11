@@ -539,6 +539,57 @@ pub struct ServeSummary {
     /// Consumer-side: the model's card provider couldn't serve (`offline`, `overloaded`, `refused`)
     /// and another provider of the same version did instead. `None` otherwise.
     pub card_fallback: Option<String>,
+    /// Consumer-side: where the reply was served, for people to see (the app under each reply,
+    /// `/model` in a coding tool). `Unknown` provider-side.
+    pub served_on: ServedOn,
+}
+
+/// Where a reply was served, as a person would put it: on this machine, in one of their private
+/// swarms, inside their private (keyed) network, or by someone on the public network.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ServedOn {
+    #[default]
+    Unknown,
+    /// By this machine's own provider: nothing left the machine.
+    ThisMachine,
+    /// By a provider of an imported private card: inside that swarm (its label, "" if not known).
+    PrivateSwarm(String),
+    /// On a keyed private network: by one of the organisation's nodes.
+    PrivateNetwork,
+    /// By a provider on OpenHydra's public network.
+    PublicNetwork,
+}
+
+impl ServedOn {
+    /// The machine-readable name (`served_on` in a response's `openhydra` block); `None` when unknown.
+    pub fn key(&self) -> Option<&'static str> {
+        match self {
+            ServedOn::Unknown => None,
+            ServedOn::ThisMachine => Some("this_machine"),
+            ServedOn::PrivateSwarm(_) => Some("private_swarm"),
+            ServedOn::PrivateNetwork => Some("private_network"),
+            ServedOn::PublicNetwork => Some("public_network"),
+        }
+    }
+
+    /// Where, in words: "on your machine", "in your private swarm “Acme”", "in your private
+    /// network", "on the public network". A swarm's name is its owner's choice, so it's shown
+    /// without control characters and cut to 40 characters.
+    pub fn phrase(&self) -> Option<String> {
+        Some(match self {
+            ServedOn::Unknown => return None,
+            ServedOn::ThisMachine => "on your machine".into(),
+            ServedOn::PrivateSwarm(label) => {
+                let name: String = label.chars().filter(|c| !c.is_control()).take(40).collect();
+                match name.trim() {
+                    "" => "in your private swarm".into(),
+                    n => format!("in your private swarm “{n}”"),
+                }
+            }
+            ServedOn::PrivateNetwork => "in your private network".into(),
+            ServedOn::PublicNetwork => "on the public network".into(),
+        })
+    }
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -571,6 +622,7 @@ pub fn handle_serve_request(
                 provider: String::new(),
                 served_model: String::new(),
                 card_fallback: None,
+                served_on: Default::default(),
             };
         }
     };
@@ -722,6 +774,7 @@ pub fn handle_serve_request_watched(
                 provider: String::new(),
                 served_model: String::new(),
                 card_fallback: None,
+                served_on: Default::default(),
             }
         }
         Err(e) => {
@@ -743,6 +796,7 @@ pub fn handle_serve_request_watched(
                 served_model: String::new(),
 
                 card_fallback: None,
+                served_on: Default::default(),
             }
         }
     }

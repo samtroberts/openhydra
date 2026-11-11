@@ -35,6 +35,17 @@ test("under an answer: model, time, trust; numbers on hover; nothing for a missi
   assert.match(local, /5 tokens/);
 });
 
+test("under an answer: where it ran, right after the model", () => {
+  const m = markupString(metaRow({ model: "qwen2.5-coder:1.5b", tok: 5, claimed: null, tps: "—", rtt: "—", tier: null, where: "on your machine", at: "9:30 PM" }));
+  assert.match(m, /<span>qwen2\.5-coder:1\.5b<\/span><span title="Where your prompt was answered">on your machine<\/span><span>9:30 PM<\/span>/);
+  // A swarm's name is escaped like everything else.
+  const s = markupString(metaRow({ model: "m", tok: 1, claimed: null, tps: "—", rtt: "—", tier: null, where: "in your private swarm “<b>x</b>”", at: "9:31 PM" }));
+  assert.doesNotMatch(s, /<b>x<\/b>/);
+  // Not said (an older gateway, a hosted API): nothing extra.
+  const none = markupString(metaRow({ model: "m", tok: 1, claimed: null, tps: "—", rtt: "—", tier: null, at: "9:32 PM" }));
+  assert.match(none, /<span>m<\/span><span>9:32 PM<\/span>/);
+});
+
 test("a corrected bill reads in words", () => {
   const m = markupString(metaRow({ model: "qwen3:8b", tok: 61, claimed: 120, tps: 50, rtt: 9, tier: "A0", at: "9:27 PM" }));
   assert.match(m, /Charged 61 tokens \(provider asked for 120, corrected\)/);

@@ -97,6 +97,10 @@ struct AppState {
     /// Per-session sticky model selection set via the `/model <id>` slash-command (keyed by the
     /// caller's API-key identity; in-memory, TTL'd, never persisted).
     sessions: Arc<SessionModels>,
+    /// What `openhydra/auto` last chose for each session, and where it ran (`` `model` on your
+    /// machine ``), for `/model` to tell a coding tool's user (who only sees "OpenHydra Auto").
+    /// Same keying and lifetime as `sessions`.
+    last_auto: Arc<SessionModels>,
     /// Sticky browse-list cache smoothing catalog churn for `/v1/models` + `/models` (routing is
     /// unaffected — it uses the live set).
     model_cache: Arc<ModelStickyCache>,
@@ -854,7 +858,8 @@ async fn handle_slash(state: &AppState, skey: &str, cmd: SlashCommand) -> String
         SlashCommand::ModelShow | SlashCommand::Help => Vec::new(),
     };
     let current = state.sessions.get(skey);
-    let result = slash::render(&cmd, &known, current.as_deref());
+    let last_auto = state.last_auto.get(skey);
+    let result = slash::render(&cmd, &known, current.as_deref(), last_auto.as_deref());
     if let Some(model) = result.set_model {
         state.sessions.set(skey, model);
     }
@@ -991,6 +996,10 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
         // The model's card provider couldn't serve and another provider of the same version did:
         // never silent (the app shows it under the reply).
         "card": summary.card_fallback.as_ref().map(|reason| json!({ "fell_back": true, "reason": reason })),
+        // Where it was served (this machine, a private swarm, the private or the public network):
+        // shown under the reply, so a person always knows where their prompt went.
+        "served_on": summary.served_on.key(),
+        "served_on_text": summary.served_on.phrase(),
         "engine": {
             "native_tps": rate(e.eval_count, e.eval_duration_ns),
             "prefill_tps": rate(e.prompt_eval_count, e.prompt_eval_duration_ns),
@@ -1139,6 +1148,7 @@ fn spawn_worker(
     fallback: Option<crate::cards::CardFallback>,
     gen_permit: OwnedSemaphorePermit,
     own_machine: bool,
+    remember: Option<(Arc<SessionModels>, String)>,
 ) -> (
     EventRx,
     std::time::Instant,
@@ -1167,6 +1177,9 @@ fn spawn_worker(
                     tracing::warn!(%model, dropped, kept = kept.len(), "dropped tool calls the request didn't offer or that were malformed");
                 }
                 summary.tool_calls = kept;
+                if let (Some((last_auto, key)), Some(place)) = (&remember, summary.served_on.phrase()) {
+                    last_auto.set(key, auto_choice_text(&model, &place));
+                }
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
@@ -1176,6 +1189,11 @@ fn spawn_worker(
         }
     });
     (rx, started)
+}
+
+/// How `/model` describes `auto`'s last choice: `` `qwen2.5-coder:1.5b` on your machine ``.
+fn auto_choice_text(model: &str, place: &str) -> String {
+    format!("`{model}` {place}")
 }
 
 /// What an `openhydra/auto` request that went to this machine's own provider says when that
@@ -1380,7 +1398,9 @@ async fn spawn_dispatch(
         )
     } else {
         let own_machine = matches!(route, Route::Auto(AutoStep::OwnMachine, _));
-        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, gen_permit, own_machine)
+        // An `auto` choice is remembered for the session once it served, for `/model` to report.
+        let remember = matches!(route, Route::Auto(..)).then(|| (state.last_auto.clone(), session_key(headers)));
+        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, gen_permit, own_machine, remember)
     };
     Ok((model, route, rx, started))
 }
@@ -1492,6 +1512,7 @@ fn spawn_byok_worker(
                     provider: String::new(),
                     served_model: String::new(),
                     card_fallback: None,
+                    served_on: Default::default(),
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -1953,7 +1974,11 @@ fn anthropic_stop_reason(summary: &ServeSummary) -> &'static str {
 /// The OpenHydra fields an Anthropic-shaped reply carries (clients ignore unknown fields): the tier
 /// the serving provider was verified at, as on the OpenAI surface (review round 4 G4-10).
 fn anthropic_openhydra(summary: &ServeSummary) -> Value {
-    json!({ "provider_authenticity": summary.authenticity.map(|t| t.label()) })
+    json!({
+        "provider_authenticity": summary.authenticity.map(|t| t.label()),
+        "served_on": summary.served_on.key(),
+        "served_on_text": summary.served_on.phrase(),
+    })
 }
 
 async fn messages(
@@ -2639,6 +2664,7 @@ pub fn router(
         byok: Arc::new(byok),
         embeddings: Arc::new(embeddings_cfg),
         sessions: Arc::new(SessionModels::new(slash::DEFAULT_SESSION_TTL)),
+        last_auto: Arc::new(SessionModels::new(slash::DEFAULT_SESSION_TTL)),
         model_cache: Arc::new(ModelStickyCache::new(MODEL_STICKY_TTL)),
     };
     // The `/v1/*` routes are auth-gated then rate-limited; `/health` stays open for liveness
@@ -2819,6 +2845,7 @@ mod tests {
             provider: String::new(),
             served_model: String::new(),
             card_fallback: None,
+            served_on: Default::default(),
         }
     }
 

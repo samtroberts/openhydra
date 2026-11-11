@@ -1270,6 +1270,7 @@ pub fn request_completion(
                     provider: String::new(),
                     served_model: String::new(),
                     card_fallback: None,
+                    served_on: Default::default(),
                 })
             }
         }
@@ -1795,6 +1796,7 @@ fn dispatch_stream_slice(
                     provider: String::new(),
                     served_model: String::new(),
                     card_fallback: None,
+                    served_on: Default::default(),
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
@@ -2829,6 +2831,34 @@ impl ConsumerNode {
     /// #7: is `provider_libp2p` this node's own co-located provider?
     fn is_self_serve(&self, provider_libp2p: &str) -> bool {
         self.self_provider.as_deref() == Some(provider_libp2p)
+    }
+
+    /// Where `provider` is, for the person reading the reply ([`crate::serve::ServedOn`]): this
+    /// machine; a private swarm, when one of this node's unexpired private cards names it (labelled
+    /// from the membership credential for that swarm); else the keyed private network or the
+    /// public network this node is on.
+    fn served_on(&self, provider: &str, now: u64) -> crate::serve::ServedOn {
+        use crate::serve::ServedOn;
+        if self.is_self_serve(provider) {
+            return ServedOn::ThisMachine;
+        }
+        let swarm = self.cards.as_ref().and_then(|c| {
+            c.valid_cards(now).into_iter().find(|card| card.libp2p_peer_id == provider && !card.swarm_public_key.is_empty())
+        });
+        if let Some(card) = swarm {
+            let label = self
+                .creds
+                .as_ref()
+                .and_then(|c| c.credential_for_swarm(&card.swarm_public_key, now))
+                .map(|cred| cred.swarm_label)
+                .unwrap_or_default();
+            return ServedOn::PrivateSwarm(label);
+        }
+        if openhydra_network::transport::private_network_key().is_some() {
+            ServedOn::PrivateNetwork
+        } else {
+            ServedOn::PublicNetwork
+        }
     }
 
     /// A consumer whose earned reputation (M2.2(a)) and give-side credit (M2.3) are
@@ -4294,6 +4324,7 @@ impl ConsumerNode {
                     summary.streamed = streamed;
                     summary.provider = provider_libp2p.clone();
                     summary.served_model = model.to_string();
+                    summary.served_on = self.served_on(&provider_libp2p, now_unix_ms());
                     // The tier the routing decision saw for this provider, for the client to see.
                     if !self.is_self_serve(&provider_libp2p) {
                         summary.authenticity = Some(self.authenticity_of(&provider.state_id, model_key_now, now));
@@ -7867,6 +7898,53 @@ mod tests {
             public_key: hex::encode(pk),
         };
         assert!(gated.auto_candidates_from(vec![p], None, now).tiers.is_empty());
+    }
+
+    /// Where a reply was served, as the app and `/model` show it.
+    #[test]
+    fn served_on_names_this_machine_a_private_swarm_or_the_network() {
+        use crate::serve::ServedOn;
+        use openhydra_network::card::{sign_card, PricingMode};
+        let (dir, node) = test_node();
+        let provider = openhydra_network::identity::Identity::load_or_create(&dir.path().join("provider.key")).unwrap();
+        let owner_dir = dir.path().join("owner-swarms");
+        let member_dir = dir.path().join("member-swarms");
+        let swarm = crate::swarms::create_swarm(&owner_dir, "Acme", 1_000).unwrap();
+        let now = now_unix_ms();
+        let detected = crate::adapter::DetectedModel {
+            engine_ref: "m".into(), canonical_id: String::new(), family: String::new(), params: String::new(),
+            quant: String::new(), size_bytes: 0, weight_digest: String::new(),
+        };
+        let card = crate::cards::build_card(&detected, "m", &provider.openhydra_peer_id, now, 3_600, PricingMode::Reciprocal, None, Some(swarm.swarm_public_key.clone()));
+        let cards_path = dir.path().join("cards.json");
+        crate::cards::add_card(&cards_path, &sign_card(card, &provider.keypair).unwrap()).unwrap();
+        let creds = crate::swarms::CredentialStore::new(member_dir.clone());
+        let node = node
+            .with_self_provider(Some("12D3KooWMe".into()))
+            .with_cards(Some(crate::cards::CardStore::new(cards_path)))
+            .with_credentials(Some(creds));
+        let pid = provider.libp2p_peer_id.to_base58();
+        assert_eq!(node.served_on("12D3KooWMe", now), ServedOn::ThisMachine);
+        assert_eq!(node.served_on("12D3KooWStranger", now), ServedOn::PublicNetwork);
+        assert_eq!(node.served_on(&pid, now), ServedOn::PrivateSwarm(String::new()), "no credential yet: unnamed");
+        assert_eq!(node.served_on(&pid, now).phrase().as_deref(), Some("in your private swarm"));
+        // Enrolled: the swarm's name comes from the membership credential.
+        let member = openhydra_network::identity::Identity::load_or_create(&dir.path().join("member.key")).unwrap();
+        let req = crate::swarms::build_enrollment_request(&member, &swarm.swarm_public_key, "me", now).unwrap();
+        let approved = crate::swarms::approve_member(&owner_dir, &swarm.swarm_public_key, &req.magnet, "me", 3_600_000, now).unwrap();
+        crate::swarms::accept_credential(&member_dir, &member, &approved.magnet, "", now).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100)); // the store rescans on a newer mtime
+        let named = node.served_on(&pid, now_unix_ms());
+        assert_eq!(named.key(), Some("private_swarm"));
+        assert_eq!(named.phrase().as_deref(), Some("in your private swarm “Acme”"));
+        assert_eq!(ServedOn::ThisMachine.phrase().as_deref(), Some("on your machine"));
+        assert_eq!(ServedOn::PublicNetwork.phrase().as_deref(), Some("on the public network"));
+        assert_eq!(ServedOn::PrivateNetwork.phrase().as_deref(), Some("in your private network"));
+        // An owner-chosen name can't smuggle in control characters or run on.
+        let odd = ServedOn::PrivateSwarm(format!("Ac\nme\u{1b}[31m{}", "x".repeat(80)));
+        let p = odd.phrase().unwrap();
+        assert!(!p.chars().any(|c| c.is_control()) && p.chars().count() < 70, "{p}");
+        assert_eq!(ServedOn::Unknown.key(), None, "provider-side and hosted APIs: nothing shown");
     }
 
     /// An imported public card's model is listed; a private card's only once this gateway holds a

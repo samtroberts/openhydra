@@ -41,7 +41,8 @@ const KW = new Set("fn let mut pub use impl struct enum trait match if else for 
 export function hl(code) { const out = []; let i = 0; const push = (c, s) => out.push(c ? html`<span class="${c}">${s}</span>` : s); while (i < code.length) { const rest = code.slice(i); let m; if ((m = rest.match(/^(\/\/|#(?!\[)|--)[^\n]*/))) push("tk-com", m[0]); else if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) push("tk-com", m[0]); else if ((m = rest.match(/^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/))) push("tk-str", m[0]); else if ((m = rest.match(/^\b\d[\d_]*(\.\d+)?\b/))) push("tk-num", m[0]); else if ((m = rest.match(/^[A-Za-z_]\w*/))) { if (KW.has(m[0])) push("tk-kw", m[0]); else if (code[i + m[0].length] === "(") push("tk-fn", m[0]); else push(null, m[0]); } else { push(null, code[i]); i++; continue; } i += m[0].length; } return html`${out}`; }
 // Fenced code is split out by the markdown module's parser (tested there).
 export { parseFences } from "./markdown.js";
-// Under an answer (SL3): the model, the time and the provider's trust; the numbers (tokens, speed,
+// Under an answer (SL3): the model, where it ran (this machine, a private swarm, the public network),
+// the time and the provider's trust; the numbers (tokens, speed,
 // network time) appear on hover, and a value that's missing isn't shown at all. A corrected bill is
 // always shown, in words.
 export function metaRow(m) {
@@ -53,7 +54,8 @@ export function metaRow(m) {
     : "";
   // A card's model another provider served (its card's provider couldn't): said under the reply.
   const note = m.note ? html`<span class="mut" title="The card you imported names another provider">${m.note}</span>` : "";
-  return html`<div class="msgmeta"><span>${m.model}</span>${known(m.at) ? html`<span>${m.at}</span>` : ""}${m.tier ? html`<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${charged}${details ? html`<span class="num det">${details}</span>` : ""}${note}</div>`;
+  const where = m.where ? html`<span title="Where your prompt was answered">${m.where}</span>` : "";
+  return html`<div class="msgmeta"><span>${m.model}</span>${where}${known(m.at) ? html`<span>${m.at}</span>` : ""}${m.tier ? html`<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${charged}${details ? html`<span class="num det">${details}</span>` : ""}${note}</div>`;
 }
 // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as
 // <think>…</think> inside content; some engines (LM Studio serving MLX) strip it and hand
