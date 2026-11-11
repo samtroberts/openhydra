@@ -22,10 +22,14 @@ import { pinRows } from "./pins";
   // its `openhydra/auto` requests until it's unused for an hour, or `/model auto`). Shown so a choice
   // made in a tool isn't invisible here, with a way back to auto. Refreshed while the view is open.
   let pinTimer = null;
+  let pinSeq = 0;
   async function renderPins() {
     const box = $("#pinpanel"); if (!box) return;
+    // Only the latest call renders: an older reply arriving last would show a pin just cleared.
+    const seq = ++pinSeq;
     let rows = [];
     try { rows = pinRows(await call("active_pins")); } catch {}
+    if (seq !== pinSeq) return;
     if (!rows.length) { box.style.display = "none"; box.replaceChildren(); }
     else {
       box.style.display = "block";

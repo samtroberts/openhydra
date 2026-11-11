@@ -18,9 +18,17 @@
 ; or removed: an agent left running by a crash or an update locks its .exe, and holds the app's
 ; ports so the new version can't start its own (11 Nov Windows test, D-H1). Agents the user runs
 ; from anywhere else are left alone.
+;
+; - The folder goes to PowerShell in an environment variable, never inside its quotes, so a path
+;   with an apostrophe (C:\Users\O'Brien\...) can't break the command; a trailing \ keeps
+;   ...\OpenHydraDev\ from matching ...\OpenHydra.
+; - Processes are found through CIM (Win32_Process.ExecutablePath): the installer is 32-bit, and a
+;   32-bit PowerShell's Get-Process can't read a 64-bit process's path (review 11 Nov).
+; - -InputFormat None: PowerShell under nsExec can otherwise wait on stdin.
+; Backtick-quoted so ' and " pass through unescaped ($$ is a literal $).
 !macro OH_STOP_AGENTS
-  ; Backtick-quoted so both ' and " pass through to PowerShell unescaped ($$ is a literal $).
-  nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process openhydra-agent,openhydra -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path.StartsWith('$INSTDIR', [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force"`
+  System::Call 'kernel32::SetEnvironmentVariable(t "OH_INSTDIR", t "$INSTDIR")'
+  nsExec::ExecToLog `powershell -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -Command "$$d = $$env:OH_INSTDIR.TrimEnd([char]92) + [char]92; Get-CimInstance Win32_Process | Where-Object { ($$_.Name -eq 'openhydra-agent.exe' -or $$_.Name -eq 'openhydra.exe') -and $$_.ExecutablePath -and $$_.ExecutablePath.StartsWith($$d, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }"`
   Pop $0
 !macroend
 

@@ -70,8 +70,9 @@ fn registry_set(slot: &AtomicU32, pid: u32) {
 }
 
 /// At launch, kill agents a previous app instance left behind (its pidfile survived a
-/// SIGKILL/crash). Only pids whose command is actually `openhydra-agent` are touched —
-/// never a reused pid, and never agents the operator runs by hand.
+/// SIGKILL/crash). Only pids whose command is `openhydra-agent` are touched (on Windows: whose
+/// program is this app's own agent binary, by full path, so a reused pid or an agent the user
+/// runs from elsewhere is left alone; on Unix the check is by name).
 fn sweep_stale_agents() {
     let Ok(content) = std::fs::read_to_string(pidfile()) else { return };
     for pid in content.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
@@ -84,22 +85,21 @@ fn sweep_stale_agents() {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("openhydra-agent"))
             .unwrap_or(false);
-        // Windows: `tasklist` names the process at that pid (11 Nov: the sweep was Unix-only, so an
-        // agent left by a crash or an update kept the ports and the new app couldn't start its own).
+        // Windows (11 Nov: the sweep was Unix-only, so an agent left by a crash or an update kept the
+        // ports and the new app couldn't start its own): kill it only if it runs this app's agent.
         #[cfg(windows)]
-        let is_agent = crate::proc::command("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("\"openhydra-agent.exe\""))
-            .unwrap_or(false);
+        {
+            if agent_binary().is_some_and(|exe| crate::winjob::kill_if_running(pid, &exe)) {
+                eprintln!("openhydra-desktop: reaped stale agent pid {pid} from a previous run");
+            }
+            continue;
+        }
+        #[cfg(unix)]
         if is_agent {
             eprintln!("openhydra-desktop: reaping stale agent pid {pid} from a previous run");
-            #[cfg(unix)]
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
             }
-            #[cfg(windows)]
-            let _ = crate::proc::command("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
         }
     }
     let _ = std::fs::remove_file(pidfile());
@@ -334,12 +334,14 @@ fn openhydra_dir() -> PathBuf {
 /// without group/other bits (an executable stays executable for the owner). It holds chat history,
 /// keys and ledgers, and was 0755 with `sessions.json` 0644, readable by every account on the
 /// machine (audit 11 Nov, finding 8). The folder's own mode is what protects anything deeper;
-/// deeper files (installed engines) aren't walked, to keep start-up cheap. Symlinks are skipped.
+/// deeper files (installed engines) aren't walked, to keep start-up cheap. Symlinks inside it are
+/// skipped; the folder itself is followed if it is one.
 #[cfg(unix)]
 fn make_private(dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    fn tighten(p: &std::path::Path) {
-        let Ok(meta) = std::fs::symlink_metadata(p) else { return };
+    fn tighten(p: &std::path::Path, follow: bool) {
+        let meta = if follow { std::fs::metadata(p) } else { std::fs::symlink_metadata(p) };
+        let Ok(meta) = meta else { return };
         if meta.file_type().is_symlink() {
             return;
         }
@@ -351,10 +353,12 @@ fn make_private(dir: &std::path::Path) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    tighten(dir);
+    // The folder itself even when it's a symlink to the real one (a moved data folder): that folder
+    // is what holds the files (review 11 Nov). Symlinks inside are left alone.
+    tighten(dir, true);
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
-            tighten(&e.path());
+            tighten(&e.path(), false);
         }
     }
 }
@@ -787,6 +791,22 @@ fn integrate_appimage() -> Result<(), String> {
         .args(["default", "openhydra.desktop", CARD_MIME, "x-scheme-handler/openhydra"])
         .status();
     Ok(())
+}
+
+/// An AppImage launcher an earlier version wrote (no `.openhydra` file type or `openhydra:` links),
+/// or one pointing at the AppImage's old place: rewrite it, so double-clicking a card works for
+/// users who added the app to their menu before (review 11 Nov). Only an existing launcher of ours.
+#[cfg(target_os = "linux")]
+fn refresh_appimage_launcher() {
+    let (Some(appimage), Some(path)) = (appimage_path(), desktop_entry_path()) else { return };
+    let Ok(current) = std::fs::read_to_string(&path) else { return };
+    let up_to_date = current.contains(CARD_MIME)
+        && exec_arg(&appimage).is_some_and(|exec| current.contains(&format!("Exec={exec} %U")));
+    if !up_to_date {
+        if let Err(e) = integrate_appimage() {
+            eprintln!("openhydra-desktop: couldn't update the AppImage launcher: {e}");
+        }
+    }
 }
 
 // ── #4: bundle the (bounded, in-memory) agent logs + environment into one file to send the
@@ -3732,6 +3752,8 @@ fn main() {
             sweep_stale_agents();
             #[cfg(unix)]
             make_private(&openhydra_dir());
+            #[cfg(target_os = "linux")]
+            std::thread::spawn(refresh_appimage_launcher);
             // The local gateway key, before anything connects a tool or starts the gateway; then
             // re-wire tools connected by an older build (or with an older key), which the gateway
             // would now refuse. Off the main thread: it reads and writes a few config files.
@@ -4199,6 +4221,15 @@ mod tests {
         assert_eq!(mode(&dir.join("tool")), 0o700, "an executable stays executable for its owner");
         assert_eq!(mode(&dir.join("swarms")), 0o700);
         assert_eq!(mode(&outside), 0o644, "a symlink's target outside the folder is left alone");
+
+        // A data folder that is a symlink to the real one: the real one is made private.
+        let real = tmp.path().join("real-data");
+        std::fs::create_dir(&real).unwrap();
+        set(&real, 0o755);
+        let linked = tmp.path().join(".openhydra-linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        make_private(&linked);
+        assert_eq!(mode(&real), 0o700);
     }
 
     #[test]
