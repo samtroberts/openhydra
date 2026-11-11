@@ -2554,6 +2554,55 @@ fn merge_transfers(base: &mut serde_json::Value, gw: serde_json::Value) {
 /// Blocking loopback GET of the status endpoint. Zero-dep: the agent serves tiny
 /// `Connection: close` JSON, so a `std::net::TcpStream` request/read is enough (no reqwest
 /// needed for a same-host call, and it avoids CORS in the webview entirely).
+/// One request to the local gateway with the app's gateway key (`/v1/*` routes require it).
+fn gateway_request(port: u16, method: &str, path: &str, body: Option<&str>) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+    let auth = gateway_api_key().map(|k| format!("Authorization: Bearer {k}\r\n")).unwrap_or_default();
+    let body = body.unwrap_or("");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}User-Agent: openhydra-desktop\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let (head, body) = raw.split_once("\r\n\r\n")?;
+    head.starts_with("HTTP/1.1 200").then_some(())?;
+    serde_json::from_str(body).ok()
+}
+
+/// The `/model` choices active in the connected tools (each tool's own), for the Connectors view.
+/// Empty when the gateway isn't running.
+#[tauri::command]
+async fn active_pins(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, ()> {
+    let running = state.gateway.lock().map(|r| r.status.running).unwrap_or(false);
+    let port = state.settings.lock().map(|s| s.gateway_port).unwrap_or(16527);
+    if !running {
+        return Ok(serde_json::json!({ "pins": [] }));
+    }
+    Ok(tauri::async_runtime::spawn_blocking(move || gateway_request(port, "GET", "/v1/openhydra/pins", None))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| serde_json::json!({ "pins": [] })))
+}
+
+/// Drop a tool's `/model` choice, so its requests go back to `openhydra/auto`.
+#[tauri::command]
+async fn clear_pin(state: tauri::State<'_, AppState>, client: String) -> Result<bool, String> {
+    let port = state.settings.lock().map(|s| s.gateway_port).unwrap_or(16527);
+    let body = serde_json::json!({ "client": client }).to_string();
+    tauri::async_runtime::spawn_blocking(move || gateway_request(port, "POST", "/v1/openhydra/pins/clear", Some(&body)))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.get("cleared").and_then(serde_json::Value::as_bool))
+        .ok_or_else(|| "the gateway isn't answering".to_string())
+}
+
 fn fetch_status(port: u16, path: &str) -> Option<serde_json::Value> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
@@ -3665,6 +3714,8 @@ fn main() {
             integrate_appimage,
             export_logs,
             connector_status,
+            active_pins,
+            clear_pin,
             connector_preview,
             connector_apply,
             connector_disconnect,

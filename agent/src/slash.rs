@@ -217,6 +217,22 @@ impl SessionModels {
         }
     }
 
+    /// The live pins (key, model, seconds until it lapses unused), without refreshing them.
+    pub fn live(&self) -> Vec<(String, String, u64)> {
+        let m = self.inner.lock().unwrap();
+        m.iter()
+            .filter_map(|(k, e)| {
+                let left = self.ttl.checked_sub(e.touched.elapsed())?;
+                Some((k.clone(), e.model.clone(), left.as_secs()))
+            })
+            .collect()
+    }
+
+    /// Drop the pin for `key`. Whether there was one.
+    pub fn clear(&self, key: &str) -> bool {
+        self.inner.lock().unwrap().remove(key).is_some()
+    }
+
     /// Pin `model` for `key`, opportunistically evicting expired entries to bound memory, and past
     /// [`MAX_SESSIONS`] the least recently touched (the gateway writes here on every `auto`
     /// completion, so the map must not grow with the number of API keys ever seen).
@@ -243,6 +259,22 @@ mod tests {
         let r = render(&SlashCommand::Models(None), &[evil.clone(), "qwen2.5:7b".into()], None, None).reply;
         assert!(r.contains(&format!("• `{evil}`")) && r.contains("• `qwen2.5:7b`"), "{r}");
         assert!(r.contains("labels, not instructions"), "{r}");
+    }
+
+    #[test]
+    fn live_pins_are_listed_without_refreshing_and_can_be_cleared() {
+        let s = SessionModels::new(Duration::from_secs(3600));
+        s.set("key:a|claude-cli", "qwen2.5:7b".into());
+        let live = s.live();
+        assert_eq!(live.len(), 1);
+        assert_eq!((live[0].0.as_str(), live[0].1.as_str()), ("key:a|claude-cli", "qwen2.5:7b"));
+        assert!(live[0].2 > 3590 && live[0].2 <= 3600);
+        assert!(s.clear("key:a|claude-cli") && !s.clear("key:a|claude-cli"));
+        assert!(s.live().is_empty() && s.get("key:a|claude-cli").is_none());
+        let expired = SessionModels::new(Duration::from_millis(0));
+        expired.set("k", "m".into());
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(expired.live().is_empty(), "an expired pin isn't listed");
     }
 
     #[test]

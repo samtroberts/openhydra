@@ -58,6 +58,8 @@ const COMMANDS: &[&str] = &[
     "integrate_appimage",
     "export_logs",
     "connector_status",
+    "active_pins",
+    "clear_pin",
     "connector_preview",
     "connector_apply",
     "connector_disconnect",

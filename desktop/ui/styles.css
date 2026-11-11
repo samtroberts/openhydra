@@ -297,6 +297,13 @@
   .clibanner{align-items:center;gap:11px;margin-bottom:14px;padding:10px 14px;border:1px solid hsl(var(--warning)/.45);background:hsl(var(--warning)/.09);border-radius:10px;font-size:12.5px;color:hsl(var(--foreground))}
   .clibanner .clib-ic{font-size:15px;flex:0 0 auto}
   .clibanner .clib-t{flex:1 1 auto;line-height:1.45}
+  .pinpanel{margin-bottom:14px;padding:12px 14px;font-size:12.5px}
+  .pinpanel .pin-hd{font-weight:600;margin-bottom:8px}
+  .pinpanel .pin-row{display:flex;align-items:center;gap:10px;padding:5px 0;border-top:1px solid hsl(var(--border))}
+  .pinpanel .pin-hd+.pin-row{border-top:0}
+  .pinpanel .pin-t{flex:1 1 auto;min-width:0;line-height:1.45}
+  .pinpanel .pin-row .btn{flex:none}
+  .pinpanel .pin-foot{margin-top:6px;font-size:11.5px}
   .clibanner .clib-go{flex:0 0 auto}
   .conncard{border:1px solid hsl(var(--border));border-radius:12px;background:hsl(var(--card));padding:14px;display:flex;flex-direction:column;gap:9px}
   .conncard .hd{display:flex;align-items:center;gap:8px}.conncard .hd b{font-size:13px}

@@ -811,17 +811,58 @@ async fn resolve_model(
 /// key, so the key alone gave them one shared pin: a `/model` typed in OpenCode steered Claude
 /// Code too (audit 11 Nov, finding 5).
 fn session_key(headers: &axum::http::HeaderMap) -> String {
-    let base = headers
+    let base = session_base(headers);
+    match headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).and_then(client_name) {
+        Some(client) => format!("{base}|{client}"),
+        None => base,
+    }
+}
+
+/// The caller's part of a session key: its API key (or `local`), without the client name.
+fn session_base(headers: &axum::http::HeaderMap) -> String {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .map(|k| format!("key:{k}"))
-        .unwrap_or_else(|| "local".to_string());
-    match headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).and_then(client_name) {
-        Some(client) => format!("{base}|{client}"),
-        None => base,
-    }
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// The caller's own live `/model` choices, one per client (a session key under another API key is
+/// never shown): `(client name, "" for a client without one; model; seconds until it lapses unused)`,
+/// sorted by client. `auto` choices are left out (they're the default, not a choice to show).
+fn caller_pins(sessions: &SessionModels, base: &str) -> Vec<(String, String, u64)> {
+    let mut pins: Vec<(String, String, u64)> = sessions
+        .live()
+        .into_iter()
+        .filter(|(_, model, _)| !is_auto_model(model))
+        .filter_map(|(key, model, left)| {
+            let client = if key == base { String::new() } else { key.strip_prefix(base)?.strip_prefix('|')?.to_string() };
+            Some((client, model, left))
+        })
+        .collect();
+    pins.sort();
+    pins
+}
+
+/// `GET /v1/openhydra/pins`: the caller's live `/model` choices, so the app can show them.
+async fn list_pins(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    let pins: Vec<Value> = caller_pins(&state.sessions, &session_base(&headers))
+        .into_iter()
+        .map(|(client, model, left)| json!({ "client": client, "model": model, "expires_in_secs": left }))
+        .collect();
+    Json(json!({ "pins": pins })).into_response()
+}
+
+/// `POST /v1/openhydra/pins/clear` `{"client": "claude-cli"}`: drop the caller's `/model` choice for
+/// that client, so its `auto` requests are chosen automatically again.
+async fn clear_pin(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let base = session_base(&headers);
+    let client = body.get("client").and_then(Value::as_str).unwrap_or("");
+    let key = if client.is_empty() { base } else { format!("{base}|{client}") };
+    let cleared = state.sessions.clear(&key);
+    Json(json!({ "cleared": cleared })).into_response()
 }
 
 /// A client's name from its `User-Agent`: the first product token, lower-cased, without its
@@ -2788,6 +2829,8 @@ pub fn router(
         .route("/v1/messages", post(messages))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
+        .route("/v1/openhydra/pins", get(list_pins))
+        .route("/v1/openhydra/pins/clear", post(clear_pin))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     let metrics = Router::new()
@@ -3915,6 +3958,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(latest_ant_user_text(&tr.messages), None);
+    }
+
+    #[test]
+    fn a_caller_sees_only_its_own_pins() {
+        let s = SessionModels::new(std::time::Duration::from_secs(3600));
+        s.set("key:mine|claude-cli", "qwen2.5:7b".into());
+        s.set("key:mine|opencode", "openhydra/auto".into());
+        s.set("key:mine", "llama3.2:3b".into());
+        s.set("key:other|claude-cli", "secret-model".into());
+        s.set("key:mine2|x", "not-mine".into());
+        let pins = caller_pins(&s, "key:mine");
+        let names: Vec<(&str, &str)> = pins.iter().map(|(c, m, _)| (c.as_str(), m.as_str())).collect();
+        assert_eq!(names, vec![("", "llama3.2:3b"), ("claude-cli", "qwen2.5:7b")], "no auto, no other caller's");
     }
 
     #[test]

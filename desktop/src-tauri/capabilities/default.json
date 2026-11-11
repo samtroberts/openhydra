@@ -67,6 +67,8 @@
     "allow-integrate-appimage",
     "allow-export-logs",
     "allow-connector-status",
+    "allow-active-pins",
+    "allow-clear-pin",
     "allow-connector-apply",
     "allow-connector-disconnect",
     "allow-open-gui",

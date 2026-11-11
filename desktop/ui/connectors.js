@@ -8,12 +8,38 @@ import { toast, confirmModal, failToast } from "./chrome";
 import { liveModels, displayModelName } from "./models";
 import { on } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
+import { pinRows } from "./pins";
 
   export function renderConnectors() {
     $$("#v-connectors .cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); const sn = b.closest(".conncard")?.querySelector(".snippet"); navigator.clipboard?.writeText((sn?.textContent || "").trim()); toast("Copied"); });
     wireConnectors();
     if (cliState() === null) refreshCliStatus();   // lazy first fetch if boot hasn't run it yet
     renderCliBanner();
+    renderPins();
+  }
+
+  // Each connected tool's `/model` choice (a tool that typed `/model <id>` keeps using that model for
+  // its `openhydra/auto` requests until it's unused for an hour, or `/model auto`). Shown so a choice
+  // made in a tool isn't invisible here, with a way back to auto. Refreshed while the view is open.
+  let pinTimer = null;
+  async function renderPins() {
+    const box = $("#pinpanel"); if (!box) return;
+    let rows = [];
+    try { rows = pinRows(await call("active_pins")); } catch {}
+    if (!rows.length) { box.style.display = "none"; box.replaceChildren(); }
+    else {
+      box.style.display = "block";
+      setHTML(box, html`<div class="pin-hd">Models chosen with <span class="mono">/model</span></div>${rows.map((r) => html`<div class="pin-row"><span class="pin-t"><b>${r.tool}</b> uses <span class="mono" title="${r.model}">${displayModelName(r.model)}</span> instead of choosing automatically <span class="mut">· ${r.lapse}</span></span><button class="btn ghost sm pin-clear" data-client="${r.client}">Back to auto</button></div>`)}<div class="mut pin-foot">In the tool itself, <span class="mono">/model auto</span> does the same.</div>`);
+      $$(".pin-clear", box).forEach((b) => b.onclick = async () => {
+        b.disabled = true;
+        try { await call("clear_pin", { client: b.dataset.client }); toast("Back to automatic choice"); }
+        catch (e) { failToast("Couldn't clear it", e); }
+        renderPins();
+      });
+    }
+    clearTimeout(pinTimer);
+    // Keep it current while the Connectors view is showing (a tool may type `/model` meanwhile).
+    pinTimer = setTimeout(() => { if ($("#v-connectors")?.offsetParent) renderPins(); }, 15000);
   }
 
   // Layer 2: the terminal snippets/`openhydra launch` only work once the `openhydra` CLI is on PATH.
