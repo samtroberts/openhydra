@@ -111,6 +111,8 @@ pub fn start_node(
         Arc<crate::rtt::PeerRtts>,
         // The peers dialled on pinned addresses (`crate::pinned`), shared with the event loop.
         crate::pinned::PinnedPeers,
+        // Whether the node is on OpenHydra's public network (`relay::uses_public_network`).
+        bool,
     ),
     String,
 > {
@@ -277,7 +279,7 @@ pub fn start_node(
         .map_err(|_| "background thread died during startup".to_string())?
         .map_err(|e| format!("startup failed: {e}"))?;
 
-    Ok((cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned_peers))
+    Ok((cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned_peers, public_network))
 }
 
 /// Check one bootstrap multiaddr the way the node will parse it at startup (a valid multiaddr with a

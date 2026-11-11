@@ -2865,8 +2865,12 @@ impl ConsumerNode {
         }
         if openhydra_network::transport::private_network_key().is_some() {
             ServedOn::PrivateNetwork
-        } else {
+        } else if self.net.is_public_network() {
             ServedOn::PublicNetwork
+        } else {
+            // A private deployment without a network key (its own bootstraps): not OpenHydra's
+            // public network, whatever a test or a CLI user calls it (11 Nov audit, S1).
+            ServedOn::Deployment
         }
     }
 
@@ -3695,6 +3699,30 @@ impl ConsumerNode {
         models
     }
 
+    /// This machine's own provider as a candidate for `model`, when its own list says it shares it
+    /// (at any reach: its Device and Private models are announced nowhere, so this is the only way
+    /// the gateway beside it reaches them; its scope gate lets this machine in).
+    fn own_peer_for(&self, model: &str, now: u64) -> Option<DiscoveredPeer> {
+        let own = self.self_provider.clone()?;
+        let mine = self.own_models(now)?;
+        mine.models.iter().any(|m| m == model).then(|| DiscoveredPeer {
+            peer_id: mine.peer_id,
+            libp2p_peer_id: own.clone(),
+            model_id: model.to_string(),
+            public_key: mine.public_key,
+            connected: self.net.peer_rtt(&own).is_some(),
+            ..Default::default()
+        })
+    }
+
+    /// Whether this machine's own provider, dialled on its pinned loopback address, shares `model`: the
+    /// request then goes to it alone ([`Self::own_peer_for`]), and a failed dial means it isn't
+    /// running, so one pass is enough.
+    fn own_pinned_serves(&self, model: &str) -> bool {
+        self.self_provider.as_deref().is_some_and(|me| self.net.is_pinned(me))
+            && self.own_peer_for(model, now_unix_ms()).is_some()
+    }
+
     /// Whether `only` restricts a request to this machine's own provider, and that provider is dialled
     /// on its pinned loopback address (`serve --self-provider-addr`).
     fn own_provider_only(&self, only: Option<&std::collections::HashSet<String>>) -> bool {
@@ -3799,7 +3827,7 @@ impl ConsumerNode {
                 // Restricted to this machine's own provider (`openhydra/auto` chose one of its models)
                 // and dialled on loopback: a failed dial means it isn't running, so one pass. The
                 // retries for a provider that just joined would only delay the answer by ~28 s.
-                if self.own_provider_only(only) {
+                if self.own_provider_only(only) || (only.is_none() && self.own_pinned_serves(model)) {
                     return self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
                 }
                 return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
@@ -4069,7 +4097,14 @@ impl ConsumerNode {
         // those providers, not for the model name.
         let allowed = |p: &DiscoveredPeer| only.is_none_or(|o| o.contains(&p.libp2p_peer_id));
         let t_discover = std::time::Instant::now();
-        let mut peers = if no_discovery {
+        // This machine's own provider shares the model: it serves it, and nobody else does. No
+        // network lookup (a Private or Device model is announced nowhere, so the lookup waited ~10 s
+        // for nothing on every request, and asked the bootstrap for the name in the clear), and no
+        // stranger announcing the same name takes the request (11 Nov audit, A4/A5).
+        let own_peer = self.own_peer_for(model, now).filter(|p| allowed(p));
+        let mut peers = if let Some(own) = &own_peer {
+            vec![own.clone()]
+        } else if no_discovery {
             // A private card's model: only the card's providers (added below), never the network.
             Vec::new()
         } else {
@@ -4091,7 +4126,7 @@ impl ConsumerNode {
         // bootstrap's provider registry, which has retained the verified adverts it saw. This is
         // a best-effort supplement: only when passive discovery found nothing, and a failed query
         // (no bootstrap, transport error) just leaves `peers` empty for the normal Retryable path.
-        if peers.is_empty() && !no_discovery {
+        if peers.is_empty() && !no_discovery && own_peer.is_none() {
             let _span = tracing::info_span!("registry_query", model = %model).entered();
             match self.net.query_registry(model) {
                 Ok(reg) if reg.iter().any(allowed) => {
@@ -4106,7 +4141,7 @@ impl ConsumerNode {
         // with no live discovery. Merge them in (deduped by libp2p id) so an imported model routes
         // even when passive discovery + the bootstrap registry are both silent. The store re-verifies
         // + expiry-checks on read, so only currently-valid cards are added.
-        if let Some(cards) = &self.cards {
+        if let Some(cards) = self.cards.as_ref().filter(|_| own_peer.is_none()) {
             let pinned = cards.providers_for(model, now);
             if !pinned.is_empty() {
                 let known: std::collections::HashSet<&str> =
@@ -4132,21 +4167,7 @@ impl ConsumerNode {
         // Phase 0.3: our own provider, for a model it shares at any reach. Its Device and Private
         // models are never announced (and a Device one has no card), so without this the gateway
         // beside it could never use them; its scope gate lets this machine in.
-        if let (Some(own), Some(mine)) = (self.self_provider.clone(), self.own_models(now)) {
-            if mine.models.iter().any(|m| m == model) && !peers.iter().any(|p| p.libp2p_peer_id == own) {
-                let p = DiscoveredPeer {
-                    peer_id: mine.peer_id,
-                    libp2p_peer_id: own.clone(),
-                    model_id: model.to_string(),
-                    public_key: mine.public_key,
-                    connected: self.net.peer_rtt(&own).is_some(),
-                    ..Default::default()
-                };
-                if allowed(&p) {
-                    peers.push(p);
-                }
-            }
-        }
+        // (Already the only candidate when it shares the model: see `own_peer` above.)
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
         // a provider that has failed this consumer ranks below an untried one. Increment 3: the
@@ -7974,11 +7995,13 @@ mod tests {
         assert_eq!(node.served_on("12D3KooWMe", "", now), ServedOn::ThisMachine);
         // The same provider, three routes: not via a private card (another of its models), via
         // Acme's card, via Beta's card. Each says its own.
-        assert_eq!(node.served_on(p, "", now), ServedOn::PublicNetwork, "its public model: public, whatever cards it has");
+        // (Test nodes are a private deployment, not OpenHydra's public network.)
+        assert_eq!(node.served_on(p, "", now), ServedOn::Deployment, "its other model: not private to a swarm, whatever cards it has");
         assert_eq!(node.served_on(p, &acme.swarm_public_key, now), ServedOn::PrivateSwarm("Acme".into()));
         assert_eq!(node.served_on(p, &beta.swarm_public_key, now), ServedOn::PrivateSwarm("Beta".into()), "the request's swarm, not the first card");
         // A private card for a swarm the caller isn't in: no credential went with the request.
-        assert_eq!(node.served_on(p, &other.swarm_public_key, now), ServedOn::PublicNetwork);
+        assert_eq!(node.served_on(p, &other.swarm_public_key, now), ServedOn::Deployment);
+        assert_eq!(ServedOn::Deployment.phrase().as_deref(), Some("on your private deployment"));
         assert_eq!(ServedOn::PrivateSwarm("Acme".into()).phrase().as_deref(), Some("in the private swarm “Acme”"));
         // A gateway other machines reach: its own provider isn't the caller's machine.
         let (_d2, remote) = test_node();
@@ -8277,6 +8300,29 @@ mod tests {
         let picked = crate::gateway::pick_auto_model(&c, None);
         assert_eq!(picked.as_deref(), Some("device-only:7b"));
         drop(dir);
+    }
+
+    /// A model this machine's own provider shares is served by it alone, with no network lookup
+    /// (11 Nov audit: a Private model's lookup waited ~10 s per request and leaked its name).
+    #[test]
+    fn a_model_this_machine_shares_goes_to_its_own_provider_alone() {
+        let (dir, node) = test_node();
+        let me = openhydra_network::identity::Identity::load_or_create(&dir.path().join("me.key")).unwrap().libp2p_peer_id.to_base58();
+        let node = node.with_self_provider(Some(me.clone()));
+        let now = now_unix_ms();
+        *node.own_models.lock().unwrap() = Some((now, crate::provider::OwnModels {
+            peer_id: "oh-me".into(),
+            public_key: "pk-me".into(),
+            models: vec!["qwen2.5-coder:1.5b".into()],
+        }));
+        let own = node.own_peer_for("qwen2.5-coder:1.5b", now).expect("shared here");
+        assert_eq!((own.libp2p_peer_id.as_str(), own.peer_id.as_str(), own.model_id.as_str()), (me.as_str(), "oh-me", "qwen2.5-coder:1.5b"));
+        assert!(node.own_peer_for("llama3.1:70b", now).is_none(), "not shared here: the network as usual");
+        // One pass only once the provider is dialled on its loopback pin (a failed dial = not running).
+        assert!(!node.own_pinned_serves("qwen2.5-coder:1.5b"));
+        node.net.pin_peer_addrs(&me, &["/ip4/127.0.0.1/tcp/9".to_string()]).unwrap();
+        assert!(node.own_pinned_serves("qwen2.5-coder:1.5b"));
+        assert!(!node.own_pinned_serves("llama3.1:70b"));
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub struct NetworkHandle {
     peer_rtts: Arc<crate::rtt::PeerRtts>,
     /// Peers dialled on pinned addresses ([`crate::pinned`]).
     pinned: crate::pinned::PinnedPeers,
+    /// The node is on OpenHydra's public network, not a private deployment.
+    public_network: bool,
 }
 
 impl NetworkHandle {
@@ -77,7 +79,7 @@ impl NetworkHandle {
             hex::encode(pk.to_bytes())
         };
         let keypair = identity.keypair.clone();
-        let (cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned) = start_node(&config)?;
+        let (cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned, public_network) = start_node(&config)?;
         Ok(Self {
             cmd_tx,
             proxy_queue,
@@ -89,6 +91,7 @@ impl NetworkHandle {
             net_generation,
             peer_rtts,
             pinned,
+            public_network,
         })
     }
 
@@ -257,6 +260,12 @@ impl NetworkHandle {
             })
             .collect::<Result<Vec<_>, String>>()?;
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::PinPeerAddrs { peer_id, addrs, reply })?
+    }
+
+    /// Whether this node is on OpenHydra's public network (its own bootstraps and relays), rather than
+    /// a private deployment (its own bootstraps only, keyed or not).
+    pub fn is_public_network(&self) -> bool {
+        self.public_network
     }
 
     /// Whether `peer` is pinned ([`pin_peer_addrs`](Self::pin_peer_addrs)): dialled on loopback, so a

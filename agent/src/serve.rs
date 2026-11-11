@@ -560,6 +560,9 @@ pub enum ServedOn {
     PrivateSwarm(String),
     /// On a keyed private network: by one of the organisation's nodes.
     PrivateNetwork,
+    /// On a private deployment that isn't keyed (its own bootstraps, not OpenHydra's): by another
+    /// node of that deployment.
+    Deployment,
     /// By a provider on OpenHydra's public network.
     PublicNetwork,
     /// By a hosted API through a BYOK key (its name, e.g. "Anthropic").
@@ -575,6 +578,7 @@ impl ServedOn {
             ServedOn::GatewayMachine => Some("gateway_machine"),
             ServedOn::PrivateSwarm(_) => Some("private_swarm"),
             ServedOn::PrivateNetwork => Some("private_network"),
+            ServedOn::Deployment => Some("private_deployment"),
             ServedOn::PublicNetwork => Some("public_network"),
             ServedOn::HostedApi(_) => Some("hosted_api"),
         }
@@ -593,6 +597,7 @@ impl ServedOn {
                 n => format!("in the private swarm “{n}”"),
             },
             ServedOn::PrivateNetwork => "in the private network".into(),
+            ServedOn::Deployment => "on your private deployment".into(),
             ServedOn::PublicNetwork => "on the public network".into(),
             ServedOn::HostedApi(name) => format!("on {name}'s hosted API"),
         })
