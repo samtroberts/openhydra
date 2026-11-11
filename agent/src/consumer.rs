@@ -8274,10 +8274,14 @@ mod tests {
         let t0 = 1_000_000;
         assert_eq!(node.own_models(t0).map(|m| m.models), Some(vec![]), "unreachable: shares nothing");
         let first = at(&node).unwrap();
-        assert_eq!(t0 - first, OWN_MODELS_TTL_MS - OWN_MODELS_RETRY_MS, "a failed ask stands OWN_MODELS_RETRY_MS");
-        node.own_models(t0 + OWN_MODELS_RETRY_MS - 1);
+        // The failed ask stands OWN_MODELS_RETRY_MS from when it ended: `t0` plus the ask's own few
+        // milliseconds (not zero on a slow first run, which made an exact check flaky).
+        let took = first + (OWN_MODELS_TTL_MS - OWN_MODELS_RETRY_MS) - t0;
+        assert!(took < 3_000, "a failed ask stands OWN_MODELS_RETRY_MS (took {took} ms)");
+        let due = t0 + took + OWN_MODELS_RETRY_MS;
+        node.own_models(due - 1);
         assert_eq!(at(&node), Some(first), "not asked again yet");
-        node.own_models(t0 + OWN_MODELS_RETRY_MS);
+        node.own_models(due);
         assert!(at(&node).unwrap() > first, "asked again {OWN_MODELS_RETRY_MS} ms later, not {OWN_MODELS_TTL_MS}");
         // An ask that ran its whole 3 s timeout stands OWN_MODELS_RETRY_MS from when it ended.
         let filed = failed_own_models_ask_at(t0, std::time::Duration::from_secs(3));
