@@ -948,6 +948,20 @@ fn failed_own_models_ask_at(now: u64, took: std::time::Duration) -> u64 {
     now.saturating_add(took.as_millis() as u64).saturating_sub(OWN_MODELS_TTL_MS - OWN_MODELS_RETRY_MS)
 }
 
+/// Add this machine's own models (`own`, from its provider `me`) to the known providers, each once.
+fn add_own_models(providers: &mut Vec<openhydra_network::types::KnownProvider>, me: &str, own: &crate::provider::OwnModels) {
+    for model in &own.models {
+        if !providers.iter().any(|k| k.libp2p_peer_id == me && &k.model_id == model) {
+            providers.push(openhydra_network::types::KnownProvider {
+                model_id: model.clone(),
+                openhydra_peer_id: own.peer_id.clone(),
+                libp2p_peer_id: me.to_string(),
+                public_key: own.public_key.clone(),
+            });
+        }
+    }
+}
+
 /// How long a failed ask of our own provider stands (it counts as sharing nothing meanwhile):
 /// short, so the machine's models are back within a couple of seconds of the provider starting
 /// (sharing turned on, the app's provider restarted), not up to [`OWN_MODELS_TTL_MS`] later. The
@@ -3504,8 +3518,16 @@ impl ConsumerNode {
     /// node's own provider, imported cards, and the reputation this node has earned with providers.
     /// `requested` is the request's own authenticity floor (the gateway's min-authenticity header).
     pub fn auto_candidates(&self, requested: Option<AuthenticityTier>) -> Result<AutoCandidates, String> {
-        let providers = self.net.known_providers()?;
-        Ok(self.auto_candidates_from(providers, requested, now_unix_ms()))
+        let now = now_unix_ms();
+        let mut providers = self.net.known_providers()?;
+        // This machine's own models, as its provider lists them: the network only ever hears of
+        // its Global ones (Private and Device models are never announced), so without these
+        // `auto` never chose a privately shared model of this machine, and offline it chose
+        // nothing at all.
+        if let (Some(me), Some(own)) = (self.self_provider.as_deref(), self.own_models(now)) {
+            add_own_models(&mut providers, me, &own);
+        }
+        Ok(self.auto_candidates_from(providers, requested, now))
     }
 
     /// [`auto_candidates`](Self::auto_candidates) over a given provider list (testable without a
@@ -8026,6 +8048,38 @@ mod tests {
         // An ask that ran its whole 3 s timeout stands OWN_MODELS_RETRY_MS from when it ended.
         let filed = failed_own_models_ask_at(t0, std::time::Duration::from_secs(3));
         assert_eq!(filed + OWN_MODELS_TTL_MS, t0 + 3_000 + OWN_MODELS_RETRY_MS);
+    }
+
+    #[test]
+    fn auto_sees_every_model_this_machine_shares_not_just_the_announced_ones() {
+        use openhydra_network::types::KnownProvider;
+        let kp = |model: &str, peer: &str| KnownProvider {
+            model_id: model.into(),
+            openhydra_peer_id: format!("oh-{peer}"),
+            libp2p_peer_id: peer.into(),
+            public_key: format!("pk-{peer}"),
+        };
+        // The network knows our Global model and someone else's model of the same name.
+        let mut providers = vec![kp("qwen2.5:0.5b", "12D3Me"), kp("qwen2.5:0.5b", "12D3Other")];
+        let own = crate::provider::OwnModels {
+            peer_id: "oh-12D3Me".into(),
+            public_key: "pk-12D3Me".into(),
+            // Global (already known), Private and Device (never announced).
+            models: vec!["qwen2.5:0.5b".into(), "qwen2.5-coder:1.5b".into(), "device-only:7b".into()],
+        };
+        add_own_models(&mut providers, "12D3Me", &own);
+        let mine: Vec<&str> = providers.iter().filter(|k| k.libp2p_peer_id == "12D3Me").map(|k| k.model_id.as_str()).collect();
+        assert_eq!(mine, ["qwen2.5:0.5b", "qwen2.5-coder:1.5b", "device-only:7b"], "each once, the known one not repeated");
+        assert_eq!(providers.len(), 4);
+        let added = providers.iter().find(|k| k.model_id == "device-only:7b").unwrap();
+        assert_eq!((added.openhydra_peer_id.as_str(), added.public_key.as_str()), ("oh-12D3Me", "pk-12D3Me"));
+        // And `auto` takes this machine's largest model first, never the other provider's.
+        let (dir, node) = test_node();
+        let node = node.with_self_provider(Some("12D3Me".into()));
+        let c = node.auto_candidates_from(providers, None, now_unix_ms());
+        let picked = crate::gateway::pick_auto_model(&c, None);
+        assert_eq!(picked.as_deref(), Some("device-only:7b"));
+        drop(dir);
     }
 
     #[test]

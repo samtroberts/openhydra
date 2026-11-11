@@ -557,7 +557,7 @@ fn auto_providers(c: &crate::consumer::AutoCandidates, model: &str, step: AutoSt
 
 /// [`pick_auto`] for a request with no special needs: just the model.
 #[cfg(test)]
-fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
+pub(crate) fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
     pick_auto(c, preferred, AutoNeeds::default()).ok().map(|(m, _)| m)
 }
 
