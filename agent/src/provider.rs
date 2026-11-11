@@ -3168,6 +3168,13 @@ impl<A: EngineAdapter> Provider<A> {
 
     /// Detect the engine's models and announce a record for each. Returns how many were
     /// announced.
+    /// How many detected models this provider shares at any reach (Global, Private or Device): what
+    /// it serves, announced or not.
+    pub fn shared_model_count(&self) -> usize {
+        let detected = self.detected.lock().unwrap_or_else(|e| e.into_inner());
+        detected.keys().filter(|e| self.policy.is_shared(e)).count()
+    }
+
     /// Detect + announce the shared models and publish the status view. Serialized against a
     /// concurrent watcher/poll announce (blocking) — used by the startup announce and the
     /// filesystem-watcher thread (blocking on the poll thread's serve loop is fine).

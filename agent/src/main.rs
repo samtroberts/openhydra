@@ -2253,7 +2253,15 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
             Err(e) => return Err(format!("announce models from {engine_url}: {e}").into()),
         }
     };
-    if announced == 0 {
+    let shared = provider.shared_model_count();
+    if announced == 0 && shared > 0 {
+        // Its models are all Private or Device: served, just never announced (review 11 Nov: the
+        // warning below said "serving nothing" for such a provider).
+        eprintln!(
+            "openhydra-agent: serving {shared} model(s) from {engine_url} to this machine and its swarms only \
+             (Private or Device: not announced to the network)"
+        );
+    } else if announced == 0 {
         // Not fatal — the operator may load models later — but the node serves nothing
         // until something is advertised, so make the silence visible. No restart needed:
         // the serve loop re-detects and re-announces on every interval below.
