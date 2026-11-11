@@ -257,7 +257,7 @@
   /* Long model names truncate (full name in the tooltip) instead of squeezing the controls. */
   #servetable td.shmodel b{display:inline-block;max-width:26ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
   @media (max-width:1240px){#servetable td.shmodel b{max-width:18ch}}
-  /* Below ~1040px (the default window is 1000, the minimum 900) the words don't fit beside the other
+  /* Below ~1040px (the default window is 1100, the minimum 900) the words don't fit beside the other
      columns: show the icons only (the words stay for screen readers, and in each button's tooltip). */
   @media (max-width:1040px){
     #servetable th,#servetable td{padding-left:8px;padding-right:8px}
