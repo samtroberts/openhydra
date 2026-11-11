@@ -502,7 +502,7 @@ fn pick_auto(
             .swarm_card_models
             .iter()
             .map(String::as_str)
-            .filter(|m| cards.contains(m) && !too_small_for_tools(m))
+            .filter(|m| cards.contains(m) && !c.skipped_cards.contains(*m) && !too_small_for_tools(m))
             .collect();
         if let Some(m) = best(swarm_cards.into_iter().map(|m| ((), m))) {
             return Ok((m.to_string(), AutoStep::Card));
@@ -511,7 +511,9 @@ fn pick_auto(
             return Ok((small.to_string(), AutoStep::OwnMachine));
         }
     }
-    let carded: Vec<&str> = cards.iter().copied().filter(|m| fits(m)).collect();
+    // A card whose provider just refused this node or couldn't be reached isn't chosen by `auto`
+    // itself (the preferred model and a pin, above, may still name it).
+    let carded: Vec<&str> = cards.iter().copied().filter(|m| !c.skipped_cards.contains(*m) && fits(m)).collect();
     if let Some(m) = best(carded.into_iter().map(|m| ((), m))) {
         return Ok((m.to_string(), AutoStep::Card));
     }
@@ -619,6 +621,19 @@ type AutoAlternate = (String, AutoStep, Option<std::collections::HashSet<String>
 /// How many further choices `openhydra/auto` tries when its first fails before answering.
 const MAX_AUTO_ALTERNATES: usize = 2;
 
+/// `c` without this machine's own provider: its models remain only where others serve them.
+fn without_own_machine(c: &crate::consumer::AutoCandidates) -> crate::consumer::AutoCandidates {
+    let mut c = c.clone();
+    if let Some(me) = c.self_provider.take() {
+        c.providers.retain(|k| k.libp2p_peer_id != me);
+        for ids in c.card_providers.values_mut() {
+            ids.remove(&me);
+        }
+        c.card_providers.retain(|_, ids| !ids.is_empty());
+    }
+    c
+}
+
 /// `c` without any of `models`: no provider, card or swarm card of them.
 fn without_models(c: &crate::consumer::AutoCandidates, models: &[String]) -> crate::consumer::AutoCandidates {
     let gone = |m: &String| models.contains(m);
@@ -639,8 +654,14 @@ fn auto_alternates(
     preferred: Option<&str>,
     needs: AutoNeeds,
     first: &str,
+    first_step: AutoStep,
     max: usize,
 ) -> Vec<AutoAlternate> {
+    // A choice on this machine that fails most likely failed for its engine, which this machine's
+    // other models share: its next choices go elsewhere (review 11 Nov: with three own models and
+    // the engine down, every choice went to the same dead engine and the swarm card was never tried).
+    let base = if first_step == AutoStep::OwnMachine { without_own_machine(c) } else { c.clone() };
+    let c = &base;
     let mut tried = vec![first.to_string()];
     let mut out = Vec::new();
     while out.len() < max {
@@ -758,9 +779,28 @@ impl Route {
 fn with_route(mut resp: Response, model: &str, route: Route) -> Response {
     use axum::http::HeaderValue;
     let headers = resp.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&route.header_value()) {
-        headers.insert(ROUTE_HEADER, v);
+    // A buffered reply that `auto`'s next choice answered has set both already
+    // ([`mark_auto_fallback`]): those say what really served, so they stay.
+    if !headers.contains_key(ROUTE_HEADER) {
+        if let Ok(v) = HeaderValue::from_str(&route.header_value()) {
+            headers.insert(ROUTE_HEADER, v);
+        }
     }
+    if !headers.contains_key(MODEL_HEADER) && model.len() <= 256 && model.bytes().all(|b| b.is_ascii_graphic()) {
+        if let Ok(v) = HeaderValue::from_str(model) {
+            headers.insert(MODEL_HEADER, v);
+        }
+    }
+    resp
+}
+
+/// A buffered reply `auto`'s next choice answered: its headers name that model, and the route
+/// `auto:fallback` (review 11 Nov: they named the first choice). A streamed reply's headers go out
+/// before anything is tried, so they keep the first choice; its chunks and final block say what served.
+fn mark_auto_fallback(mut resp: Response, model: &str) -> Response {
+    use axum::http::HeaderValue;
+    let headers = resp.headers_mut();
+    headers.insert(ROUTE_HEADER, HeaderValue::from_static("auto:fallback"));
     if model.len() <= 256 && model.bytes().all(|b| b.is_ascii_graphic()) {
         if let Ok(v) = HeaderValue::from_str(model) {
             headers.insert(MODEL_HEADER, v);
@@ -843,7 +883,7 @@ async fn resolve_model(
     match picked {
         Ok((model, step)) => {
             let only = auto_providers(&candidates, &model, step);
-            let next = auto_alternates(&candidates, preferred.as_deref(), needs, &model, MAX_AUTO_ALTERNATES);
+            let next = auto_alternates(&candidates, preferred.as_deref(), needs, &model, step, MAX_AUTO_ALTERNATES);
             Ok((model, Route::Auto(step, needs), only, next))
         }
         Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
@@ -1416,7 +1456,15 @@ fn spawn_worker(
                         }
                         continue;
                     }
-                    let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e), error_details(&e)));
+                    // Every choice failed: say what was tried before the last (review 11 Nov: only the
+                    // last choice's error reached the client).
+                    let text = if skipped.is_empty() {
+                        e.to_string()
+                    } else {
+                        let before: Vec<String> = skipped.iter().map(|(m, why)| format!("`{m}` ({why})")).collect();
+                        format!("openhydra/auto tried {}, then `{model}`, and none could answer: {e}", before.join(", then "))
+                    };
+                    let _ = tx.blocking_send(GatewayEvent::Error(text, error_class(&e), error_details(&e)));
                     return;
                 }
             }
@@ -1869,6 +1917,7 @@ async fn buffered_response(
     started: std::time::Instant,
     metrics: Arc<Metrics>,
 ) -> Response {
+    let mut rerouted = false;
     let mut content = String::new();
     let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass, Option<Value>)>> = None;
     // Time the first delta even though the HTTP body is buffered: with P1 streaming the tokens
@@ -1887,7 +1936,10 @@ async fn buffered_response(
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
             GatewayEvent::Error(m, class, details) => outcome = Some(Err((m, class, details))),
             // `auto`'s next choice answers: the reply carries its name.
-            GatewayEvent::Rerouted(m) => model = m,
+            GatewayEvent::Rerouted(m) => {
+                model = m;
+                rerouted = true;
+            }
         }
     }
     match outcome {
@@ -1903,8 +1955,8 @@ async fn buffered_response(
             );
             let e = &summary.metrics.engine;
             metrics.record_model(served_label(&summary, &model), &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
-            Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall)))
-                .into_response()
+            let resp = Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall))).into_response();
+            if rerouted { mark_auto_fallback(resp, &model) } else { resp }
         }
         Some(Err((m, (status, etype), details))) => {
             metrics.record_error();
@@ -2328,6 +2380,7 @@ async fn anthropic_buffered_response(
     started: std::time::Instant,
     metrics: Arc<Metrics>,
 ) -> Response {
+    let mut rerouted = false;
     let mut content = String::new();
     let mut ttft: Option<std::time::Duration> = None;
     let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass, Option<Value>)>> = None;
@@ -2344,7 +2397,10 @@ async fn anthropic_buffered_response(
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
             GatewayEvent::Error(m, class, details) => outcome = Some(Err((m, class, details))),
             // `auto`'s next choice answers: the reply carries its name.
-            GatewayEvent::Rerouted(m) => model = m,
+            GatewayEvent::Rerouted(m) => {
+                model = m;
+                rerouted = true;
+            }
         }
     }
     match outcome {
@@ -2354,7 +2410,8 @@ async fn anthropic_buffered_response(
             metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns, summary.streamed);
             let e = &summary.metrics.engine;
             metrics.record_model(served_label(&summary, &model), &summary.provider, ttft.or(Some(wall)), e.eval_count, e.eval_duration_ns);
-            Json(anthropic_message_object(&id, &model, &content, &summary)).into_response()
+            let resp = Json(anthropic_message_object(&id, &model, &content, &summary)).into_response();
+            if rerouted { mark_auto_fallback(resp, &model) } else { resp }
         }
         Some(Err((m, (status, etype), details))) => {
             metrics.record_error();
@@ -3286,6 +3343,7 @@ mod tests {
             providers: vec!["…a1b2c3".into()],
             alternatives: 2,
             fallback: "ask".into(),
+            membership_refused: false,
         }));
         let body = error_body(&e.to_string(), error_class(&e).1, error_details(&e));
         assert_eq!(body["type"], "card_provider_unavailable");
@@ -3418,24 +3476,46 @@ mod tests {
 
         // A tool request goes to the swarm's 7B; if that card fails (revoked), this machine's after all.
         assert_eq!(pick_auto(&c, None, tools), Ok(("Qwen/Qwen2.5-7B-Instruct".into(), AutoStep::Card)));
-        let next = auto_alternates(&c, None, tools, "Qwen/Qwen2.5-7B-Instruct", MAX_AUTO_ALTERNATES);
+        let next = auto_alternates(&c, None, tools, "Qwen/Qwen2.5-7B-Instruct", AutoStep::Card, MAX_AUTO_ALTERNATES);
         assert_eq!(names(&next), vec![("qwen2.5:0.5b".to_string(), AutoStep::OwnMachine)]);
         assert_eq!(next[0].2, Some(["12D3Me".to_string()].into()), "only this machine's provider");
 
         // No tools: this machine first; if its engine is down, the swarm's cards, never the public model.
         assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Ok(("qwen2.5:0.5b".into(), AutoStep::OwnMachine)));
-        let next = auto_alternates(&c, None, AutoNeeds::default(), "qwen2.5:0.5b", MAX_AUTO_ALTERNATES);
+        let next = auto_alternates(&c, None, AutoNeeds::default(), "qwen2.5:0.5b", AutoStep::OwnMachine, MAX_AUTO_ALTERNATES);
         assert_eq!(next.len(), 2);
         assert!(next.iter().all(|(m, s, only)| *s == AutoStep::Card && m != "llama3.1:70b" && only.as_ref().is_some_and(|o| !o.contains("12D3Pub"))), "{next:?}");
 
         // Not in a swarm: the public network's trusted provider is a next choice.
         c.swarm_only = false;
-        let next = auto_alternates(&c, None, AutoNeeds::default(), "qwen2.5:0.5b", 3);
+        let next = auto_alternates(&c, None, AutoNeeds::default(), "qwen2.5:0.5b", AutoStep::OwnMachine, 3);
         assert_eq!(next.iter().filter(|(m, _, _)| m == "llama3.1:70b").count(), 1, "{next:?}");
         // Nothing else to choose: no next choice.
         let lone = cands(vec![kp("qwen2.5:0.5b", "me", "12D3Me")]);
         let lone = crate::consumer::AutoCandidates { self_provider: Some("12D3Me".into()), ..lone };
-        assert!(auto_alternates(&lone, None, AutoNeeds::default(), "qwen2.5:0.5b", MAX_AUTO_ALTERNATES).is_empty());
+        assert!(auto_alternates(&lone, None, AutoNeeds::default(), "qwen2.5:0.5b", AutoStep::OwnMachine, MAX_AUTO_ALTERNATES).is_empty());
+        // Review 11 Nov: this machine shares three models and its engine is down. After its first
+        // choice fails, the next choices are the swarm's cards, not this machine's other models.
+        let mut three = cands(vec![
+            kp("qwen2.5:0.5b", "me", "12D3Me"),
+            kp("qwen2.5:1.5b", "me", "12D3Me"),
+            kp("llama3.2:3b", "me", "12D3Me"),
+            kp("qwen2.5-coder:1.5b", "mt", "12D3Mt"),
+        ]);
+        three.self_provider = Some("12D3Me".into());
+        three.swarm_only = true;
+        three.card_models = vec!["qwen2.5-coder:1.5b".into()];
+        three.swarm_card_models = vec!["qwen2.5-coder:1.5b".into()];
+        three.card_providers.insert("qwen2.5-coder:1.5b".into(), ["12D3Mt".to_string()].into());
+        let (first, step) = pick_auto(&three, None, AutoNeeds::default()).unwrap();
+        assert_eq!(step, AutoStep::OwnMachine);
+        let next = auto_alternates(&three, None, AutoNeeds::default(), &first, step, MAX_AUTO_ALTERNATES);
+        assert_eq!(names(&next), vec![("qwen2.5-coder:1.5b".to_string(), AutoStep::Card)], "not this machine's other models");
+        // A card skipped for now (its provider refused this node) isn't one of auto's choices, but a
+        // pin may still name it.
+        three.skipped_cards.insert("qwen2.5-coder:1.5b".into());
+        assert!(auto_alternates(&three, None, AutoNeeds::default(), &first, step, MAX_AUTO_ALTERNATES).is_empty());
+        assert!(pin_reachable(&three, "qwen2.5-coder:1.5b"), "a pin isn't dropped while the card is skipped");
         assert!(auto_fallback_text(&[("a".into(), "x".into()), ("b".into(), "y".into())]).contains("`a`, then `b`"));
     }
 

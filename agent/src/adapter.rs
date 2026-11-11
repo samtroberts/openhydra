@@ -64,6 +64,10 @@ pub struct CardUnavailable {
     pub alternatives: usize,
     /// The fallback choice that applied: `ask`, `same-version` or `never`.
     pub fallback: String,
+    /// The provider refused this node's swarm membership (no or a revoked credential, another swarm),
+    /// rather than the request itself: what `auto` remembers (review 11 Nov). Not sent to clients.
+    #[serde(skip)]
+    pub membership_refused: bool,
 }
 
 impl fmt::Display for AdapterError {

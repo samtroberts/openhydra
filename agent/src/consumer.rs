@@ -828,6 +828,17 @@ fn card_alternatives(found: &[DiscoveredPeer], pinned: &std::collections::HashSe
 
 /// Why a card's providers didn't serve, from the last error: `overloaded` (it shed the request or
 /// is busy), `refused` (it answered with an error), else `offline` (it couldn't be reached).
+/// Whether a provider's error refused this node's swarm membership (the provider's swarm gate,
+/// `AuthzError` and `scope_gate`), not the request: no credential, a revoked or expired one, one for
+/// another swarm or another peer, or a model not shared with this swarm.
+fn membership_refusal(e: &AdapterError) -> bool {
+    let AdapterError::Provider(m) = e else { return false };
+    let m = m.to_ascii_lowercase();
+    ["membership credential is required", "not authorised", "credential authorises", "credential lacks", "not shared with your swarm"]
+        .iter()
+        .any(|needle| m.contains(needle))
+}
+
 fn card_failure_reason(e: &AdapterError) -> &'static str {
     match e {
         AdapterError::Overloaded(_) | AdapterError::Busy(_) => "overloaded",
@@ -882,6 +893,7 @@ fn card_unavailable(
         providers,
         alternatives: if private { 0 } else { alternatives },
         fallback: if private { CardFallback::Never.as_str().to_string() } else { choice.as_str().to_string() },
+        membership_refused: membership_refusal(err),
     }))
 }
 
@@ -2204,6 +2216,9 @@ pub struct AutoCandidates {
     /// [`Self::swarm_only`] through membership credentials that have all expired: the swarm's
     /// models can't be used until the owner renews one, and `auto` says so.
     pub swarm_credential_expired: bool,
+    /// Private card models `auto` leaves out of its own steps for now (their provider just refused
+    /// this node's membership or couldn't be reached); a pin or the preferred model may still use them.
+    pub skipped_cards: std::collections::BTreeSet<String>,
     /// On a keyed private network: every provider is the organisation's, so the network's steps
     /// count as the swarm.
     pub private_network: bool,
@@ -3613,8 +3628,13 @@ impl ConsumerNode {
             .unwrap_or_default()
             .into_iter()
             .filter(|card| if card.swarm_public_key.is_empty() { !swarm_only } else { member(&card.swarm_public_key) })
-            // A private card whose provider just refused us or couldn't be reached: not offered.
-            .filter(|card| card.swarm_public_key.is_empty() || !self.card_recently_missed(&card.model_id, now))
+            .collect();
+        // A private card whose provider just refused this node's membership or couldn't be reached:
+        // `auto` doesn't choose it itself, but a `/model` pin or the preferred model still can.
+        let skipped_cards = cards
+            .iter()
+            .filter(|card| !card.swarm_public_key.is_empty() && self.card_recently_missed(&card.model_id, now))
+            .map(|card| card.model_id.clone())
             .collect();
         let card_models = cards.iter().map(|card| card.model_id.clone()).collect();
         let swarm_card_models = cards.iter().filter(|card| !card.swarm_public_key.is_empty()).map(|card| card.model_id.clone()).collect();
@@ -3658,6 +3678,7 @@ impl ConsumerNode {
             swarm_card_models,
             swarm_only,
             swarm_credential_expired,
+            skipped_cards,
             private_network,
             earned,
             tiers,
@@ -3851,8 +3872,11 @@ impl ConsumerNode {
             Ok(_) => {
                 misses.remove(model);
             }
-            Err(AdapterError::CardUnavailable(c)) if c.private => {
-                let skip = if c.reason == "refused" { CARD_REFUSED_SKIP_MS } else { CARD_OFFLINE_SKIP_MS };
+            // Only what will happen again on the next request: its membership refused (a revoked
+            // credential), or its provider unreachable. Not an engine's error or a busy provider, which
+            // say nothing about the next request (review 11 Nov: one oversized prompt blocked the card).
+            Err(AdapterError::CardUnavailable(c)) if c.private && (c.membership_refused || c.reason == "offline") => {
+                let skip = if c.membership_refused { CARD_REFUSED_SKIP_MS } else { CARD_OFFLINE_SKIP_MS };
                 if !misses.contains_key(model) && misses.len() >= 1024 {
                     misses.retain(|_, (at, skip)| now.saturating_sub(*at) < *skip);
                 }
@@ -8177,20 +8201,28 @@ mod tests {
 
         // Its swarm's provider refuses it (a revoked membership, review 11 Nov): `auto` leaves the
         // card out for a while instead of trying it first on every request; a serve brings it back.
-        let refused = |reason: &str| Err(AdapterError::CardUnavailable(Box::new(crate::adapter::CardUnavailable {
+        let refused = |reason: &str, membership: bool| Err(AdapterError::CardUnavailable(Box::new(crate::adapter::CardUnavailable {
             message: "refused".into(), model: "acme-model".into(), private: true, reason: reason.into(),
-            providers: vec![], alternatives: 0, fallback: "never".into(),
+            providers: vec![], alternatives: 0, fallback: "never".into(), membership_refused: membership,
         })));
-        node.note_card_outcome("acme-model", &refused("refused"), now);
-        assert!(node.auto_candidates_from(vec![], None, now + 1).swarm_card_models.is_empty());
-        assert_eq!(node.auto_candidates_from(vec![], None, now + CARD_REFUSED_SKIP_MS).swarm_card_models.len(), 1, "back after a while");
-        node.note_card_outcome("acme-model", &refused("offline"), now);
-        assert!(node.auto_candidates_from(vec![], None, now + CARD_OFFLINE_SKIP_MS - 1).swarm_card_models.is_empty());
+        let skipped = |at: u64| node.auto_candidates_from(vec![], None, at).skipped_cards.contains("acme-model");
+        node.note_card_outcome("acme-model", &refused("refused", true), now);
+        assert!(skipped(now + 1), "a refused membership is skipped");
+        assert!(node.auto_candidates_from(vec![], None, now + 1).swarm_card_models.contains(&"acme-model".to_string()), "but still a card (for a pin)");
+        assert!(!skipped(now + CARD_REFUSED_SKIP_MS), "back after a while");
+        node.note_card_outcome("acme-model", &refused("offline", false), now);
+        assert!(skipped(now + CARD_OFFLINE_SKIP_MS - 1));
         node.note_card_outcome("acme-model", &Ok(ServeSummary::default()), now);
-        assert_eq!(node.auto_candidates_from(vec![], None, now + 1).swarm_card_models.len(), 1, "a serve forgets it");
-        // Another error (or a public card's) is not remembered.
+        assert!(!skipped(now + 1), "a serve forgets it");
+        // An engine's error (an oversized prompt, review 11 Nov), a busy provider, or another error
+        // says nothing about the next request: not remembered.
+        node.note_card_outcome("acme-model", &refused("refused", false), now);
+        node.note_card_outcome("acme-model", &refused("overloaded", false), now);
         node.note_card_outcome("acme-model", &Err(AdapterError::Http("x".into())), now);
-        assert_eq!(node.auto_candidates_from(vec![], None, now + 1).swarm_card_models.len(), 1);
+        assert!(!skipped(now + 1));
+        assert!(membership_refusal(&AdapterError::Provider("not authorised for this swarm: credential revoked".into())));
+        assert!(membership_refusal(&AdapterError::Provider("model 'm' is not shared with your swarm".into())));
+        assert!(!membership_refusal(&AdapterError::Provider("engine http error: prompt too long".into())));
 
         // Its credential expired: still swarm-only (it hasn't left), and the refusal can say why.
         let later = now + 3_600_000 * 1_000 + 1; // the credential's TTL above is in seconds

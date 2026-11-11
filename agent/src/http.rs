@@ -24,8 +24,10 @@ fn http_err(e: reqwest::Error) -> AdapterError {
     // Without the engine's URL: an error's text reaches the consumer that asked, and where this
     // provider's engine listens is its own business (review 11 Nov: replies named
     // `http://127.0.0.1:8080/...`). The operator's own log keeps it.
+    // At warning level: the default log shows warnings, and without the address an operator
+    // couldn't tell which engine failed (review 11 Nov).
     if let Some(url) = e.url() {
-        tracing::debug!(%url, error = %e, "engine request failed");
+        tracing::warn!(%url, error = %e, "engine request failed");
     }
     let e = e.without_url();
     // reqwest's text for a timeout doesn't say so: callers tell timeouts by "timed out" (round 10).
@@ -44,8 +46,10 @@ fn ok_or_status(resp: reqwest::blocking::Response) -> Result<reqwest::blocking::
     if status.is_success() {
         return Ok(resp);
     }
-    let body: String = resp.text().unwrap_or_default().chars().take(8192).collect();
-    Err(status_error(status.as_u16(), status.canonical_reason().unwrap_or(""), &body))
+    // At most 8 KB of it (review 11 Nov: reading the whole body could wait on a stream for minutes).
+    let mut raw = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::io::Read::take(resp, 8192), &mut raw);
+    Err(status_error(status.as_u16(), status.canonical_reason().unwrap_or(""), &String::from_utf8_lossy(&raw)))
 }
 
 /// `HTTP status client error (400 Bad Request): <what the engine said>` (the prefix as reqwest
@@ -55,6 +59,26 @@ pub(crate) fn status_error(code: u16, reason: &str, body: &str) -> AdapterError 
     let said = engine_message(body);
     let head = format!("HTTP status {kind} error ({code} {reason})");
     AdapterError::Http(if said.is_empty() { head } else { format!("{head}: {said}") })
+}
+
+/// Whether a word of an engine's message names where something listens: a URL, `localhost`, an IP
+/// address, or `host:port` (review 11 Nov: "Cannot connect to host 10.0.0.5:8001" got through).
+fn names_a_place(word: &str) -> bool {
+    let w = word.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';' | '"' | '\'' | '.' | '<' | '>')).replace(['[', ']'], "");
+    let w = w.as_str();
+    if w.contains("://") || w.to_ascii_lowercase().contains("localhost") {
+        return true;
+    }
+    if w.parse::<std::net::IpAddr>().is_ok() || w.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    // `host:port`, `10.0.0.5:8001`, `[::1]:8080` (the last also caught above once trimmed).
+    if let Some((host, port)) = w.rsplit_once(':') {
+        if !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')) {
+            return true;
+        }
+    }
+    false
 }
 
 /// An engine's error body as one short line: its JSON `error` (text, or an object's `message`),
@@ -67,11 +91,13 @@ pub(crate) fn engine_message(body: &str) -> String {
             .or_else(|| v.get("message").and_then(field))
             .or_else(|| v.get("detail").and_then(|d| field(d).or_else(|| Some(d.to_string()))))
     });
-    let text = from_json.unwrap_or_else(|| body.to_string());
-    let words: Vec<&str> = text
-        .split_whitespace()
-        .filter(|w| !(w.contains("http://") || w.contains("https://")))
-        .collect();
+    // An HTML error page (a proxy's 502) says nothing useful, and may name the server: left out.
+    let text = match from_json {
+        Some(t) => t,
+        None if body.trim_start().starts_with('<') => String::new(),
+        None => body.to_string(),
+    };
+    let words: Vec<&str> = text.split_whitespace().filter(|w| !names_a_place(w)).collect();
     let mut line = words.join(" ");
     if line.chars().count() > 300 {
         line = line.chars().take(299).collect::<String>() + "…";
@@ -305,6 +331,11 @@ mod engine_error_tests {
         let AdapterError::Http(m) = status_error(503, "Service Unavailable", r#"{"error":{"message":"loading model, see http://127.0.0.1:8080/health"}}"#) else { panic!() };
         assert!(m.starts_with("HTTP status server error (503") && !m.contains("127.0.0.1") && m.contains("loading model"), "{m}");
         assert_eq!(engine_message(r#"{"detail":"Not Found"}"#), "Not Found");
+        // Addresses in other forms, and HTML pages, are left out too (review 11 Nov).
+        assert_eq!(engine_message("Cannot connect to host 10.0.0.5:8001 ssl:default"), "Cannot connect to host ssl:default");
+        assert_eq!(engine_message("dial localhost:11434 failed ([::1]:8080)"), "dial failed");
+        assert_eq!(engine_message("<html><body>502 Bad Gateway nginx/1.25</body></html>"), "");
+        assert_eq!(engine_message("context length 4096 exceeded"), "context length 4096 exceeded");
         assert_eq!(engine_message("plain   text\n reply"), "plain text reply");
         assert_eq!(engine_message(&"x ".repeat(400)).chars().count(), 300);
         let AdapterError::Http(m) = status_error(400, "Bad Request", "") else { panic!() };

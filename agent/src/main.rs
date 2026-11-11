@@ -2258,8 +2258,8 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         // Its models are all Private or Device: served, just never announced (review 11 Nov: the
         // warning below said "serving nothing" for such a provider).
         eprintln!(
-            "openhydra-agent: serving {shared} model(s) from {engine_url} to this machine and its swarms only \
-             (Private or Device: not announced to the network)"
+            "openhydra-agent: serving {shared} model(s) from {engine_url}, none announced to the network \
+             (Private or Device models, and Global ones without a recorded consent, are not announced)"
         );
     } else if announced == 0 {
         // Not fatal — the operator may load models later — but the node serves nothing

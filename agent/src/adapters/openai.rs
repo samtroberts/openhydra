@@ -363,10 +363,21 @@ impl<H: HttpClient> EngineAdapter for OpenAiAdapter<H> {
 /// than only the engine's own 400.
 fn tools_refused_hint(e: AdapterError, offered_tools: bool) -> AdapterError {
     match e {
-        AdapterError::Http(m) if offered_tools && m.contains("client error") && m.to_ascii_lowercase().contains("tool") => AdapterError::Http(format!(
-            "{m} (this provider's engine isn't set up for tool calls: a request with tools can't be served here; \
-             vLLM needs --enable-auto-tool-choice and a --tool-call-parser, SGLang a --tool-call-parser)"
-        )),
+        // Only the engine's tool-call setup, as its own message words it (review 11 Nov: any 4xx
+        // mentioning "tool" got the vLLM advice).
+        AdapterError::Http(m) if offered_tools && m.contains("client error") => {
+            let lower = m.to_ascii_lowercase();
+            if ["tool choice", "tool_choice", "tool-call-parser", "enable-auto-tool-choice"].iter().any(|n| lower.contains(n)) {
+                AdapterError::Http(format!(
+                    "{m} (this provider's engine isn't set up for tool calls: a request with tools can't be served here; \
+                     vLLM needs --enable-auto-tool-choice and a --tool-call-parser, SGLang a --tool-call-parser)"
+                ))
+            } else if lower.contains("does not support tools") || lower.contains("doesn't support tools") {
+                AdapterError::Http(format!("{m} (this model can't take tool calls: choose another for a request with tools)"))
+            } else {
+                AdapterError::Http(m)
+            }
+        }
         other => other,
     }
 }
@@ -835,6 +846,11 @@ mod tests {
         // Without tools, or for another error, the error is left as it was.
         let refused = AdapterError::Http("HTTP status client error (400 Bad Request): tool".into());
         assert!(!tools_refused_hint(refused, false).to_string().contains("isn't set up"));
+        // A client's own malformed tool message, or a model without tools, isn't an engine setup issue.
+        let bad_msg = AdapterError::Http("HTTP status client error (400 Bad Request): invalid role: tool message missing tool_call_id".into());
+        assert!(!tools_refused_hint(bad_msg, true).to_string().contains("isn't set up"));
+        let no_tools = AdapterError::Http("HTTP status client error (400 Bad Request): registry.ollama.ai/library/gemma does not support tools".into());
+        assert!(tools_refused_hint(no_tools, true).to_string().contains("this model can't take tool calls"));
         let other = AdapterError::Http("HTTP status server error (500 Internal Server Error)".into());
         assert!(!tools_refused_hint(other, true).to_string().contains("isn't set up"));
     }
