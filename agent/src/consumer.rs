@@ -2107,6 +2107,11 @@ pub struct ConsumerNode {
     /// anything (round 8 T8-3). Tried last for [`UNAVAILABLE_RANK_LAST_MS`]; a second within
     /// [`UNAVAILABLE_REPEAT_MS`] costs reputation.
     unavailable: Mutex<HashMap<(String, String), u64>>,
+    /// Per private card model: when its swarm's provider last refused us (a revoked membership, say)
+    /// or couldn't be reached, and for how long `auto` leaves it out ([`CARD_REFUSED_SKIP_MS`],
+    /// [`CARD_OFFLINE_SKIP_MS`]). Review 11 Nov: a revoked member's `auto` tried the refused card
+    /// first on every request. A request naming the model still goes to it; a serve clears it.
+    card_misses: Mutex<HashMap<String, (u64, u64)>>,
     /// Per `(provider libp2p id, model)`: when it last completed a serve for us.
     served_ok: Mutex<HashMap<(String, String), u64>>,
     /// Providers (libp2p id, model) that completed a real serve for us with standing (see
@@ -2163,6 +2168,12 @@ pub struct ConsumerNode {
     /// for [`ConsumerNode::paid_recently`] (review round 4 T4-10).
     served_paid: Mutex<HashMap<String, u64>>,
 }
+
+/// How long `auto` leaves out a private card whose swarm provider refused this node (a revoked
+/// membership doesn't come back by itself).
+pub const CARD_REFUSED_SKIP_MS: u64 = 10 * 60 * 1000;
+/// How long `auto` leaves out a private card whose swarm provider couldn't be reached.
+pub const CARD_OFFLINE_SKIP_MS: u64 = 2 * 60 * 1000;
 
 /// SL1: the reputation a seed provider is ranked at before this node has any history with it —
 /// above neutral (50), so it goes ahead of an unknown provider of the same model, and far below
@@ -2487,6 +2498,7 @@ impl ConsumerNode {
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             payment_refusals: Mutex::new(HashMap::new()),
             unavailable: Mutex::new(HashMap::new()),
+            card_misses: Mutex::new(HashMap::new()),
             served_ok: Mutex::new(HashMap::new()),
             writer_candidates: Mutex::new(HashMap::new()),
             no_writer_until: Mutex::new(HashMap::new()),
@@ -2935,6 +2947,7 @@ impl ConsumerNode {
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             payment_refusals: Mutex::new(HashMap::new()),
             unavailable: Mutex::new(HashMap::new()),
+            card_misses: Mutex::new(HashMap::new()),
             served_ok: Mutex::new(HashMap::new()),
             writer_candidates: Mutex::new(HashMap::new()),
             no_writer_until: Mutex::new(HashMap::new()),
@@ -3600,6 +3613,8 @@ impl ConsumerNode {
             .unwrap_or_default()
             .into_iter()
             .filter(|card| if card.swarm_public_key.is_empty() { !swarm_only } else { member(&card.swarm_public_key) })
+            // A private card whose provider just refused us or couldn't be reached: not offered.
+            .filter(|card| card.swarm_public_key.is_empty() || !self.card_recently_missed(&card.model_id, now))
             .collect();
         let card_models = cards.iter().map(|card| card.model_id.clone()).collect();
         let swarm_card_models = cards.iter().filter(|card| !card.swarm_public_key.is_empty()).map(|card| card.model_id.clone()).collect();
@@ -3810,6 +3825,54 @@ impl ConsumerNode {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn complete(
+        self: &Arc<Self>,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        tools: Vec<Value>,
+        think: Option<bool>,
+        min_authenticity: Option<AuthenticityTier>,
+        only: Option<&std::collections::HashSet<String>>,
+        fallback: Option<crate::cards::CardFallback>,
+        cancel: &dyn Fn() -> bool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ServeSummary, AdapterError> {
+        let result = self.complete_inner(model, messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, cancel, on_delta);
+        self.note_card_outcome(model, &result, now_unix_ms());
+        result
+    }
+
+    /// Remember a private card's model whose swarm provider refused us or couldn't be reached, so
+    /// `auto` leaves it out for a while; a serve of the model forgets it.
+    fn note_card_outcome(&self, model: &str, result: &Result<ServeSummary, AdapterError>, now: u64) {
+        let mut misses = self.card_misses.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(_) => {
+                misses.remove(model);
+            }
+            Err(AdapterError::CardUnavailable(c)) if c.private => {
+                let skip = if c.reason == "refused" { CARD_REFUSED_SKIP_MS } else { CARD_OFFLINE_SKIP_MS };
+                if !misses.contains_key(model) && misses.len() >= 1024 {
+                    misses.retain(|_, (at, skip)| now.saturating_sub(*at) < *skip);
+                }
+                misses.insert(model.to_string(), (now, skip));
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Whether `auto` should leave `model`'s private card out right now (see [`Self::card_misses`]).
+    fn card_recently_missed(&self, model: &str, now: u64) -> bool {
+        self.card_misses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model)
+            .is_some_and(|(at, skip)| now.saturating_sub(*at) < *skip)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_inner(
         self: &Arc<Self>,
         model: &str,
         messages: Vec<ChatMessage>,
@@ -8111,6 +8174,23 @@ mod tests {
         assert_eq!(c.swarm_card_models, vec!["acme-model".to_string()]);
         assert_eq!(c.card_providers.len(), 1);
         assert!(!c.swarm_credential_expired);
+
+        // Its swarm's provider refuses it (a revoked membership, review 11 Nov): `auto` leaves the
+        // card out for a while instead of trying it first on every request; a serve brings it back.
+        let refused = |reason: &str| Err(AdapterError::CardUnavailable(Box::new(crate::adapter::CardUnavailable {
+            message: "refused".into(), model: "acme-model".into(), private: true, reason: reason.into(),
+            providers: vec![], alternatives: 0, fallback: "never".into(),
+        })));
+        node.note_card_outcome("acme-model", &refused("refused"), now);
+        assert!(node.auto_candidates_from(vec![], None, now + 1).swarm_card_models.is_empty());
+        assert_eq!(node.auto_candidates_from(vec![], None, now + CARD_REFUSED_SKIP_MS).swarm_card_models.len(), 1, "back after a while");
+        node.note_card_outcome("acme-model", &refused("offline"), now);
+        assert!(node.auto_candidates_from(vec![], None, now + CARD_OFFLINE_SKIP_MS - 1).swarm_card_models.is_empty());
+        node.note_card_outcome("acme-model", &Ok(ServeSummary::default()), now);
+        assert_eq!(node.auto_candidates_from(vec![], None, now + 1).swarm_card_models.len(), 1, "a serve forgets it");
+        // Another error (or a public card's) is not remembered.
+        node.note_card_outcome("acme-model", &Err(AdapterError::Http("x".into())), now);
+        assert_eq!(node.auto_candidates_from(vec![], None, now + 1).swarm_card_models.len(), 1);
 
         // Its credential expired: still swarm-only (it hasn't left), and the refusal can say why.
         let later = now + 3_600_000 * 1_000 + 1; // the credential's TTL above is in seconds
