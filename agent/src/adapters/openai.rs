@@ -358,6 +358,19 @@ impl<H: HttpClient> EngineAdapter for OpenAiAdapter<H> {
     }
 }
 
+/// An engine that refused a request offering tools because it isn't set up for them (vLLM started
+/// without `--enable-auto-tool-choice`, live 11 Nov): say so in words a person can act on, rather
+/// than only the engine's own 400.
+fn tools_refused_hint(e: AdapterError, offered_tools: bool) -> AdapterError {
+    match e {
+        AdapterError::Http(m) if offered_tools && m.contains("client error") && m.to_ascii_lowercase().contains("tool") => AdapterError::Http(format!(
+            "{m} (this provider's engine isn't set up for tool calls: a request with tools can't be served here; \
+             vLLM needs --enable-auto-tool-choice and a --tool-call-parser, SGLang a --tool-call-parser)"
+        )),
+        other => other,
+    }
+}
+
 /// Stream a chat completion from any OpenAI-compatible `chat_url`
 /// (`…/v1/chat/completions`). Factored out of [`OpenAiAdapter`] so the llama.cpp adapter
 /// — which serves over the same OpenAI route but detects models bespoke-ly — reuses it.
@@ -369,7 +382,7 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
 ) -> Result<ServeOutcome, AdapterError> {
     let body = build_chat_body(request);
     let start = std::time::Instant::now();
-    let lines = http.post_stream(chat_url, &body)?;
+    let lines = http.post_stream(chat_url, &body).map_err(|e| tools_refused_hint(e, !request.tools.is_empty()))?;
 
     let mut chunk_tokens = 0u64;
     let mut usage: Option<Usage> = None;
@@ -812,6 +825,18 @@ mod tests {
         // Timings are measured provider-locally; these invariants hold regardless of clock.
         assert!(outcome.engine.total_duration_ns >= outcome.engine.eval_duration_ns);
         assert!(outcome.engine.total_duration_ns >= outcome.engine.prompt_eval_duration_ns);
+    }
+
+    #[test]
+    fn an_engine_without_tool_support_is_named_as_such() {
+        let refused = AdapterError::Http("HTTP status client error (400 Bad Request): \"auto\" tool choice requires --enable-auto-tool-choice".into());
+        let AdapterError::Http(m) = tools_refused_hint(refused, true) else { panic!() };
+        assert!(m.contains("isn't set up for tool calls"), "{m}");
+        // Without tools, or for another error, the error is left as it was.
+        let refused = AdapterError::Http("HTTP status client error (400 Bad Request): tool".into());
+        assert!(!tools_refused_hint(refused, false).to_string().contains("isn't set up"));
+        let other = AdapterError::Http("HTTP status server error (500 Internal Server Error)".into());
+        assert!(!tools_refused_hint(other, true).to_string().contains("isn't set up"));
     }
 
     #[test]

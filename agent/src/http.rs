@@ -21,12 +21,62 @@ use reqwest::blocking::Client;
 use crate::adapter::{AdapterError, HttpClient};
 
 fn http_err(e: reqwest::Error) -> AdapterError {
+    // Without the engine's URL: an error's text reaches the consumer that asked, and where this
+    // provider's engine listens is its own business (review 11 Nov: replies named
+    // `http://127.0.0.1:8080/...`). The operator's own log keeps it.
+    if let Some(url) = e.url() {
+        tracing::debug!(%url, error = %e, "engine request failed");
+    }
+    let e = e.without_url();
     // reqwest's text for a timeout doesn't say so: callers tell timeouts by "timed out" (round 10).
     if e.is_timeout() {
         AdapterError::Http(format!("timed out: {e}"))
     } else {
         AdapterError::Http(e.to_string())
     }
+}
+
+/// The reply itself when it succeeded; else an error that says what the engine said. Replaces
+/// `error_for_status`, which dropped the engine's explanation (live 11 Nov: vLLM's "auto tool
+/// choice requires --enable-auto-tool-choice" became a bare "400 Bad Request").
+fn ok_or_status(resp: reqwest::blocking::Response) -> Result<reqwest::blocking::Response, AdapterError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body: String = resp.text().unwrap_or_default().chars().take(8192).collect();
+    Err(status_error(status.as_u16(), status.canonical_reason().unwrap_or(""), &body))
+}
+
+/// `HTTP status client error (400 Bad Request): <what the engine said>` (the prefix as reqwest
+/// words it, which callers match on).
+pub(crate) fn status_error(code: u16, reason: &str, body: &str) -> AdapterError {
+    let kind = if (400..500).contains(&code) { "client" } else { "server" };
+    let said = engine_message(body);
+    let head = format!("HTTP status {kind} error ({code} {reason})");
+    AdapterError::Http(if said.is_empty() { head } else { format!("{head}: {said}") })
+}
+
+/// An engine's error body as one short line: its JSON `error` (text, or an object's `message`),
+/// `message` or `detail`, else the text itself; at most 300 characters, URLs taken out.
+pub(crate) fn engine_message(body: &str) -> String {
+    let from_json = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
+        let field = |x: &serde_json::Value| x.as_str().map(str::to_string);
+        v.get("error")
+            .and_then(|e| field(e).or_else(|| e.get("message").and_then(field)))
+            .or_else(|| v.get("message").and_then(field))
+            .or_else(|| v.get("detail").and_then(|d| field(d).or_else(|| Some(d.to_string()))))
+    });
+    let text = from_json.unwrap_or_else(|| body.to_string());
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .filter(|w| !(w.contains("http://") || w.contains("https://")))
+        .collect();
+    let mut line = words.join(" ");
+    if line.chars().count() > 300 {
+        line = line.chars().take(299).collect::<String>() + "…";
+    }
+    line
 }
 
 // Per-request total timeouts (A1). reqwest's *blocking* client exposes no idle/read
@@ -136,9 +186,8 @@ impl HttpClient for ReqwestClient {
             .get(url)
             .timeout(GET_TIMEOUT)
             .send()
-            .map_err(http_err)?
-            .error_for_status()
-            .map_err(http_err)?
+            .map_err(http_err)
+            .and_then(ok_or_status)?
             .text()
             .map_err(http_err)
     }
@@ -153,9 +202,8 @@ impl HttpClient for ReqwestClient {
             .get(url)
             .timeout(GET_TIMEOUT)
             .send()
-            .map_err(http_err)?
-            .error_for_status()
-            .map_err(http_err)?
+            .map_err(http_err)
+            .and_then(ok_or_status)?
             .bytes()
             .map_err(http_err)?
             .to_vec())
@@ -168,9 +216,8 @@ impl HttpClient for ReqwestClient {
             .body(body.to_string())
             .timeout(POST_JSON_TIMEOUT)
             .send()
-            .map_err(http_err)?
-            .error_for_status()
-            .map_err(http_err)?
+            .map_err(http_err)
+            .and_then(ok_or_status)?
             .text()
             .map_err(http_err)
     }
@@ -189,9 +236,8 @@ impl HttpClient for ReqwestClient {
             req = req.header(*k, *v);
         }
         req.send()
-            .map_err(http_err)?
-            .error_for_status()
-            .map_err(http_err)?
+            .map_err(http_err)
+            .and_then(ok_or_status)?
             .text()
             .map_err(http_err)
     }
@@ -212,9 +258,8 @@ impl HttpClient for ReqwestClient {
             req = req.header(*k, *v);
         }
         req.send()
-            .map_err(http_err)?
-            .error_for_status()
-            .map_err(http_err)?
+            .map_err(http_err)
+            .and_then(ok_or_status)?
             .text()
             .map_err(http_err)
     }
@@ -234,7 +279,7 @@ impl HttpClient for ReqwestClient {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let resp = req.send().map_err(http_err)?.error_for_status().map_err(http_err)?;
+        let resp = req.send().map_err(http_err).and_then(ok_or_status)?;
         // The Lines iterator owns the BufReader which owns the Response → 'static, so it
         // can be boxed and pulled lazily as chunks arrive.
         let reader = std::io::BufReader::new(resp);
@@ -243,5 +288,26 @@ impl HttpClient for ReqwestClient {
                 .lines()
                 .map(|line| line.map_err(|e| AdapterError::Http(e.to_string()))),
         ))
+    }
+}
+
+#[cfg(test)]
+mod engine_error_tests {
+    use super::*;
+
+    /// Review 11 Nov: the engine's explanation is kept, its address never.
+    #[test]
+    fn an_engine_refusal_says_why_and_never_where() {
+        let vllm = r#"{"object":"error","message":"\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set","type":"BadRequestError","code":400}"#;
+        let AdapterError::Http(m) = status_error(400, "Bad Request", vllm) else { panic!() };
+        assert!(m.starts_with("HTTP status client error (400 Bad Request): "), "{m}");
+        assert!(m.contains("--enable-auto-tool-choice"), "{m}");
+        let AdapterError::Http(m) = status_error(503, "Service Unavailable", r#"{"error":{"message":"loading model, see http://127.0.0.1:8080/health"}}"#) else { panic!() };
+        assert!(m.starts_with("HTTP status server error (503") && !m.contains("127.0.0.1") && m.contains("loading model"), "{m}");
+        assert_eq!(engine_message(r#"{"detail":"Not Found"}"#), "Not Found");
+        assert_eq!(engine_message("plain   text\n reply"), "plain text reply");
+        assert_eq!(engine_message(&"x ".repeat(400)).chars().count(), 300);
+        let AdapterError::Http(m) = status_error(400, "Bad Request", "") else { panic!() };
+        assert_eq!(m, "HTTP status client error (400 Bad Request)");
     }
 }
