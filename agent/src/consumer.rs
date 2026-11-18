@@ -8412,6 +8412,17 @@ mod tests {
         }
     }
 
+    /// Review (18 Nov): audits come both ways, so neither way tells a provider "not an audit".
+    #[test]
+    fn audits_are_taken_whole_and_streamed() {
+        let (_dir, node) = test_node();
+        let a = selected("A");
+        let ways: std::collections::HashSet<bool> = (0..64)
+            .map(|_| node.audit_request_for(&a, &AuditRequest { messages: user("hi"), max_tokens: Some(8), tools: vec![], think: None }).stream_whole)
+            .collect();
+        assert_eq!(ways.len(), 2, "both ways in 64 audits");
+    }
+
     /// Review (18 Nov): a request taken whole asks for the short hold; audits go both ways.
     #[test]
     fn a_whole_request_asks_for_the_short_hold() {
@@ -9694,6 +9705,9 @@ mod tests {
             &AuditRequest { messages: user("hi there"), max_tokens: Some(300), tools: tools.clone(), think: Some(true) },
         );
         assert_ne!(as_user.nonce, audit.nonce, "each serve commits its own nonce");
+        // An audit is taken whole or streamed at random, as users' requests come both ways: it asks
+        // what a user taking the reply the same way would.
+        let as_user = as_user.taken_whole_with(audit.stream_whole, STREAM_HOLD_WHOLE.as_millis() as u32);
         let (mut u, mut v) = (serde_json::to_value(&as_user).unwrap(), serde_json::to_value(&audit).unwrap());
         u.as_object_mut().unwrap().remove("nonce");
         v.as_object_mut().unwrap().remove("nonce");

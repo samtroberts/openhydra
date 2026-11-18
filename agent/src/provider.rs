@@ -2847,7 +2847,11 @@ impl<A: EngineAdapter> Provider<A> {
         if let Some(fetched) = fetched {
             self.commit_fetched(nonce, source_peer, fetched);
         }
-        let nothing_yet = matches!(&resp, FetchChunksResponse::Chunks { framed, done: false, .. } if framed.is_empty());
+        // Held while there is nothing new; a stream taken whole is held until its end (or the hold's)
+        // even with frames waiting, so its reply goes back in one answer rather than a poll a round
+        // trip apart for each batch (review, 18 Nov: a 2 s hold then cost 245 ms on a 3 s reply).
+        let whole = map.get(&nonce).is_some_and(|b| b.whole);
+        let nothing_yet = matches!(&resp, FetchChunksResponse::Chunks { framed, done: false, .. } if framed.is_empty() || whole);
         let hold_ms = hold_ms.min(MAX_STREAM_HOLD_MS);
         if !(nothing_yet && hold_ms > 0) {
             return Some((request_id, resp.encode_held(0)));
@@ -5671,6 +5675,26 @@ mod tests {
         data.extend_from_slice(&req.encode());
         provider.clone().run_stream_job("r".into(), "12D3KooWConsumer".into(), data, 4, std::time::Instant::now());
         assert!(provider.streams.lock().unwrap().get(&[202; 16]).is_some_and(|b| b.whole));
+    }
+
+    /// Review (18 Nov): a whole stream's poll is held to the stream's end even with frames waiting.
+    #[test]
+    fn a_whole_streams_poll_is_held_with_frames_waiting() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let n = [23u8; 16];
+        provider.stream_begin(n, "c", billing(None));
+        provider.streams.lock().unwrap().get_mut(&n).unwrap().whole = true;
+        assert!(provider.stream_append_waking(n, &delta("a")).is_none());
+        assert!(provider.stream_append_waking(n, &delta("b")).is_none());
+        assert!(provider.hold_or_answer("p".into(), "c", n, 0, 2_000).is_none(), "held though frames wait");
+        let (_, reply) = provider.stream_append_waking(n, &done(2)).expect("its end answers it");
+        let (framed, next, over, _) = read_held(&reply);
+        assert_eq!((next, over, parse_response(&framed).unwrap().len()), (3, true, 3));
+        // A streamed (not whole) one is answered at once when frames wait.
+        let m = [24u8; 16];
+        provider.stream_begin(m, "c", billing(None));
+        assert!(provider.stream_append_waking(m, &delta("a")).is_none());
+        assert!(provider.hold_or_answer("q".into(), "c", m, 0, 2_000).is_some());
     }
 
     /// Review (18 Nov): every frame notified the sweep; only the first of a held poll moves it.
