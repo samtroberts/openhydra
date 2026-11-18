@@ -542,7 +542,7 @@ struct StreamUpgrade<UserData, TOk, TErr> {
 /// swarm's setting: OpenHydra's request/response protocols, which every OpenHydra peer that is sent
 /// them speaks. Everything else (ping, identify, Kademlia, relays, gossip) keeps the default, so a
 /// peer that doesn't speak one is still told apart from one that fails.
-pub const LAZY_PROTOCOL_PREFIXES: [&str; 2] = ["/openhydra/tensor/", "/openhydra/registry/"];
+pub const LAZY_PROTOCOL_PREFIXES: [&str; 3] = ["/openhydra/tensor/", "/openhydra/registry/", "/openhydra/push/"];
 
 /// OpenHydra patch: a connection's protocols proven in a full negotiation (see `lazy_proven`),
 /// shared with its outbound negotiations.
@@ -576,6 +576,7 @@ mod openhydra_lazy_tests {
     fn only_openhydras_own_single_protocol_negotiates_lazily() {
         assert!(lazy_protocols(&["/openhydra/tensor/1.0.0"]));
         assert!(lazy_protocols(&["/openhydra/registry/1.0.0"]));
+        assert!(lazy_protocols(&["/openhydra/push/1.0.0"]));
         assert!(!lazy_protocols(&["/openhydra/kad/1.0.0"]));
         assert!(!lazy_protocols(&["/ipfs/ping/1.0.0"]));
         assert!(!lazy_protocols(&["/openhydra/tensor/1.0.0", "/openhydra/tensor/0.9.0"]));

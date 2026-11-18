@@ -37,6 +37,9 @@ libp2p = { version = "0.54", features = [
 ] }
 
 # Async runtime
+# Raw per-protocol streams: a reply's tokens are pushed to the consumer as they come (#4). Still
+# an alpha upstream; the version libp2p 0.54 builds with, patched (../Cargo.toml [patch]).
+libp2p-stream = "=0.2.0-alpha"
 tokio = { version = "1", features = ["full"] }
 
 # Pure protocol core (canonical id, routing math, receipts, verify, ledger).

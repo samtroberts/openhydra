@@ -83,6 +83,9 @@ pub struct TransferStats {
     pub tokens_served: AtomicU64,
     pub serve_errors: AtomicU64,
     pub aup_refusals: AtomicU64,
+    /// Provider-side: streams served on a push stream (#4), the rest of `requests_served` streamed
+    /// by polls (or buffered). A visibility counter.
+    pub streams_pushed: AtomicU64,
     /// M4-base: inbound serves refused at the swarm gate (private model, missing/invalid/wrong-peer
     /// credential). A visibility counter, like `aup_refusals`.
     pub swarm_refusals: AtomicU64,
@@ -255,6 +258,7 @@ impl TransferStats {
             tokens_served: self.tokens_served.load(Ordering::Relaxed),
             serve_errors: self.serve_errors.load(Ordering::Relaxed),
             aup_refusals: self.aup_refusals.load(Ordering::Relaxed),
+            streams_pushed: self.streams_pushed.load(Ordering::Relaxed),
             swarm_refusals: self.swarm_refusals.load(Ordering::Relaxed),
             unknown_billing_rules: self.unknown_billing_rules.load(Ordering::Relaxed),
             recounts_skipped: self.recounts_skipped.load(Ordering::Relaxed),
@@ -277,6 +281,7 @@ struct TransfersView {
     tokens_served: u64,
     serve_errors: u64,
     aup_refusals: u64,
+    streams_pushed: u64,
     swarm_refusals: u64,
     unknown_billing_rules: u64,
     recounts_skipped: u64,

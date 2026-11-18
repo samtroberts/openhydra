@@ -33,6 +33,8 @@ libp2p-request-response = { path = "../../network/patched-deps/libp2p-request-re
 # OpenHydra's own request protocols negotiate lazily, one round trip less per request (see its
 # CHANGELOG.md); same reason.
 libp2p-swarm = { path = "../../network/patched-deps/libp2p-swarm" }
+# A reply's tokens are pushed on a stream of their own (#4); see its CHANGELOG.md.
+libp2p-stream = { path = "../../network/patched-deps/libp2p-stream" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -1,6 +1,7 @@
 ## 0.45.1 (OpenHydra patch)
 
-- OpenHydra's request protocols (`/openhydra/tensor/`, `/openhydra/registry/`) negotiate with
+- OpenHydra's request protocols (`/openhydra/tensor/`, `/openhydra/registry/`, and from 18 Nov 2026
+  `/openhydra/push/`, the streams a reply's tokens are pushed on) negotiate with
   multistream-select `V1Lazy`: the request goes out with the protocol proposal instead of after the
   listener's echo, one round trip less per request (packet capture, 12 Nov 2026: every request cost
   two round trips). Every listener understands it, so older peers need nothing. Only those

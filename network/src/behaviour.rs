@@ -109,6 +109,8 @@ pub struct OpenHydraBehaviour {
     /// for full/restricted-cone home NATs). Does nothing useful behind CGNAT
     /// (the gateway itself is NATed → ``NonRoutableGateway``).
     pub upnp: libp2p::upnp::tokio::Behaviour,
+    /// Push streams (#4, [`crate::push`]).
+    pub push: libp2p_stream::Behaviour,
 }
 
 #[cfg(test)]

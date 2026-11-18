@@ -113,6 +113,8 @@ pub fn start_node(
         crate::pinned::PinnedPeers,
         // Whether the node is on OpenHydra's public network (`relay::uses_public_network`).
         bool,
+        // The node's push streams (#4, `crate::push`).
+        Arc<crate::push::PushStreams>,
     ),
     String,
 > {
@@ -232,7 +234,7 @@ pub fn start_node(
     let pinned = pinned_peers.clone();
 
     // Use a oneshot to communicate any startup error from the background thread.
-    let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<Arc<crate::push::PushStreams>, String>>();
 
     // Spawn a background thread with its own tokio runtime.
     // The swarm MUST be built inside the tokio context because listen_on()
@@ -261,7 +263,13 @@ pub fn start_node(
                 let keypair_for_loop = identity.keypair.clone();
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, peer_relay_leech)) => {
-                        let _ = startup_tx.send(Ok(()));
+                        // Push streams (#4): opened by this node as a consumer, accepted as a provider.
+                        let push = crate::push::PushStreams::new(swarm.behaviour().push.new_control(), *swarm.local_peer_id());
+                        if let Err(e) = push.accept(Arc::clone(&proxy_queue_clone)) {
+                            let _ = startup_tx.send(Err(format!("push streams: {e}")));
+                            return;
+                        }
+                        let _ = startup_tx.send(Ok(push));
                         event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, peer_rtts_loop, pcp_bind, pinned).await;
                     }
                     Err(e) => {
@@ -274,12 +282,12 @@ pub fn start_node(
         .map_err(|e| format!("thread spawn: {e}"))?;
 
     // Wait for the background thread to report startup success/failure.
-    startup_rx
+    let push = startup_rx
         .recv()
         .map_err(|_| "background thread died during startup".to_string())?
         .map_err(|e| format!("startup failed: {e}"))?;
 
-    Ok((cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned_peers, public_network))
+    Ok((cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned_peers, public_network, push))
 }
 
 /// Check one bootstrap multiaddr the way the node will parse it at startup (a valid multiaddr with a

@@ -471,6 +471,7 @@ pub fn build_swarm(
         gossipsub,
         ping,
         upnp,
+        push: libp2p_stream::Behaviour::new(),
     };
 
     // F-N8 (note): a 300 s idle-connection timeout keeps an otherwise-silent

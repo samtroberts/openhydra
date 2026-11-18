@@ -53,7 +53,7 @@ use crate::prompt_score::{
     LOGPROB_BACKOFF_MS, LOGPROB_RETRY_MS,
 };
 use openhydra_protocol::logprob::ChallengeRound;
-use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM};
+use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM, STREAM_ACK};
 use crate::receipt::{request_receipt, ReceiptFailure};
 use crate::serve::{
     parse_response, FetchChunksResponse, FetchResponse, ServeChunk,
@@ -1438,6 +1438,35 @@ const STREAM_HOLD: Duration = Duration::from_secs(10);
 /// at the reply's end or this hold's, so it is short enough that a client gone meanwhile is noticed
 /// (between polls) about as soon as on a stream (review, 18 Nov: 10 s otherwise).
 const STREAM_HOLD_WHOLE: Duration = Duration::from_secs(2);
+/// How often a consumer acknowledges what a push stream brought it (#4), so the provider can drop it.
+const PUSH_ACK_EVERY: Duration = Duration::from_millis(500);
+/// How long past a pushed stream's hold its consumer waits for the next push (the provider pushes an
+/// empty reply when a hold runs out) before taking the push stream for broken and polling.
+const PUSH_GRACE: Duration = Duration::from_secs(5);
+/// How long a provider that doesn't push streams (an older build) is polled without asking again.
+const NO_PUSH_TTL_MS: u64 = 10 * 60 * 1000;
+/// Providers remembered as not pushing, at most.
+const MAX_NO_PUSH: usize = 4096;
+
+/// Whether streams are pushed (#4) at all: on unless `OPENHYDRA_STREAM_PUSH` is `0`, `off` or
+/// `false` (every stream is then polled, as before).
+fn push_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("OPENHYDRA_STREAM_PUSH").as_deref().map(str::to_ascii_lowercase).as_deref(), Ok("0" | "off" | "false"))
+    })
+}
+
+/// A stream's push stream (#4), as its consumer reads it.
+#[derive(Default)]
+struct PushState {
+    /// `None`: not pushed (never, or no longer).
+    stream: Option<openhydra_network::push::PushStream>,
+    /// The offset acknowledged last, and when.
+    acked: u32,
+    acked_at: Option<std::time::Instant>,
+}
+
 /// Give up if no new chunk arrives for this much *accumulated idle time* — the "provider wedged"
 /// signal. Reset on every progress, so total generation is unbounded as long as tokens flow.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1558,8 +1587,8 @@ fn no_route_error(model: &str, policy: &AssurancePolicy, peers: &[DiscoveredPeer
 }
 
 /// One request's trip to a provider ([`ConsumerNode::exchange`]).
-struct Exchange {
-    result: Result<ServeSummary, AdapterError>,
+pub(crate) struct Exchange {
+    pub(crate) result: Result<ServeSummary, AdapterError>,
     /// The first-ack (stream) or round-trip (buffered) time, ns.
     proxy_roundtrip_ns: u64,
     /// Whether the provider opened the stream (acknowledged it, not refused it): only then is there a
@@ -2053,6 +2082,20 @@ fn request_completion_streaming_with(
     progress: &mut StreamProgress,
     on_delta: &mut dyn FnMut(&str),
 ) -> Result<ServeSummary, StreamFail> {
+    request_completion_streaming_paced(transport, sleep, request, cancel, &|| false, progress, on_delta)
+}
+
+/// [`request_completion_streaming_with`], told by `pushed` whether its replies are being pushed
+/// (#4): a poll is then a read of what the provider pushed, not a trip to it, so it is never paced.
+fn request_completion_streaming_paced(
+    transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>,
+    sleep: &mut dyn FnMut(Duration),
+    request: &ServeRequest,
+    cancel: &dyn Fn() -> bool,
+    pushed: &dyn Fn() -> bool,
+    progress: &mut StreamProgress,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<ServeSummary, StreamFail> {
     // F2: absolute total-time backstop (real wall clock), generous + `max_tokens`-scaled so it
     // never aborts a legitimate long serve — only the pathological never-idle dribble.
     let started = std::time::Instant::now();
@@ -2189,9 +2232,16 @@ fn request_completion_streaming_with(
                 let pause = if progressed {
                     interval = POLL_MIN;
                     idle = Duration::ZERO;
-                    // Held: ask again at once, but no more often than every POLL_MIN (a nearby
-                    // provider answers each token; its poll limit is per second).
-                    if held.is_some() { POLL_MIN.saturating_sub(sent.elapsed()) } else { interval }
+                    // Pushed: read the next at once. Held: ask again at once, but no more often than
+                    // every POLL_MIN (a nearby provider answers each token; its poll limit is per
+                    // second).
+                    if pushed() {
+                        Duration::ZERO
+                    } else if held.is_some() {
+                        POLL_MIN.saturating_sub(sent.elapsed())
+                    } else {
+                        interval
+                    }
                 } else if let Some(waited) = held.filter(|w| holds && hold.is_some_and(|h| *w >= h / 2)) {
                     // Held its full hold with nothing new: the wait was the provider's, so ask again
                     // at once. (A held reply that came back early with nothing is paced below.) The
@@ -2306,6 +2356,9 @@ pub struct ConsumerNode {
     /// Best-effort/advisory — a wrong entry only forfeits the streaming benefit, never correctness
     /// (a re-probe would just re-learn it). Never persisted; a fresh process re-learns on first use.
     buffered_only: Mutex<std::collections::HashSet<String>>,
+    /// Providers that don't push streams (#4: an older build), by libp2p id → until when (unix ms)
+    /// their streams are polled without asking again ([`NO_PUSH_TTL_MS`]).
+    no_push: Mutex<HashMap<String, u64>>,
     /// M2: imported `.openhydra` cards — verified providers pinned locally and dialable by peer id
     /// without live discovery. Merged into the candidate set in `serve_once`. `None` = no store.
     cards: Option<Arc<crate::cards::CardStore>>,
@@ -2727,6 +2780,7 @@ impl ConsumerNode {
             open_at: Mutex::new(HashMap::new()),
             affinity: Mutex::new(HashMap::new()),
             buffered_only: Mutex::new(std::collections::HashSet::new()),
+            no_push: Mutex::new(HashMap::new()),
             cards: None,
             own_models: Mutex::new(None),
             own_models_asking: std::sync::atomic::AtomicBool::new(false),
@@ -3161,6 +3215,7 @@ impl ConsumerNode {
             open_at: Mutex::new(HashMap::new()),
             affinity: Mutex::new(HashMap::new()),
             buffered_only: Mutex::new(std::collections::HashSet::new()),
+            no_push: Mutex::new(HashMap::new()),
             cards: None,
             own_models: Mutex::new(None),
             own_models_asking: std::sync::atomic::AtomicBool::new(false),
@@ -3206,6 +3261,84 @@ impl ConsumerNode {
     /// P1c: has `libp2p_id` been observed to speak only the buffered (non-streaming) serve path?
     fn is_buffered_only(&self, libp2p_id: &str) -> bool {
         self.buffered_only.lock().map(|s| s.contains(libp2p_id)).unwrap_or(false)
+    }
+
+    /// Whether a stream from `libp2p_id` may be pushed (#4): on, and not a provider found not to.
+    fn may_push(&self, libp2p_id: &str) -> bool {
+        push_enabled()
+            && self.no_push.lock().map_or(true, |m| m.get(libp2p_id).map_or(true, |until| now_unix_ms() >= *until))
+    }
+
+    /// Remember that `libp2p_id` doesn't push streams, for [`NO_PUSH_TTL_MS`].
+    fn mark_no_push(&self, libp2p_id: &str) {
+        if let Ok(mut m) = self.no_push.lock() {
+            let now = now_unix_ms();
+            if m.len() >= MAX_NO_PUSH {
+                m.retain(|_, until| *until > now);
+            }
+            if m.len() < MAX_NO_PUSH {
+                m.insert(libp2p_id.to_string(), now + NO_PUSH_TTL_MS);
+            }
+        }
+    }
+
+    /// One trip of a stream's open or poll to `peer` (#4): on its push stream when it has one (an
+    /// open opens one when `may_push`), else as a request. A push stream that broke or went quiet
+    /// past its hold is dropped, and the same poll goes as a request: the provider kept what it
+    /// pushed until acknowledged, so the poll picks up where the consumer is.
+    fn stream_call(&self, peer: &str, framed: &[u8], may_push: bool, push: &mut PushState) -> Result<Vec<u8>, String> {
+        use openhydra_network::push::PushOpenError;
+        let forward = || self.net.proxy_forward_timeout(peer.to_string(), framed.to_vec(), STREAM_CALL_TIMEOUT);
+        match framed.first() {
+            Some(&SERVE_STREAM) if may_push && push.stream.is_none() => {
+                match self.net.open_push(peer, framed.to_vec(), STREAM_CALL_TIMEOUT) {
+                    Ok(stream) => {
+                        // The open was written: from here, a failure is a lost open (the provider may
+                        // have begun the stream), which the caller asks for by poll.
+                        let first = stream.recv_timeout(STREAM_CALL_TIMEOUT).map_err(|e| format!("push open lost: {e}"))?;
+                        push.stream = Some(stream);
+                        Ok(first)
+                    }
+                    Err(PushOpenError::Unsupported) => {
+                        self.mark_no_push(peer);
+                        forward()
+                    }
+                    Err(PushOpenError::NotSent(e)) => {
+                        tracing::debug!(provider = %peer, error = %e, "stream not pushed; polling it");
+                        forward()
+                    }
+                    Err(PushOpenError::Lost(e)) => Err(format!("push open lost: {e}")),
+                }
+            }
+            Some(&FETCH_CHUNKS) if framed.len() >= 1 + 20 => {
+                let Some(stream) = push.stream.as_ref() else {
+                    return forward();
+                };
+                let offset = u32::from_be_bytes(framed[17..21].try_into().expect("4 bytes"));
+                let hold = framed.get(21..25).map_or(STREAM_HOLD, |b| {
+                    Duration::from_millis(u32::from_be_bytes(b.try_into().expect("4 bytes")).into())
+                });
+                // What arrived may go from the provider's buffer.
+                if offset > push.acked && push.acked_at.map_or(true, |t| t.elapsed() >= PUSH_ACK_EVERY) {
+                    let mut ack = Vec::with_capacity(1 + 20);
+                    ack.push(STREAM_ACK);
+                    ack.extend_from_slice(&framed[1..21]);
+                    if stream.send(ack).is_ok() {
+                        push.acked = offset;
+                        push.acked_at = Some(std::time::Instant::now());
+                    }
+                }
+                match stream.recv_timeout(hold + PUSH_GRACE) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => {
+                        tracing::debug!(provider = %peer, error = %e, "push stream lost; polling the stream from where it was");
+                        push.stream = None;
+                        forward()
+                    }
+                }
+            }
+            _ => forward(),
+        }
     }
 
     /// P1c: remember that `libp2p_id` answered `SERVE_STREAM` with a legacy reply, so the next
@@ -5011,7 +5144,7 @@ impl ConsumerNode {
     /// Send `request` to `provider_libp2p` the way every serve travels: as a stream (polled), or as
     /// one buffered reply to a provider known not to stream, with reconnect-and-fetch if that reply's
     /// connection drops. Each text fragment goes to `on_delta` as it arrives.
-    fn exchange(
+    pub(crate) fn exchange(
         &self,
         provider_libp2p: &str,
         request: &ServeRequest,
@@ -5052,9 +5185,15 @@ impl ConsumerNode {
             // same offset itself for drop-resume); the first-ack RTT is recorded as
             // proxy_roundtrip_ns. Real thread::sleep paces the poll loop live.
             let stream_out = {
+                // #4: the stream is pushed when the provider can (its replies come as they are made,
+                // each poll read off the push stream), and polled otherwise or once that breaks.
+                let may_push = self.may_push(provider_libp2p);
+                let mut push = PushState::default();
+                let pushing = std::cell::Cell::new(false);
                 let mut stream_transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
                     let t = std::time::Instant::now();
-                    let r = self.net.proxy_forward_timeout(provider_libp2p.to_string(), framed.to_vec(), STREAM_CALL_TIMEOUT);
+                    let r = self.stream_call(provider_libp2p, framed, may_push, &mut push);
+                    pushing.set(push.stream.is_some());
                     if proxy_rt.get() == 0 {
                         // First-ack RTT: a held open's reply waited at the provider for the first
                         // frames, which it says; that wait is the serve's, not the network's.
@@ -5067,7 +5206,15 @@ impl ConsumerNode {
                     r.map_err(AdapterError::Network)
                 };
                 let mut sleeper = |d: Duration| std::thread::sleep(d);
-                request_completion_streaming_with(&mut stream_transport, &mut sleeper, request, cancel, &mut progress, on_delta)
+                request_completion_streaming_paced(
+                    &mut stream_transport,
+                    &mut sleeper,
+                    request,
+                    cancel,
+                    &|| pushing.get(),
+                    &mut progress,
+                    on_delta,
+                )
             };
             match stream_out {
                 Ok(s) => Ok(s),

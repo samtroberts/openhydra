@@ -61,6 +61,8 @@ pub struct NetworkHandle {
     pinned: crate::pinned::PinnedPeers,
     /// The node is on OpenHydra's public network, not a private deployment.
     public_network: bool,
+    /// Push streams (#4, [`crate::push`]).
+    push: Arc<crate::push::PushStreams>,
 }
 
 impl NetworkHandle {
@@ -79,7 +81,7 @@ impl NetworkHandle {
             hex::encode(pk.to_bytes())
         };
         let keypair = identity.keypair.clone();
-        let (cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned, public_network) = start_node(&config)?;
+        let (cmd_tx, proxy_queue, thread, net_generation, peer_rtts, pinned, public_network, push) = start_node(&config)?;
         Ok(Self {
             cmd_tx,
             proxy_queue,
@@ -92,6 +94,7 @@ impl NetworkHandle {
             peer_rtts,
             pinned,
             public_network,
+            push,
         })
     }
 
@@ -337,7 +340,17 @@ impl NetworkHandle {
 
     /// Send the one-shot response for an inbound request (used as an ACK; the streamed
     /// body is delivered separately via [`push`](Self::push)).
+    ///
+    /// For a push stream's open ([`crate::push::is_push_id`]), each respond is written to the stream
+    /// as one message, and the stream stays open for more: an error once it has ended. A message a
+    /// consumer wrote on its push stream ([`crate::push::is_push_message_id`]) takes no answer.
     pub fn respond(&self, request_id: String, data: Vec<u8>) -> Result<(), String> {
+        if crate::push::is_push_id(&request_id) {
+            return self.push.send(&request_id, data);
+        }
+        if crate::push::is_push_message_id(&request_id) {
+            return Ok(());
+        }
         self.cmd_tx
             .blocking_send(SwarmCommand::RespondProxy { request_id, data, on_sent: None })
             .map_err(|_| "swarm not running".to_string())
@@ -355,6 +368,33 @@ impl NetworkHandle {
         self.cmd_tx
             .blocking_send(SwarmCommand::RespondProxy { request_id, data, on_sent: Some(on_sent) })
             .map_err(|_| "swarm not running".to_string())
+    }
+
+    /// End the push stream `request_id` once what was responded on it is written (#4).
+    pub fn end_push(&self, request_id: &str) {
+        self.push.end(request_id);
+    }
+
+    /// Open a push stream to `peer_id` (#4) on a connection this node already has to it, writing
+    /// `open` (a stream open, as it would be sent as a request) on it, within `timeout`. Each reply
+    /// the peer's agent gives that open is then read from the stream.
+    pub fn open_push(
+        &self,
+        peer_id: &str,
+        open: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<crate::push::PushStream, crate::push::PushOpenError> {
+        self.push.open(peer_id, open, timeout)
+    }
+
+    /// Push stream opens this node has served, as a provider.
+    pub fn push_streams_served(&self) -> u64 {
+        self.push.served_count()
+    }
+
+    /// Push streams this node is serving now, as a provider.
+    pub fn push_streams_open(&self) -> usize {
+        self.push.open_count()
     }
 
     /// Fire-and-forget push of raw bytes to a peer (used to stream serve chunks back to

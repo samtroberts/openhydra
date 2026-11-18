@@ -9,6 +9,7 @@ pub mod address_book;
 pub mod behaviour;
 pub mod card;
 pub mod proxy;
+pub mod push;
 
 /// Prost-generated types from peer.proto.
 pub mod proto {
