@@ -93,6 +93,16 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+/// OpenHydra patch: process-wide load counters (gossip bytes received, message copies whose
+/// signature was checked, messages delivered once, duplicates dropped), read by the status
+/// endpoint and the bootstrap's load-test metrics.
+pub mod openhydra_counters {
+    use std::sync::atomic::AtomicU64;
+    pub static RPC_BYTES_IN: AtomicU64 = AtomicU64::new(0);
+    pub static COPIES_CHECKED: AtomicU64 = AtomicU64::new(0);
+    pub static UNIQUE_MESSAGES: AtomicU64 = AtomicU64::new(0);
+    pub static DUPLICATES: AtomicU64 = AtomicU64::new(0);
+}
 mod backoff;
 mod behaviour;
 mod config;

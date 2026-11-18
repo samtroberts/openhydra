@@ -746,6 +746,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut put_quota = openhydra_network::dht::PutQuota::default();
     let mut provider_quota = openhydra_network::dht::PutQuota::default();
     let mut total_circuits: u64 = 0;
+    // Load tests (`--metrics-bind`): DHT writes received, and provider announces by key, so the load
+    // on the nodes nearest a popular model's key can be measured.
+    let mut put_record_in: u64 = 0;
+    let mut add_provider_in: u64 = 0;
+    let mut adds_by_key: std::collections::HashMap<Vec<u8>, u64> = Default::default();
     let mut denied_circuits: u64 = 0;
     // Each open connection's kind (transport, direction), for the metrics endpoint.
     let mut conn_kinds: std::collections::HashMap<libp2p::swarm::ConnectionId, &'static str> = Default::default();
@@ -825,6 +830,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = metrics_tick.tick(), if metrics_bind.is_some() => {
                 let topic = gossipsub::IdentTopic::new(openhydra_network::swarm::GOSSIPSUB_TOPIC).hash();
+                let provider_keys: Vec<serde_json::Value> = {
+                    use libp2p::kad::store::RecordStore;
+                    let mut top: Vec<(Vec<u8>, u64)> = adds_by_key.iter().map(|(k, n)| (k.clone(), *n)).collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1));
+                    top.into_iter().take(5).map(|(k, n)| {
+                        let stored = swarm.behaviour_mut().kademlia.store_mut().providers(&kad::RecordKey::new(&k)).len();
+                        serde_json::json!({"key": String::from_utf8_lossy(&k[..k.len().min(120)]), "adds": n, "stored": stored})
+                    }).collect()
+                };
                 let g = &swarm.behaviour().gossipsub;
                 let counters = swarm.network_info().connection_counters().clone();
                 let json = serde_json::json!({
@@ -843,6 +857,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "gossip_mesh_peers": g.mesh_peers(&topic).count(),
                     "gossip_rejected": gossip_rejected,
                     "gossip_ignored": gossip_ignored,
+                    "put_record_in": put_record_in,
+                    "gossip_bytes_in": libp2p::gossipsub::openhydra_counters::RPC_BYTES_IN.load(std::sync::atomic::Ordering::Relaxed),
+                    "gossip_copies_checked": libp2p::gossipsub::openhydra_counters::COPIES_CHECKED.load(std::sync::atomic::Ordering::Relaxed),
+                    "gossip_unique": libp2p::gossipsub::openhydra_counters::UNIQUE_MESSAGES.load(std::sync::atomic::Ordering::Relaxed),
+                    "gossip_duplicates": libp2p::gossipsub::openhydra_counters::DUPLICATES.load(std::sync::atomic::Ordering::Relaxed),
+                    "add_provider_in": add_provider_in,
+                    "provider_keys": provider_keys,
                     "conn_kinds": conn_kinds.values().fold(std::collections::BTreeMap::<&str, u64>::new(), |mut m, k| { *m.entry(k).or_default() += 1; m }),
                 });
                 if let Ok(mut b) = metrics_json.lock() {
@@ -1029,6 +1050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 use libp2p::kad::store::RecordStore;
                                 match request {
                                     kad::InboundRequest::PutRecord { source, record: Some(record), .. } => {
+                                        put_record_in += 1;
                                         // Verified, recent, under its own key, never over a newer one,
                                         // and within its publisher's and network's share of the store.
                                         match openhydra_network::dht::check_put_record(&record, now_ms()) {
@@ -1052,6 +1074,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // libp2p-kad only hands on a provider record from the provider itself;
                                     // each provider and network gets its share of the provider store.
                                     kad::InboundRequest::AddProvider { record: Some(provider) } => {
+                                        add_provider_in += 1;
+                                        if adds_by_key.len() < 4096 || adds_by_key.contains_key(provider.key.as_ref()) {
+                                            *adds_by_key.entry(provider.key.to_vec()).or_default() += 1;
+                                        }
                                         let origin = moved_conns.origin_of(&provider.provider).unwrap_or_else(|| format!("relayed:{}", provider.provider));
                                         if !provider_quota.admit(&provider.key, &provider.provider.to_base58(), &origin, std::time::Instant::now()) {
                                             debug!(provider = %provider.provider, %origin, "kademlia: refused an ADD_PROVIDER over its share");

@@ -395,6 +395,16 @@ pub struct NetCounters {
     pub reversal_successes: u64,
     /// Per-ladder-rung connection successes (F-3), keyed by rung name.
     pub tier_connect_success: std::collections::HashMap<String, u64>,
+    /// Gossip load since start (load tests): bytes received, message copies signature-checked,
+    /// messages delivered once, duplicates dropped.
+    #[serde(default)]
+    pub gossip_bytes_in: u64,
+    #[serde(default)]
+    pub gossip_copies_checked: u64,
+    #[serde(default)]
+    pub gossip_unique: u64,
+    #[serde(default)]
+    pub gossip_duplicates: u64,
 }
 
 /// Read-only introspection snapshot of the running node — the network half of the

@@ -239,9 +239,12 @@ impl Decoder for GossipsubCodec {
     type Error = quick_protobuf_codec::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let before = src.len();
         let Some(rpc) = self.codec.decode(src)? else {
             return Ok(None);
         };
+        crate::openhydra_counters::RPC_BYTES_IN
+            .fetch_add(before.saturating_sub(src.len()) as u64, std::sync::atomic::Ordering::Relaxed);
         // Store valid messages.
         let mut messages = Vec::with_capacity(rpc.publish.len());
         // Store any invalid messages.
@@ -320,6 +323,9 @@ impl Decoder for GossipsubCodec {
             }
 
             // verify message signatures if required
+            if verify_signature {
+                crate::openhydra_counters::COPIES_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if verify_signature && !GossipsubCodec::verify_signature(&message) {
                 tracing::warn!("Invalid signature for received message");
 

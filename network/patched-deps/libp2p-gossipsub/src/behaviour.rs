@@ -1727,6 +1727,11 @@ where
             return;
         }
 
+        if self.duplicate_cache.contains(&msg_id) {
+            crate::openhydra_counters::DUPLICATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::openhydra_counters::UNIQUE_MESSAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if !self.duplicate_cache.insert(msg_id.clone()) {
             tracing::debug!(message=%msg_id, "Message already received, ignoring");
             if let Some((peer_score, ..)) = &mut self.peer_score {

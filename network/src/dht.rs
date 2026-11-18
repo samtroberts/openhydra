@@ -616,6 +616,64 @@ mod tests {
         assert!(err.contains("libp2p_peer_id"), "expected empty-peer-id error, got: {err}");
     }
 
+    /// Load-test measurement (run by hand: `cargo test --release -p openhydra-network
+    /// pex_cost_measure -- --ignored --nocapture`): the size of a realistic signed provider
+    /// announcement and what checking one costs on this machine.
+    #[test]
+    #[ignore]
+    fn pex_cost_measure() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let record = PeerRecord {
+            peer_id: "a3f1c2d4e5b6a7980a1b2c3d4e5f6071".into(),
+            model_id: "qwen3/8b/q4_k_m/4b9e1f2a".into(),
+            canonical_model_id: "qwen3/8b/q4_k_m/4b9e1f2a".into(),
+            runtime_model_id: "qwen3:8b".into(),
+            host: "203.0.113.25".into(),
+            port: 4001,
+            region: Some("ap-south".into()),
+            daemon_mode: "provider".into(),
+            runtime_backend: "ollama".into(),
+            runtime_target: "cuda".into(),
+            quantization_mode: "q4_k_m".into(),
+            quantization_bits: 4,
+            runtime_gpu_available: true,
+            runtime_estimated_tokens_per_sec: 42.0,
+            runtime_estimated_memory_mb: 6144,
+            context_length: 40960,
+            max_output_tokens: 8192,
+            hardware_class: "consumer-gpu".into(),
+            nat_type: "port_restricted".into(),
+            requires_relay: true,
+            relay_address: "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit".into(),
+            ..Default::default()
+        };
+        let signed = sign_peer_record(&record, &kp).unwrap();
+        let envelope = serde_json::to_vec(&serde_json::json!({"type": "PROVIDER_ANNOUNCE", "record": &signed})).unwrap();
+        let source = signed.libp2p_peer_id.clone();
+        let n = 20_000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            pex_record_is_authentic(&signed, &source).unwrap();
+        }
+        let record_check = t.elapsed() / n;
+        // The gossip layer's own check: one Ed25519 verify over the message.
+        let sig = kp.sign(&envelope).unwrap();
+        let pk = kp.public();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            assert!(pk.verify(&envelope, &sig));
+        }
+        let message_check = t.elapsed() / n;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let v: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+            let _r: PeerRecord = serde_json::from_value(v["record"].clone()).unwrap();
+        }
+        let parse = t.elapsed() / n;
+        println!("PEX_MEASURE envelope_bytes={} record_check_us={:.1} message_check_us={:.1} parse_us={:.1}",
+            envelope.len(), record_check.as_secs_f64() * 1e6, message_check.as_secs_f64() * 1e6, parse.as_secs_f64() * 1e6);
+    }
+
     #[test]
     fn test_pex_accepts_self_authored_record() {
         // A provider gossiping its OWN signed record (gossip_source == its peer id)

@@ -1761,6 +1761,10 @@ pub async fn run_event_loop(
                                     .iter()
                                     .map(|(k, v)| (k.to_string(), *v))
                                     .collect(),
+                                gossip_bytes_in: gossip_count(&libp2p::gossipsub::openhydra_counters::RPC_BYTES_IN),
+                                gossip_copies_checked: gossip_count(&libp2p::gossipsub::openhydra_counters::COPIES_CHECKED),
+                                gossip_unique: gossip_count(&libp2p::gossipsub::openhydra_counters::UNIQUE_MESSAGES),
+                                gossip_duplicates: gossip_count(&libp2p::gossipsub::openhydra_counters::DUPLICATES),
                             },
                         };
                         let _ = reply.send(snapshot);
@@ -2341,6 +2345,11 @@ pub async fn run_event_loop(
 /// already made before it; marks it seen either way.
 fn first_time(seen: &mut bool, announced: bool) -> bool {
     !std::mem::replace(seen, true) && announced
+}
+
+/// A gossip load counter's value (see `openhydra_counters` in the patched gossip library).
+fn gossip_count(c: &std::sync::atomic::AtomicU64) -> u64 {
+    c.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Tell the provider to re-announce (it re-announces when the generation advances).
