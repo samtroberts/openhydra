@@ -391,6 +391,11 @@ pub struct ServeRequest {
     /// older consumer (and absent from the wire, so its requests are unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_hold_ms: Option<u32>,
+    /// Streaming only: its client takes the reply whole, not streamed (#3), so a provider that holds
+    /// may keep the open and each poll until the reply is done (or the hold runs out) instead of
+    /// answering each frame. Absent when false; an older provider ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_whole: bool,
 }
 
 /// Parameters for a deterministic (reproducible) serve. The model's quantisation is already pinned
@@ -1130,7 +1135,7 @@ mod tests {
             settlement_peg: None,
             settlement_domain: None,
             settlement_wallet: None,
-            stream_hold_ms: None,
+            stream_hold_ms: None, stream_whole: false,
         }
     }
 

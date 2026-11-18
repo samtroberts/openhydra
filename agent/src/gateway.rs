@@ -1396,6 +1396,7 @@ fn spawn_worker(
     think: Option<bool>,
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
     fallback: Option<crate::cards::CardFallback>,
+    whole: bool,
     gen_permit: OwnedSemaphorePermit,
     remember: Option<(Arc<SessionModels>, String)>,
 ) -> (
@@ -1430,7 +1431,7 @@ fn spawn_worker(
                 delivered.set(true);
                 on_delta(d)
             };
-            let result = node.complete(&model, messages.clone(), max_tokens, temperature, tools.clone(), think, min_authenticity, only.as_ref(), fallback, &cancel, &mut track);
+            let result = node.complete(&model, messages.clone(), max_tokens, temperature, tools.clone(), think, min_authenticity, only.as_ref(), fallback, whole, &cancel, &mut track);
             match result {
                 Ok(mut summary) => {
                     let (kept, dropped) = filter_tool_calls(std::mem::take(&mut summary.tool_calls), &offered);
@@ -1552,6 +1553,7 @@ async fn chat_completions(
         req.tools,
         think,
         req.openhydra.and_then(|o| o.fallback),
+        !stream,
     )
     .await
     {
@@ -1621,6 +1623,8 @@ async fn spawn_dispatch(
     tools: Vec<Value>,
     think: Option<bool>,
     body_fallback: Option<String>,
+    // Its client takes the reply whole, not streamed (#3).
+    whole: bool,
 ) -> Result<(String, Route, EventRx, std::time::Instant), DispatchErr>
 {
     // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
@@ -1684,7 +1688,7 @@ async fn spawn_dispatch(
         let remember = matches!(route, Route::Auto(..)).then(|| (state.last_auto.clone(), session_key(headers)));
         let first = (model.clone(), only, own_machine);
         let next = next.into_iter().map(|(m, step, only)| (m, only, step == AutoStep::OwnMachine)).collect();
-        spawn_worker(state.node.clone(), first, next, messages, max_tokens, temperature, tools, think, min_authenticity, fallback, gen_permit, remember)
+        spawn_worker(state.node.clone(), first, next, messages, max_tokens, temperature, tools, think, min_authenticity, fallback, whole, gen_permit, remember)
     };
     Ok((model, route, rx, started))
 }
@@ -2357,6 +2361,7 @@ async fn messages(
         None,
         // The Anthropic surface takes the fallback choice from the header only.
         None,
+        !stream,
     )
     .await
     {

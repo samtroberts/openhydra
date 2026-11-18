@@ -1964,6 +1964,21 @@ fn provider_error(msg: String, at_admission: bool) -> AdapterError {
 /// The text of a provider's shed reply to a request its full serve pool couldn't take.
 const SHED_REPLY: &str = "provider overloaded, retry";
 
+/// How often, and how far apart, a stream whose held open was lost is asked for before the attempt
+/// gives up on that provider (its close then settles whatever the provider counted).
+const OPEN_RESUME_TRIES: u32 = 2;
+const OPEN_RESUME_WAIT: Duration = Duration::from_secs(1);
+
+/// A transport error that shows the request never reached the provider: no connection could be
+/// made to it, or this gateway didn't send it. (Gate 0 rerun, 18 Nov: treating these as a lost held
+/// open kept an outsider's request retrying an unreachable provider for minutes.)
+fn never_sent(e: &AdapterError) -> bool {
+    let m = e.message();
+    ["dial failed", "relay queue full", "too many requests waiting", "invalid peer_id", "Failed to negotiate"]
+        .iter()
+        .any(|s| m.contains(s))
+}
+
 /// Send a stream poll, sending it again after a transport error (drop-resume: the provider still
 /// holds the un-fetched tail), within the retry budget and the stall clock (`idle`, to which the
 /// waits are added).
@@ -2051,7 +2066,10 @@ fn request_completion_streaming_with(
         // or our call timed out): ask for the stream from its start instead, as a lost poll is asked
         // again, and carry on with it if it's there. Until we know, the stream may be open: if we
         // can't reach the provider, our close finds and pays for whatever it counted, or nothing.
-        Err(e) if hold.is_some() => {
+        // Not when it never left (no connection could be made): then there is no stream, and the
+        // attempt fails at once as before. Asked for briefly, not for a poll's whole retry budget:
+        // a provider that stays out of reach is left to the close, and the request goes elsewhere.
+        Err(e) if hold.is_some() && !never_sent(&e) => {
             progress.opened = true;
             let mut poll = Vec::with_capacity(1 + 16 + 4);
             poll.push(FETCH_CHUNKS);
@@ -2059,7 +2077,28 @@ fn request_completion_streaming_with(
             poll.extend_from_slice(&0u32.to_be_bytes());
             tracing::debug!(error = %e.message(), "a held stream open was lost; asking for the stream instead");
             resumed = true;
-            fetch_resuming(transport, sleep, cancel, &poll, &mut idle)?
+            let mut last = e;
+            let mut got = None;
+            for attempt in 0..OPEN_RESUME_TRIES {
+                if attempt > 0 {
+                    sleep(OPEN_RESUME_WAIT);
+                    idle += OPEN_RESUME_WAIT;
+                    if cancel() {
+                        return Err(StreamFail::Cancelled);
+                    }
+                }
+                match transport(&poll) {
+                    Ok(bytes) => {
+                        got = Some(bytes);
+                        break;
+                    }
+                    Err(e) => last = e,
+                }
+            }
+            match got {
+                Some(bytes) => bytes,
+                None => return Err(StreamFail::Error(last)),
+            }
         }
         Err(e) => return Err(StreamFail::Error(e)),
     };
@@ -4023,10 +4062,11 @@ impl ConsumerNode {
         min_authenticity: Option<AuthenticityTier>,
         only: Option<&std::collections::HashSet<String>>,
         fallback: Option<crate::cards::CardFallback>,
+        whole: bool,
         cancel: &dyn Fn() -> bool,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
-        let result = self.complete_inner(model, messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, cancel, on_delta);
+        let result = self.complete_inner(model, messages, max_tokens, temperature, tools, think, min_authenticity, only, fallback, whole, cancel, on_delta);
         self.note_card_outcome(model, &result, now_unix_ms());
         result
     }
@@ -4074,6 +4114,7 @@ impl ConsumerNode {
         min_authenticity: Option<AuthenticityTier>,
         only: Option<&std::collections::HashSet<String>>,
         fallback: Option<crate::cards::CardFallback>,
+        whole: bool,
         cancel: &dyn Fn() -> bool,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
@@ -4098,9 +4139,9 @@ impl ConsumerNode {
                 // and dialled on loopback: a failed dial means it isn't running, so one pass. The
                 // retries for a provider that just joined would only delay the answer by ~28 s.
                 if self.own_provider_only(only) || (only.is_none() && self.own_pinned_serves(model)) {
-                    return self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
+                    return self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, only, false, None, cancel, on_delta);
                 }
-                return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, on_delta);
+                return self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, only, false, None, cancel, on_delta);
             }
             // Inside a keyed private network every node holds the organisation's network key, so
             // there is no stranger to keep a private model from: its providers are pooled with the
@@ -4121,9 +4162,9 @@ impl ConsumerNode {
                         on_delta(d)
                     };
                     if known_down {
-                        self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, &mut track)
+                        self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, only, false, None, cancel, &mut track)
                     } else {
-                        self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, only, false, None, cancel, &mut track)
+                        self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, only, false, None, cancel, &mut track)
                     }
                 };
                 return match result {
@@ -4164,7 +4205,7 @@ impl ConsumerNode {
                 // asked), with a failure worded as for an unknown model.
                 let mut track = |d: &str| on_delta(d);
                 return self
-                    .serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), true, None, cancel, &mut track)
+                    .serve_passes(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, Some(&pinned), true, None, cancel, &mut track)
                     .map_err(|e| match e {
                         AdapterError::Cancelled(_) => e,
                         _ => AdapterError::Route(format!("no provider for model '{model}'")),
@@ -4188,9 +4229,9 @@ impl ConsumerNode {
             // A private card's model is never looked up on the network: its name isn't asked about
             // publicly, and nobody found there could serve it anyway.
             if known_down {
-                self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
+                self.serve_one_pass(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
             } else {
-                self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
+                self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, Some(&pinned), private, Some(&seen), cancel, &mut track)
             }
         };
         let err = match first {
@@ -4222,7 +4263,7 @@ impl ConsumerNode {
                 delivered.set(true);
                 on_delta(d)
             };
-            self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, &policy, Some(&alternatives), false, None, cancel, &mut track)
+            self.serve_passes(model, &messages, max_tokens, temperature, &tools, think, whole, &policy, Some(&alternatives), false, None, cancel, &mut track)
         };
         match second {
             Ok(mut summary) => {
@@ -4285,6 +4326,7 @@ impl ConsumerNode {
         temperature: Option<f64>,
         tools: &[Value],
         think: Option<bool>,
+        whole: bool,
         policy: &AssurancePolicy,
         only: Option<&std::collections::HashSet<String>>,
         no_discovery: bool,
@@ -4294,7 +4336,7 @@ impl ConsumerNode {
     ) -> Result<ServeSummary, AdapterError> {
         let noted = std::cell::RefCell::new(std::collections::HashSet::new());
         let req_span = tracing::Span::current();
-        match self.serve_once(model, messages, max_tokens, temperature, tools, think, policy, only, no_discovery, seen, cancel, now_unix_ms(), &noted, &req_span, on_delta) {
+        match self.serve_once(model, messages, max_tokens, temperature, tools, think, whole, policy, only, no_discovery, seen, cancel, now_unix_ms(), &noted, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => Ok(summary),
             AttemptOutcome::Fatal(e) | AttemptOutcome::Retryable(e) | AttemptOutcome::NotReachableYet(e) | AttemptOutcome::AllShed(e) => Err(e),
         }
@@ -4311,6 +4353,7 @@ impl ConsumerNode {
         temperature: Option<f64>,
         tools: &[Value],
         think: Option<bool>,
+        whole: bool,
         policy: &AssurancePolicy,
         only: Option<&std::collections::HashSet<String>>,
         no_discovery: bool,
@@ -4330,7 +4373,7 @@ impl ConsumerNode {
                 if fresh && !no_discovery {
                     let _ = self.net.invalidate_discover(model);
                 }
-                self.serve_once(model, messages, max_tokens, temperature, tools, think, policy, only, no_discovery, seen, cancel, now, &noted, &req_span, on_delta)
+                self.serve_once(model, messages, max_tokens, temperature, tools, think, whole, policy, only, no_discovery, seen, cancel, now, &noted, &req_span, on_delta)
             },
             cancel,
             &|| started.elapsed(),
@@ -4352,6 +4395,7 @@ impl ConsumerNode {
         temperature: Option<f64>,
         tools: &[Value],
         think: Option<bool>,
+        whole: bool,
         policy: &AssurancePolicy,
         only: Option<&std::collections::HashSet<String>>,
         no_discovery: bool,
@@ -4590,7 +4634,7 @@ impl ConsumerNode {
             .entered();
             // B-S1: the request commits a fresh receipt nonce up front, so the provider records
             // what it serves under it; the settlement receipt then reuses this exact nonce.
-            let request = self.serve_request_for(&provider, messages, max_tokens, temperature, tools, think);
+            let request = ServeRequest { stream_whole: whole, ..self.serve_request_for(&provider, messages, max_tokens, temperature, tools, think) };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             let open = self.open_serve(&provider_libp2p);
             let t_serve = std::time::Instant::now();
@@ -4952,6 +4996,8 @@ impl ConsumerNode {
             // Every serve offers to have its open and polls held (long-poll); only the streaming
             // path uses it, and a provider that doesn't hold ignores it.
             stream_hold_ms: Some(STREAM_HOLD.as_millis() as u32),
+            // Set by the caller whose client takes the reply whole (#3).
+            stream_whole: false,
         }
     }
 
@@ -7838,7 +7884,7 @@ mod tests {
             settlement_peg: None,
             settlement_domain: None,
             settlement_wallet: None,
-            stream_hold_ms: None,
+            stream_hold_ms: None, stream_whole: false,
         }
     }
 
@@ -8274,18 +8320,38 @@ mod tests {
 
     #[test]
     fn a_lost_held_open_on_a_dead_connection_is_closed_and_settled_later() {
-        // Nothing gets through: the stream may have begun, so it counts as opened (its close then
-        // finds and pays for whatever the provider counted, or nothing).
+        // The connection went mid-request and nothing gets through: the stream may have begun, so
+        // it counts as opened (its close then finds and pays for whatever the provider counted, or
+        // nothing). It is asked for briefly, then the attempt gives up on this provider.
         let mut sends = 0u32;
         let mut transport = |_: &[u8]| -> Result<Vec<u8>, AdapterError> {
             sends += 1;
-            Err(AdapterError::Network("unreachable".into()))
+            Err(AdapterError::Network("proxy outbound: Io(ConnectionClosed)".into()))
         };
+        let mut sleeps = Vec::new();
         let mut progress = StreamProgress::default();
-        let out = request_completion_streaming_with(&mut transport, &mut |_| {}, &held_request(), &|| false, &mut progress, &mut |_| {});
-        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(ref m))) if m.contains("retry budget")));
+        let out = request_completion_streaming_with(&mut transport, &mut |d| sleeps.push(d), &held_request(), &|| false, &mut progress, &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(_)))));
         assert!(progress.opened);
-        assert!(sends > 2, "asked again within the retry budget");
+        assert_eq!(sends, 1 + OPEN_RESUME_TRIES, "the open, then the stream asked for twice");
+        assert_eq!(sleeps, vec![OPEN_RESUME_WAIT]);
+    }
+
+    /// Gate 0 rerun (18 Nov): an outsider's open to a provider it could never connect to was taken
+    /// for a lost held open and retried for minutes.
+    #[test]
+    fn an_open_that_never_left_fails_at_once() {
+        for err in ["proxy_forward: dial failed (peer unreachable)", "proxy_forward: relay queue full"] {
+            let mut sends = 0u32;
+            let mut transport = |_: &[u8]| -> Result<Vec<u8>, AdapterError> {
+                sends += 1;
+                Err(AdapterError::Network(err.into()))
+            };
+            let mut progress = StreamProgress::default();
+            let out = request_completion_streaming_with(&mut transport, &mut |_| panic!("no wait"), &held_request(), &|| false, &mut progress, &mut |_| {});
+            assert!(matches!(out, Err(StreamFail::Error(_))));
+            assert_eq!((sends, progress.opened), (1, false), "{err}");
+        }
     }
 
     #[test]
