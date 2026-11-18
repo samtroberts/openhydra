@@ -9,7 +9,7 @@
 [workspace]
 resolver = "2"
 members = ["network", "protocol", "agent"]
-# The patched libp2p-quic, libp2p-mdns, libp2p-kad, libp2p-dcutr, libp2p-gossipsub and libp2p-request-response live inside the `network` tree and are consumed via
+# The patched libp2p-quic, libp2p-mdns, libp2p-kad, libp2p-dcutr, libp2p-gossipsub, libp2p-request-response and libp2p-swarm live inside the `network` tree and are consumed via
 # the [patch] below, not as workspace members. `engine-mlx/rust` (the built-in Mac engine's linking crate) is its own workspace.
 exclude = [
     "network/patched-deps/libp2p-quic",
@@ -18,6 +18,7 @@ exclude = [
     "network/patched-deps/libp2p-dcutr",
     "network/patched-deps/libp2p-gossipsub",
     "network/patched-deps/libp2p-request-response",
+    "network/patched-deps/libp2p-swarm",
     "engine-mlx/rust",
 ]
 
@@ -41,3 +42,6 @@ libp2p-gossipsub = { path = "network/patched-deps/libp2p-gossipsub" }
 # Requests go on a direct connection when the peer has one, never alternating with a relay
 # circuit (see its CHANGELOG.md).
 libp2p-request-response = { path = "network/patched-deps/libp2p-request-response" }
+# OpenHydra's own request protocols negotiate lazily: one round trip less per request (see its
+# CHANGELOG.md).
+libp2p-swarm = { path = "network/patched-deps/libp2p-swarm" }
