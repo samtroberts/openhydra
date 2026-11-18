@@ -1444,7 +1444,9 @@ const PUSH_ACK_EVERY: Duration = Duration::from_millis(500);
 /// empty reply when a hold runs out) before taking the push stream for broken and polling.
 const PUSH_GRACE: Duration = Duration::from_secs(5);
 /// How long a provider that doesn't push streams (an older build) is polled without asking again.
-const NO_PUSH_TTL_MS: u64 = 10 * 60 * 1000;
+/// Short: a connection dropped during the first negotiation reads as "doesn't speak it" too
+/// (review 18 Nov).
+const NO_PUSH_TTL_MS: u64 = 2 * 60 * 1000;
 /// Providers remembered as not pushing, at most.
 const MAX_NO_PUSH: usize = 4096;
 
@@ -1595,7 +1597,7 @@ pub(crate) struct Exchange {
     /// stream to close (review round 5, R5S-3).
     opened: bool,
     /// How far the stream was read (its next poll offset), for closing it.
-    stream_offset: u32,
+    pub(crate) stream_offset: u32,
     /// Tool calls a stream delivered before it broke (counted when it is settled, R5S-5).
     tool_calls: Vec<ToolCall>,
     /// The nonce the serve ended under: the request's, or a fresh one if it had to be served again
@@ -3287,18 +3289,22 @@ impl ConsumerNode {
     /// past its hold is dropped, and the same poll goes as a request: the provider kept what it
     /// pushed until acknowledged, so the poll picks up where the consumer is.
     fn stream_call(&self, peer: &str, framed: &[u8], may_push: bool, push: &mut PushState) -> Result<Vec<u8>, String> {
-        use openhydra_network::push::PushOpenError;
+        use openhydra_network::push::{PushOpenError, PushRecvError};
         let forward = || self.net.proxy_forward_timeout(peer.to_string(), framed.to_vec(), STREAM_CALL_TIMEOUT);
         match framed.first() {
             Some(&SERVE_STREAM) if may_push && push.stream.is_none() => {
                 match self.net.open_push(peer, framed.to_vec(), STREAM_CALL_TIMEOUT) {
-                    Ok(stream) => {
+                    Ok(stream) => match stream.recv_timeout(STREAM_CALL_TIMEOUT) {
+                        Ok(first) => {
+                            push.stream = Some(stream);
+                            Ok(first)
+                        }
+                        // Refused unread (the provider's push streams are full): sent the usual way.
+                        Err(PushRecvError::Refused) => forward(),
                         // The open was written: from here, a failure is a lost open (the provider may
                         // have begun the stream), which the caller asks for by poll.
-                        let first = stream.recv_timeout(STREAM_CALL_TIMEOUT).map_err(|e| format!("push open lost: {e}"))?;
-                        push.stream = Some(stream);
-                        Ok(first)
-                    }
+                        Err(e) => Err(format!("push open lost: {e}")),
+                    },
                     Err(PushOpenError::Unsupported) => {
                         self.mark_no_push(peer);
                         forward()

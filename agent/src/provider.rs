@@ -1688,19 +1688,22 @@ fn fetch_chunks_at(
 }
 
 /// A push stream's consumer acknowledged the frames before `offset` of the stream under `nonce`
-/// ([`STREAM_ACK`]): they are dropped (at most up to what was returned to it), and it counts as
-/// reading. Nothing is returned or counted. `false`: no such stream of `source_peer`'s.
+/// ([`STREAM_ACK`]): they are dropped (at most up to what was returned to it). Nothing is returned
+/// or counted. Only one that drops something counts as reading: what it drops was returned, and
+/// so is owed (review 18 Nov: an empty acknowledgement kept an unread stream generating, unbilled).
+/// `false`: nothing dropped.
 fn ack_stream_in(map: &mut HashMap<[u8; 16], StreamBuffer>, nonce: &[u8; 16], source_peer: &str, offset: u32, now: u64) -> bool {
     let Some(buf) = map.get_mut(nonce).filter(|b| b.reply_to == source_peer) else {
         return false;
     };
     let upto = offset.min(buf.fetched_hi).clamp(buf.base_offset, buf.base_offset + buf.chunks.len() as u32);
     let li = (upto - buf.base_offset) as usize;
-    if li > 0 {
-        buf.chunks.drain(0..li);
-        buf.base_offset = upto;
-        buf.bytes = buf.chunks.iter().map(|c| c.len()).sum();
+    if li == 0 {
+        return false;
     }
+    buf.chunks.drain(0..li);
+    buf.base_offset = upto;
+    buf.bytes = buf.chunks.iter().map(|c| c.len()).sum();
     buf.recorded_ms = now;
     buf.last_poll_ms = now;
     buf.polled = true;
@@ -2549,8 +2552,9 @@ impl<A: EngineAdapter> Provider<A> {
             }
         }
         drop(map);
+        // (Through `reply`: a push stream's own poll ends its push, review 18 Nov.)
         if let Some((request_id, bytes)) = woken {
-            let _ = self.net.respond(request_id, bytes);
+            self.reply(request_id, bytes);
         }
         reply.encode()
     }
@@ -2905,12 +2909,14 @@ impl<A: EngineAdapter> Provider<A> {
     fn reply(&self, request_id: String, bytes: Vec<u8>) {
         let mut next = Some((request_id, bytes));
         while let Some((id, bytes)) = next.take() {
-            let pushed = self.pushed.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
-            let sent = self.net.respond(id.clone(), bytes.clone()).is_ok();
             if !openhydra_network::push::is_push_id(&id) {
+                let _ = self.net.respond(id, bytes);
                 continue;
             }
-            match (pushed, sent, FetchChunksResponse::decode(&bytes)) {
+            let pushed = self.pushed.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+            let reply = FetchChunksResponse::decode(&bytes);
+            let sent = self.net.respond(id.clone(), bytes).is_ok();
+            match (pushed, sent, reply) {
                 (Some(p), true, Ok(FetchChunksResponse::Chunks { next_offset, done: false, .. })) => {
                     next = self.hold_or_answer(id, &p.peer, p.nonce, next_offset, p.hold_ms);
                 }
@@ -2927,13 +2933,18 @@ impl<A: EngineAdapter> Provider<A> {
         self.net.end_push(request_id);
     }
 
-    /// A push stream's consumer acknowledged its frames before an offset ([`STREAM_ACK`]): they
-    /// are dropped, and it counts as reading. A flood of them is shed.
-    fn handle_stream_ack(&self, source_peer: &str, payload: &[u8]) {
+    /// A push stream's consumer acknowledged its frames before an offset ([`STREAM_ACK`]), on the
+    /// push stream `message_id` came on: they are dropped, and it counts as reading. Only for the
+    /// stream that push stream carries (review 18 Nov: any stream of the consumer's could be kept
+    /// alive). A flood of them is shed.
+    fn handle_stream_ack(&self, message_id: &str, source_peer: &str, payload: &[u8]) {
         let Some((nonce, offset, None)) = parse_fetch_chunks(payload) else {
             return;
         };
-        if self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+        let pushes_it = openhydra_network::push::push_id_of_message(message_id)
+            .and_then(|id| self.pushed.lock().unwrap_or_else(|e| e.into_inner()).get(&id).map(|p| p.nonce == nonce && p.peer == source_peer))
+            .unwrap_or(false);
+        if !pushes_it || self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
             return;
         }
         let now = now_unix_ms();
@@ -3920,7 +3931,7 @@ impl<A: EngineAdapter> Provider<A> {
                 if openhydra_network::push::is_push_message_id(&request_id) {
                     if data.first() == Some(&STREAM_ACK) {
                         let provider = Arc::clone(&self);
-                        let _ = control_pool.submit(move || provider.handle_stream_ack(&source_peer, &data[1..]));
+                        let _ = control_pool.submit(move || provider.handle_stream_ack(&request_id, &source_peer, &data[1..]));
                     }
                     continue;
                 }
@@ -6895,12 +6906,20 @@ mod tests {
         stream_append_in(&mut map, &n, &delta("e"), 3);
         stream_append_in(&mut map, &n, &delta("f"), 3);
         assert!(!ack_stream_in(&mut map, &n, "x", 4, 5), "not its stream");
-        assert!(!ack_stream_in(&mut map, &n, "c", 4, 5) || map[&n].base_offset == 4);
         // An acknowledgement past what was returned drops no more than that.
         assert!(ack_stream_in(&mut map, &n, "c", 6, 6));
         let b = &map[&n];
         assert_eq!((b.base_offset, b.chunks.len(), b.last_poll_ms), (4, 2, 6));
+        // One that drops nothing doesn't count as reading.
+        assert!(!ack_stream_in(&mut map, &n, "c", 6, 9));
+        assert_eq!(map[&n].last_poll_ms, 6);
         assert!(!ack_stream_in(&mut map, &[0; 16], "c", 1, 7), "no such stream");
+        // A stream nothing was returned from can't be kept alive by acknowledgements.
+        let m = [23u8; 16];
+        stream_begin_billed_in(&mut map, m, "c", 0, billing(None));
+        stream_append_in(&mut map, &m, &delta("a"), 1);
+        assert!(!ack_stream_in(&mut map, &m, "c", 1, 50));
+        assert_eq!(map[&m].last_poll_ms, 0);
     }
 
     #[test]
@@ -7018,5 +7037,18 @@ mod tests {
         assert_eq!(text, expected, "every token once, in order");
         assert_eq!(provider.net.push_streams_served(), 2);
         assert!(provider.pushed.lock().unwrap().is_empty(), "nothing left pushed");
+
+        // Its client leaves after the third token and the stream is closed at once, while the
+        // provider holds the push stream's own poll: nothing is left pushed (review 18 Nov).
+        made.store(0, Ordering::SeqCst);
+        let got = std::cell::Cell::new(0);
+        let out = consumer.exchange(&provider_id, &request(33), &|| got.get() >= 3, &mut |_| got.set(got.get() + 1));
+        assert!(matches!(out.result, Err(AdapterError::Cancelled(_))), "{:?}", out.result);
+        assert_eq!(provider.net.push_streams_served(), 3);
+        let mut close = [33u8; 16].to_vec();
+        close.extend_from_slice(&out.stream_offset.to_be_bytes());
+        let reply = provider.handle_stream_close(&consumer_id, &close);
+        assert!(matches!(FetchChunksResponse::decode(&reply), Ok(FetchChunksResponse::Chunks { done: true, .. })));
+        assert!(provider.pushed.lock().unwrap().is_empty(), "the closed stream's push ended");
     }
 }
