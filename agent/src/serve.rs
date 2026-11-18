@@ -384,6 +384,13 @@ pub struct ServeRequest {
     /// than serving and then refusing the receipt. `None` elsewhere (or predating the field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_wallet: Option<String>,
+    /// Streaming only: how long (ms) the provider may hold the reply to this request's open, and to
+    /// each poll, until there is something new to send (long-poll). A provider that holds answers in
+    /// the held reply shape ([`FetchChunksResponse::encode_held`]), so the consumer knows to keep
+    /// asking for holds; an older provider ignores the field and is polled as before. `None` from an
+    /// older consumer (and absent from the wire, so its requests are unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_hold_ms: Option<u32>,
 }
 
 /// Parameters for a deterministic (reproducible) serve. The model's quantisation is already pinned
@@ -935,6 +942,11 @@ const FC_CHUNKS: u8 = 0xF1;
 const FC_NOTFOUND: u8 = 0xF2;
 const FC_FORBIDDEN: u8 = 0xF3;
 const FC_OVERLOADED: u8 = 0xF4;
+/// [`FetchChunksResponse::Chunks`] from a provider that holds polls (long-poll), sent only to a
+/// consumer that asked for holds: `0xF5 ‖ next_offset(4 BE) ‖ done(1) ‖ held_ms(4 BE) ‖ framed`.
+/// `held_ms` is how long the provider kept the request before answering, so the consumer can tell
+/// the network's share of the wait from the provider's.
+const FC_CHUNKS_HELD: u8 = 0xF5;
 
 impl FetchChunksResponse {
     pub fn encode(&self) -> Vec<u8> {
@@ -953,8 +965,42 @@ impl FetchChunksResponse {
         }
     }
 
+    /// [`encode`](Self::encode) for a consumer that asked for holds: `Chunks` in the held shape,
+    /// saying it was kept `held_ms`. The other replies are the same in both shapes.
+    pub fn encode_held(&self, held_ms: u32) -> Vec<u8> {
+        match self {
+            FetchChunksResponse::Chunks { framed, next_offset, done } => {
+                let mut b = Vec::with_capacity(10 + framed.len());
+                b.push(FC_CHUNKS_HELD);
+                b.extend_from_slice(&next_offset.to_be_bytes());
+                b.push(u8::from(*done));
+                b.extend_from_slice(&held_ms.to_be_bytes());
+                b.extend_from_slice(framed);
+                b
+            }
+            other => other.encode(),
+        }
+    }
+
+    /// How long the provider held this reply, when it is in the held shape (`None` otherwise: an
+    /// older provider, or a reply it didn't hold, such as a shed poll's).
+    pub fn held_ms(bytes: &[u8]) -> Option<u32> {
+        match bytes {
+            [FC_CHUNKS_HELD, _, _, _, _, _, a, b, c, d, ..] => Some(u32::from_be_bytes([*a, *b, *c, *d])),
+            _ => None,
+        }
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, AdapterError> {
         match bytes.first() {
+            Some(&FC_CHUNKS_HELD) => {
+                if bytes.len() < 10 {
+                    return Err(AdapterError::Parse("fetch-chunks: short header".into()));
+                }
+                let next_offset = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                let done = bytes[5] != 0;
+                Ok(FetchChunksResponse::Chunks { framed: bytes[10..].to_vec(), next_offset, done })
+            }
             Some(&FC_CHUNKS) => {
                 if bytes.len() < 6 {
                     return Err(AdapterError::Parse("fetch-chunks: short header".into()));
@@ -993,6 +1039,31 @@ pub fn parse_response(buffer: &[u8]) -> Result<Vec<ServeChunk>, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_chunks_reply_reads_back_and_says_how_long_it_was_held() {
+        let r = FetchChunksResponse::Chunks { framed: vec![1, 2, 3], next_offset: 9, done: true };
+        let held = r.encode_held(4_321);
+        assert_eq!(FetchChunksResponse::held_ms(&held), Some(4_321));
+        assert_eq!(FetchChunksResponse::decode(&held).unwrap(), r);
+        // The plain shape says nothing about holding, and the other replies are the same in both.
+        assert_eq!(FetchChunksResponse::held_ms(&r.encode()), None);
+        assert_eq!(FetchChunksResponse::NotFound.encode_held(5), FetchChunksResponse::NotFound.encode());
+        assert_eq!(FetchChunksResponse::held_ms(&FetchChunksResponse::Overloaded.encode()), None);
+        assert!(FetchChunksResponse::decode(&held[..9]).is_err(), "short held header");
+    }
+
+    #[test]
+    fn a_request_that_asks_no_hold_is_unchanged_on_the_wire() {
+        let json = String::from_utf8(req("p").encode()).unwrap();
+        assert!(!json.contains("stream_hold_ms"));
+        let mut asked = req("p");
+        asked.stream_hold_ms = Some(10_000);
+        let back = ServeRequest::decode(&asked.encode()).unwrap();
+        assert_eq!(back.stream_hold_ms, Some(10_000));
+        // An older consumer's request (no field) reads as asking none.
+        assert_eq!(ServeRequest::decode(json.as_bytes()).unwrap().stream_hold_ms, None);
+    }
 
     #[test]
     fn remote_text_is_cut_and_has_no_control_characters() {
@@ -1059,6 +1130,7 @@ mod tests {
             settlement_peg: None,
             settlement_domain: None,
             settlement_wallet: None,
+            stream_hold_ms: None,
         }
     }
 

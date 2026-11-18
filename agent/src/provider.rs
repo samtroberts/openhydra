@@ -965,6 +965,118 @@ impl ScoreTurn {
 /// (its call timeout, 30 s).
 const STREAM_OPEN_STALE: Duration = Duration::from_secs(30);
 
+/// Longest a stream's open or poll is held waiting for something new (long-poll), whatever its
+/// consumer asks: well inside the consumer's call timeout (30 s) and the network's (120 s).
+const MAX_STREAM_HOLD_MS: u32 = 15_000;
+/// Polls held at once, provider-wide. Past it a poll is answered at once, as an older provider
+/// answers, and its consumer paces itself.
+const MAX_HELD_POLLS: usize = 4096;
+/// Polls held at once for one consumer. Each held poll keeps one of the connection's request
+/// substreams open (the network allows [`openhydra_network::proxy::MAX_CONCURRENT_STREAMS`] per
+/// connection, both directions), so a consumer with many streams open keeps most of them free for
+/// opens, closes and receipts; past it a poll is answered at once and paced by its consumer.
+const MAX_HELD_POLLS_PER_PEER: usize = 64;
+/// How often held polls whose hold has run out, or whose stream is gone, are answered.
+const HELD_SWEEP_EVERY: Duration = Duration::from_millis(100);
+/// An open waits for its first frames no later than this after it arrived, counting its time in
+/// the serve queue: so its reply reaches the consumer inside its call timeout (30 s), with room
+/// for the network trip back.
+const OPEN_ANSWER_BY: Duration = Duration::from_secs(25);
+
+/// How long a stream's open may be held, given how long it waited in the serve queue: what it
+/// asked for, cut so the reply leaves by [`OPEN_ANSWER_BY`] (0: answered at once).
+fn open_hold_ms(asked_ms: u32, queued_for: Duration) -> u32 {
+    let left = OPEN_ANSWER_BY.saturating_sub(queued_for).as_millis();
+    asked_ms.min(u32::try_from(left).unwrap_or(u32::MAX))
+}
+
+/// A stream's open or poll the provider is holding until the stream has something new (long-poll),
+/// answered through the network by its request id. Holding costs no worker: the frame that wakes it
+/// answers it from the generating thread, and a sweep answers it when its hold runs out.
+/// Timed on the monotonic clock, so a change of the system clock can't stretch or cut a hold.
+#[derive(Debug)]
+struct HeldPoll {
+    request_id: String,
+    /// Its authenticated sender (the stream's consumer: only its polls are held).
+    peer: String,
+    offset: u32,
+    since: std::time::Instant,
+    until: std::time::Instant,
+}
+
+impl HeldPoll {
+    /// How long it has been held by `now`, in ms (what the held reply tells the consumer).
+    fn held_ms(&self, now: std::time::Instant) -> u32 {
+        u32::try_from(now.saturating_duration_since(self.since).as_millis()).unwrap_or(u32::MAX)
+    }
+}
+
+/// What holding a poll came to.
+#[derive(Debug)]
+enum Park {
+    Parked,
+    /// Held; it replaced this older poll of the same stream, which is to be answered now.
+    Replaced(HeldPoll),
+    /// Not held: the provider, or this consumer, has as many polls held as it may. Answer it now.
+    Full(HeldPoll),
+}
+
+/// Held polls by stream nonce: one per stream (a newer poll replaces an older one, which its
+/// consumer has given up on), at most [`MAX_HELD_POLLS`] in all and [`MAX_HELD_POLLS_PER_PEER`]
+/// per consumer.
+#[derive(Debug, Default)]
+struct HeldPolls {
+    by_nonce: HashMap<[u8; 16], HeldPoll>,
+    per_peer: HashMap<String, usize>,
+}
+
+impl HeldPolls {
+    fn park(&mut self, nonce: [u8; 16], poll: HeldPoll) -> Park {
+        let replacing = self.by_nonce.get(&nonce).is_some_and(|old| old.peer == poll.peer);
+        if !replacing {
+            let full = self.by_nonce.len() >= MAX_HELD_POLLS
+                || self.per_peer.get(&poll.peer).copied().unwrap_or(0) >= MAX_HELD_POLLS_PER_PEER;
+            if full {
+                return Park::Full(poll);
+            }
+        }
+        *self.per_peer.entry(poll.peer.clone()).or_default() += 1;
+        match self.by_nonce.insert(nonce, poll) {
+            Some(old) => {
+                self.forget_peer(&old.peer);
+                Park::Replaced(old)
+            }
+            None => Park::Parked,
+        }
+    }
+
+    fn forget_peer(&mut self, peer: &str) {
+        if let Some(n) = self.per_peer.get_mut(peer) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_peer.remove(peer);
+            }
+        }
+    }
+
+    fn take(&mut self, nonce: &[u8; 16]) -> Option<HeldPoll> {
+        let poll = self.by_nonce.remove(nonce)?;
+        self.forget_peer(&poll.peer);
+        Some(poll)
+    }
+
+    /// The polls whose hold has run out by `now`, or whose stream `exists` no longer, taken out.
+    fn take_due(&mut self, now: std::time::Instant, exists: impl Fn(&[u8; 16]) -> bool) -> Vec<([u8; 16], HeldPoll)> {
+        let due: Vec<[u8; 16]> =
+            self.by_nonce.iter().filter(|(n, p)| p.until <= now || !exists(n)).map(|(n, _)| *n).collect();
+        due.into_iter().filter_map(|n| self.take(&n).map(|p| (n, p))).collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_nonce.is_empty()
+    }
+}
+
 /// Serve nonces admitted recently, oldest first (see `Provider::seen_nonces`).
 #[derive(Default)]
 struct SeenNonces {
@@ -1403,6 +1515,18 @@ fn stream_append_in(
     }
 }
 
+/// A [`FETCH_CHUNKS`] payload: `nonce(16) ‖ offset(4 BE)`, and from a consumer that asks for the
+/// poll to be held, `‖ hold_ms(4 BE)`. `None` for any other length.
+fn parse_fetch_chunks(payload: &[u8]) -> Option<([u8; 16], u32, Option<u32>)> {
+    if !matches!(payload.len(), 20 | 24) {
+        return None;
+    }
+    let nonce: [u8; 16] = payload[0..16].try_into().ok()?;
+    let offset = u32::from_be_bytes(payload[16..20].try_into().ok()?);
+    let hold = payload.get(20..24).and_then(|b| b.try_into().ok()).map(u32::from_be_bytes);
+    Some((nonce, offset, hold))
+}
+
 /// Serve a `FETCH_CHUNKS` poll from the buffer: peer-bind, return the incremental slice
 /// `[offset..]`, prune the acknowledged prefix `[base_offset..offset)`, and report `done`. Pure
 /// (operates on `&mut map`) so it is unit-testable without a live `Provider`; TTL pruning + the
@@ -1610,6 +1734,9 @@ pub struct Provider<A: EngineAdapter> {
     /// proven reconnect-fetch path is untouched; prune-on-ack keeps per-stream memory bounded to
     /// the un-fetched tail so thousands of concurrent streams don't evict one another.
     streams: Mutex<HashMap<[u8; 16], StreamBuffer>>,
+    /// Stream opens and polls held until their stream has something new (long-poll). Locked only
+    /// inside `streams` (or alone), never the other way round.
+    held_polls: Mutex<HeldPolls>,
     /// Serve nonces admitted recently (nonce → when), so none is served twice: a reused nonce would
     /// rewrite the commitment of the serve that first used it, erasing what that one owes (review
     /// round 4 C2). Kept for [`NONCE_MEMORY_MS`], at most [`MAX_SEEN_NONCES`].
@@ -1786,6 +1913,7 @@ impl<A: EngineAdapter> Provider<A> {
             detected: Mutex::new(HashMap::new()),
             declared_quant: None,
             streams: Mutex::new(HashMap::new()),
+            held_polls: Mutex::new(HeldPolls::default()),
             seen_nonces: Mutex::new(SeenNonces::default()),
             serving_nonces: Mutex::new(std::collections::HashSet::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
@@ -2273,6 +2401,13 @@ impl<A: EngineAdapter> Provider<A> {
         let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, b| !stream_expired(b, now));
         let reply = close_stream_in(&mut map, &nonce, source_peer, offset, now);
+        // A poll still held for the stream is answered now (the stream is over).
+        let woken = if matches!(reply, FetchChunksResponse::Chunks { .. }) {
+            let poll = self.held_polls.lock().unwrap_or_else(|e| e.into_inner()).take(&nonce);
+            poll.map(|p| self.answer_held(&mut map, nonce, p, now, std::time::Instant::now()))
+        } else {
+            None
+        };
         // Its consumer is here to settle it: the commitment is kept as long as from a poll, so
         // closes retried through an outage still find it (round 8 S8-3).
         // Once per stream (round 9 B9-5): closes sent again can't keep it from ever expiring.
@@ -2289,6 +2424,10 @@ impl<A: EngineAdapter> Provider<A> {
                     c.recorded_ms = now;
                 }
             }
+        }
+        drop(map);
+        if let Some((request_id, bytes)) = woken {
+            let _ = self.net.respond(request_id, bytes);
         }
         reply.encode()
     }
@@ -2579,22 +2718,135 @@ impl<A: EngineAdapter> Provider<A> {
     /// also flips `done`). No-op if the buffer was reaped meanwhile — the consumer re-serves on
     /// the resulting `NotFound`.
     fn stream_append(&self, nonce: [u8; 16], encoded: &[u8]) {
+        if let Some((request_id, bytes)) = self.stream_append_waking(nonce, encoded) {
+            let _ = self.net.respond(request_id, bytes);
+        }
+    }
+
+    /// [`Self::stream_append`], handing back the answer to a poll held for the stream (to be sent),
+    /// which the new frame wakes.
+    fn stream_append_waking(&self, nonce: [u8; 16], encoded: &[u8]) -> Option<(String, Vec<u8>)> {
         let now = now_unix_ms();
         let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         stream_append_in(&mut map, &nonce, encoded, now);
+        let woken = self.held_polls.lock().unwrap_or_else(|e| e.into_inner()).take(&nonce);
+        woken.map(|poll| self.answer_held(&mut map, nonce, poll, now, std::time::Instant::now()))
+    }
+
+    /// Answer a held poll from its stream as it is now, in the held shape (called with the streams
+    /// lock held, as `commit_fetched` needs): what it returns is owed, as for any poll.
+    fn answer_held(
+        &self,
+        map: &mut HashMap<[u8; 16], StreamBuffer>,
+        nonce: [u8; 16],
+        poll: HeldPoll,
+        now: u64,
+        at: std::time::Instant,
+    ) -> (String, Vec<u8>) {
+        let (resp, fetched) = fetch_chunks_billed(map, &nonce, &poll.peer, poll.offset, now);
+        if let Some(fetched) = fetched {
+            self.commit_fetched(nonce, &poll.peer, fetched);
+        }
+        let held = poll.held_ms(at);
+        (poll.request_id, resp.encode_held(held))
+    }
+
+    /// Answer a stream's open or poll from `source_peer` for the frames from `offset`: at once when
+    /// there are any (or the stream is over, gone, or not its), otherwise held for up to `hold_ms`
+    /// ([`MAX_STREAM_HOLD_MS`] at most) until a frame arrives (long-poll). Never blocks the caller.
+    fn hold_stream_poll(&self, request_id: String, source_peer: &str, nonce: [u8; 16], offset: u32, hold_ms: u32) {
+        if let Some((request_id, reply)) = self.hold_or_answer(request_id, source_peer, nonce, offset, hold_ms) {
+            let _ = self.net.respond(request_id, reply);
+        }
+    }
+
+    /// [`Self::hold_stream_poll`], handing back the reply to send now (`None`: the poll is held).
+    fn hold_or_answer(
+        &self,
+        request_id: String,
+        source_peer: &str,
+        nonce: [u8; 16],
+        offset: u32,
+        hold_ms: u32,
+    ) -> Option<(String, Vec<u8>)> {
+        let now = now_unix_ms();
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, b| !stream_expired(b, now));
+        let (resp, fetched) = fetch_chunks_billed(&mut map, &nonce, source_peer, offset, now);
+        if let Some(fetched) = fetched {
+            self.commit_fetched(nonce, source_peer, fetched);
+        }
+        let nothing_yet = matches!(&resp, FetchChunksResponse::Chunks { framed, done: false, .. } if framed.is_empty());
+        let hold_ms = hold_ms.min(MAX_STREAM_HOLD_MS);
+        if !(nothing_yet && hold_ms > 0) {
+            return Some((request_id, resp.encode_held(0)));
+        }
+        let since = std::time::Instant::now();
+        let poll = HeldPoll {
+            request_id,
+            peer: source_peer.to_string(),
+            offset,
+            since,
+            until: since + Duration::from_millis(hold_ms.into()),
+        };
+        let parked = self.held_polls.lock().unwrap_or_else(|e| e.into_inner()).park(nonce, poll);
+        match parked {
+            Park::Parked => None,
+            // Its consumer stopped waiting for the older one: an ordinary empty reply.
+            Park::Replaced(old) => {
+                let empty = FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: old.offset, done: false };
+                Some((old.request_id, empty.encode()))
+            }
+            // Not held: the ordinary reply, so its consumer paces its next poll itself.
+            Park::Full(poll) => Some((poll.request_id, resp.encode())),
+        }
+    }
+
+    /// Answer the held polls whose hold has run out, or whose stream is gone (settled, evicted or
+    /// expired), run every [`HELD_SWEEP_EVERY`].
+    fn answer_due_held_polls(&self) {
+        for (request_id, bytes) in self.due_held_replies(std::time::Instant::now()) {
+            let _ = self.net.respond(request_id, bytes);
+        }
+    }
+
+    /// The replies [`Self::answer_due_held_polls`] sends at `at`.
+    fn due_held_replies(&self, at: std::time::Instant) -> Vec<(String, Vec<u8>)> {
+        if self.held_polls.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return Vec::new();
+        }
+        let now = now_unix_ms();
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        let due = self.held_polls.lock().unwrap_or_else(|e| e.into_inner()).take_due(at, |n| map.contains_key(n));
+        due.into_iter().map(|(nonce, poll)| self.answer_held(&mut map, nonce, poll, now, at)).collect()
+    }
+
+    /// A [`FETCH_CHUNKS`] poll that asks to be held: `nonce(16) ‖ offset(4 BE) ‖ hold_ms(4 BE)`.
+    /// Answered (now or when held) through the network, so it takes a control worker only briefly.
+    fn handle_held_fetch_chunks(&self, request_id: String, source_peer: &str, payload: &[u8]) {
+        let Some((nonce, offset, hold_ms)) = parse_fetch_chunks(payload) else {
+            let _ = self.net.respond(request_id, FetchChunksResponse::NotFound.encode());
+            return;
+        };
+        // A shed poll: "nothing new at your offset", unheld, as for an unheld poll.
+        if self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+            let empty = FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: offset, done: false };
+            let _ = self.net.respond(request_id, empty.encode());
+            return;
+        }
+        self.hold_stream_poll(request_id, source_peer, nonce, offset, hold_ms.unwrap_or(0));
     }
 
     /// Handle a [`FETCH_CHUNKS`] poll: `payload` = `nonce(16) ‖ offset(4, big-endian)`. Returns
     /// the incremental slice from `offset`, pruning the acknowledged prefix. `source_peer` is the
     /// libp2p-authenticated sender; only the committing consumer (`reply_to`) may poll. Fast and
-    /// **non-blocking** — never long-polls; the consumer paces itself.
+    /// **non-blocking**: a poll asking to be held goes to [`Self::handle_held_fetch_chunks`] instead.
     fn handle_fetch_chunks(&self, source_peer: &str, payload: &[u8]) -> Vec<u8> {
-        // Parse `nonce ‖ offset`. A malformed poll → NotFound (the consumer re-serves).
-        if payload.len() != 20 {
+        // Parse `nonce ‖ offset` (a hold asked for is not honoured here: held polls are answered by
+        // `handle_held_fetch_chunks`). A malformed poll → NotFound (the consumer re-serves).
+        let Some((nonce, offset, _)) = parse_fetch_chunks(payload) else {
             return FetchChunksResponse::NotFound.encode();
-        }
-        let nonce: [u8; 16] = payload[0..16].try_into().unwrap();
-        let offset = u32::from_be_bytes(payload[16..20].try_into().unwrap());
+        };
         // E-S8: shed a poll flood, keyed on the authenticated sender. A shed poll returns
         // "no progress at your offset" so an honest consumer simply backs off and re-polls the
         // same offset — it never re-serves or fails over on a transient rate-limit.
@@ -2628,6 +2880,7 @@ impl<A: EngineAdapter> Provider<A> {
         source_peer: String,
         data: Vec<u8>,
         max_concurrency: usize,
+        arrived: std::time::Instant,
     ) {
         // A stream reply is always a `FetchChunksResponse`. A refusal (bad request / AUP / not
         // shared) is delivered as a *complete* stream: an ack carrying the framed `Error` with
@@ -2720,10 +2973,22 @@ impl<A: EngineAdapter> Provider<A> {
         // Create the buffer, then ack immediately (before generating), so the consumer starts
         // polling right away and never races an absent buffer (begin happens before the ack).
         self.stream_begin(nonce, &reply_to, billing);
-        let _ = self.net.respond(
-            request_id,
-            FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: 0, done: false }.encode(),
-        );
+        // A consumer that asked for holds gets its open answered with the first frames (or when
+        // the hold runs out), saving the round trip of a separate first poll; any other gets the
+        // empty ack at once.
+        match req.stream_hold_ms {
+            // Held no later than its consumer still waits for it, counting its time in the queue
+            // (a hold cut to nothing answers at once, in the held shape).
+            Some(hold_ms) if hold_ms > 0 => {
+                self.hold_stream_poll(request_id, &source_peer, nonce, 0, open_hold_ms(hold_ms, arrived.elapsed()))
+            }
+            _ => {
+                let _ = self.net.respond(
+                    request_id,
+                    FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: 0, done: false }.encode(),
+                );
+            }
+        }
         // Generate, appending each frame (deltas, then the terminal Done/Error which flips `done`).
         // F5: `generate_guarded` catches a panic in the adapter/engine and appends a synthetic
         // terminal Error, so a bug can't leave this buffer `done=false` forever (which would stall
@@ -3406,6 +3671,18 @@ impl<A: EngineAdapter> Provider<A> {
             let watcher = Arc::clone(&self);
             std::thread::spawn(move || watcher.watch_policy_file());
         }
+        // Held stream polls whose hold ran out are answered from here (long-poll). Ends with the
+        // provider.
+        {
+            let provider = Arc::downgrade(&self);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(HELD_SWEEP_EVERY);
+                match provider.upgrade() {
+                    Some(p) => p.answer_due_held_polls(),
+                    None => break,
+                }
+            });
+        }
         // When the last *regular* announcement went out (see `reannounce_due`).
         let mut last_announce = std::time::Instant::now();
         // #42: track the network generation. The event loop bumps it whenever it
@@ -3437,12 +3714,24 @@ impl<A: EngineAdapter> Provider<A> {
                             let _ = provider.net.respond(request_id, FetchChunksResponse::Overloaded.encode());
                             return;
                         }
-                        provider.run_stream_job(request_id, src, data, max_concurrency);
+                        provider.run_stream_job(request_id, src, data, max_concurrency, queued);
                     });
                     if !accepted {
                         // A3: pool full → shed at submit. No buffer was created (begin runs inside
                         // the job), so there's no orphan `Generating` stream. The consumer fails
                         // over to another provider on the explicit `Overloaded` ack.
+                        let _ = self.net.respond(shed_id, FetchChunksResponse::Overloaded.encode());
+                    }
+                    continue;
+                }
+                // A poll that asks to be held (long-poll) answers itself, now or when its stream
+                // has something new: on a control worker only for as long as it takes to look.
+                if data.first() == Some(&FETCH_CHUNKS) && data.len() == 1 + 24 {
+                    let provider = Arc::clone(&self);
+                    let shed_id = request_id.clone();
+                    let src = source_peer.clone();
+                    let accepted = control_pool.submit(move || provider.handle_held_fetch_chunks(request_id, &src, &data[1..]));
+                    if !accepted {
                         let _ = self.net.respond(shed_id, FetchChunksResponse::Overloaded.encode());
                     }
                     continue;
@@ -4503,7 +4792,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
         };
         let mut data = vec![SERVE_REQUEST];
         data.extend_from_slice(&req.encode());
@@ -4728,7 +5017,7 @@ mod tests {
         let req = |model: String, domain: Option<String>| ServeRequest {
             reply_to: "c".into(), model_ref: model, messages: vec![],
             max_tokens: Some(16), temperature: None, tools: Vec::new(), think: None, nonce: [5u8; 16],
-            credential: None, deterministic: None, settlement_peg: Some(10), settlement_domain: domain, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: Some(10), settlement_domain: domain, settlement_wallet: None, stream_hold_ms: None,
         };
         let (_dir, provider) = test_provider(StubAdapter);
         let chain = ChainDomain::Solana(SolanaDomain { program_id: [1; 32], cluster: [2; 32] });
@@ -4838,7 +5127,7 @@ mod tests {
         let req = |model: &str| ServeRequest {
             reply_to: "c".into(), model_ref: model.into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
         };
         let refusal = |model: &str, from: &str| {
             provider.scope_refusal(&req(model), &provider.engine_ref_of(model), from).map(|r| match &parse_response(&r).unwrap()[0] {
@@ -5225,7 +5514,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce,
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
         };
 
         // Collect the frames the engine produces (the buffered result), then reveal them into the
@@ -5318,7 +5607,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
         };
         let load = crate::serve::ProviderLoad { in_flight: 1, capacity: 2, decode_tok_s: 40 };
         let calls = std::cell::Cell::new(0);
@@ -5420,7 +5709,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.
@@ -5574,7 +5863,7 @@ mod tests {
             let req = ServeRequest {
                 reply_to: "12D3KooWConsumer".into(), model_ref: model.into(), messages: vec![],
                 max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [nonce; 16],
-                credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+                credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
             };
             let mut data = vec![SERVE_REQUEST];
             data.extend_from_slice(&req.encode());
@@ -5608,7 +5897,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [3u8; 16],
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
         };
         assert!(provider.nonce_refusal(&req, "c").is_none(), "admitted");
         provider.hold_nonce(req.nonce, "c");
@@ -5729,6 +6018,175 @@ mod tests {
         assert!(provider.serve_commitments.lock().unwrap().get(&m).is_none());
     }
 
+    fn held_by(peer: &str, id: &str, offset: u32, until: std::time::Instant) -> HeldPoll {
+        HeldPoll { request_id: id.into(), peer: peer.into(), offset, since: until, until }
+    }
+
+    fn held(id: &str, offset: u32, until: std::time::Instant) -> HeldPoll {
+        held_by("c", id, offset, until)
+    }
+
+    fn nonce_of(i: usize) -> [u8; 16] {
+        let mut n = [0u8; 16];
+        n[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        n
+    }
+
+    /// A held-shape reply, decoded: (frames, next offset, done, held ms).
+    fn read_held(bytes: &[u8]) -> (Vec<u8>, u32, bool, u32) {
+        let held = FetchChunksResponse::held_ms(bytes).expect("held shape");
+        match FetchChunksResponse::decode(bytes) {
+            Ok(FetchChunksResponse::Chunks { framed, next_offset, done }) => (framed, next_offset, done, held),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn held_polls_keep_one_per_stream_and_a_bounded_total() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut h = HeldPolls::default();
+        assert!(matches!(h.park([1; 16], held("a", 0, at(10))), Park::Parked));
+        // A newer poll of the same stream replaces the older, which is handed back to answer now.
+        match h.park([1; 16], held("b", 2, at(20))) {
+            Park::Replaced(old) => assert_eq!((old.request_id.as_str(), old.offset), ("a", 0)),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(h.park([2; 16], held("c", 0, at(30))), Park::Parked));
+        // Only the ones whose hold ran out (or whose stream is gone) are taken.
+        let due = h.take_due(at(20), |_| true);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].0, due[0].1.request_id.as_str()), ([1; 16], "b"));
+        assert_eq!(h.take(&[2; 16]).map(|p| p.request_id), Some("c".into()));
+        assert!(h.is_empty() && h.per_peer.is_empty());
+        // Full: a poll of a new stream is handed back unheld; one already held is still replaced.
+        for i in 0..MAX_HELD_POLLS {
+            assert!(matches!(h.park(nonce_of(i), held_by(&format!("p{}", i % 100), "x", 0, at(1))), Park::Parked));
+        }
+        assert!(matches!(h.park([9; 16], held_by("new", "y", 0, at(1))), Park::Full(p) if p.request_id == "y"));
+        assert!(matches!(h.park(nonce_of(0), held_by("p0", "z", 0, at(1))), Park::Replaced(_)));
+    }
+
+    #[test]
+    fn one_consumer_holds_only_its_share_of_polls() {
+        let t = std::time::Instant::now();
+        let mut h = HeldPolls::default();
+        for i in 0..MAX_HELD_POLLS_PER_PEER {
+            assert!(matches!(h.park(nonce_of(i), held_by("busy", "p", 0, t)), Park::Parked));
+        }
+        // Its next stream's poll is answered at once; another consumer's is still held, and the busy
+        // one can still replace a poll it holds.
+        assert!(matches!(h.park(nonce_of(1000), held_by("busy", "q", 0, t)), Park::Full(_)));
+        assert!(matches!(h.park(nonce_of(1001), held_by("other", "r", 0, t)), Park::Parked));
+        assert!(matches!(h.park(nonce_of(0), held_by("busy", "s", 0, t)), Park::Replaced(_)));
+        // A poll answered frees its place.
+        assert!(h.take(&nonce_of(1)).is_some());
+        assert!(matches!(h.park(nonce_of(1000), held_by("busy", "q", 0, t)), Park::Parked));
+        assert_eq!((h.per_peer["busy"], h.per_peer["other"]), (MAX_HELD_POLLS_PER_PEER, 1));
+    }
+
+    #[test]
+    fn an_open_is_held_no_later_than_its_consumer_still_waits() {
+        assert_eq!(open_hold_ms(10_000, Duration::ZERO), 10_000);
+        assert_eq!(open_hold_ms(10_000, Duration::from_secs(20)), 5_000);
+        assert_eq!(open_hold_ms(10_000, Duration::from_secs(25)), 0);
+        assert_eq!(open_hold_ms(10_000, Duration::from_secs(29)), 0);
+    }
+
+    #[test]
+    fn a_poll_payload_may_carry_a_hold() {
+        let mut p = [3u8; 16].to_vec();
+        p.extend_from_slice(&7u32.to_be_bytes());
+        assert_eq!(parse_fetch_chunks(&p), Some(([3; 16], 7, None)));
+        p.extend_from_slice(&10_000u32.to_be_bytes());
+        assert_eq!(parse_fetch_chunks(&p), Some(([3; 16], 7, Some(10_000))));
+        assert_eq!(parse_fetch_chunks(&p[..23]), None);
+        assert_eq!(parse_fetch_chunks(&[]), None);
+    }
+
+    #[test]
+    fn a_held_poll_waits_for_the_next_frame_and_is_owed_what_it_returns() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let n = [11u8; 16];
+        provider.stream_begin(n, "c", billing(None));
+        let parked = |p: &Provider<StubAdapter>| p.held_polls.lock().unwrap().by_nonce.get(&n).map(|h| h.offset);
+        // Nothing yet: the poll (or the open, at offset 0) is held, and nothing is owed.
+        assert!(provider.hold_or_answer("open".into(), "c", n, 0, 10_000).is_none());
+        assert_eq!(parked(&provider), Some(0));
+        assert!(provider.serve_commitments.lock().unwrap().get(&n).is_none());
+        // The first frame answers it at once, in the held shape, and is owed.
+        let (id, reply) = provider.stream_append_waking(n, &delta("a")).expect("woken");
+        let (framed, next, over, _) = read_held(&reply);
+        assert_eq!((id.as_str(), next, over), ("open", 1, false));
+        assert_eq!(parse_response(&framed).unwrap().len(), 1);
+        assert_eq!(parked(&provider), None);
+        assert_eq!(provider.serve_commitments.lock().unwrap()[&n].tokens, 1);
+        // A frame with nothing held wakes nothing.
+        assert!(provider.stream_append_waking(n, &delta("b")).is_none());
+        // With frames waiting, a poll is answered at once, never held.
+        let (id, reply) = provider.hold_or_answer("p1".into(), "c", n, 1, 10_000).expect("answered");
+        assert_eq!((id.as_str(), read_held(&reply).1, read_held(&reply).3), ("p1", 2, 0));
+        assert_eq!(provider.serve_commitments.lock().unwrap()[&n].tokens, 2);
+        // Someone else's poll of the stream is refused, never held.
+        let (_, reply) = provider.hold_or_answer("p2".into(), "x", n, 2, 10_000).expect("answered");
+        assert!(matches!(FetchChunksResponse::decode(&reply), Ok(FetchChunksResponse::Forbidden)));
+        assert_eq!(parked(&provider), None);
+        // An unknown stream: answered (not found), never held.
+        let (_, reply) = provider.hold_or_answer("p3".into(), "c", [12; 16], 0, 10_000).expect("answered");
+        assert!(matches!(FetchChunksResponse::decode(&reply), Ok(FetchChunksResponse::NotFound)));
+        assert!(provider.held_polls.lock().unwrap().is_empty());
+        // No hold asked: answered at once.
+        assert!(provider.hold_or_answer("p4".into(), "c", n, 2, 0).is_some());
+        // A newer poll replaces a held one, which is answered (plain, empty, at its offset).
+        assert!(provider.hold_or_answer("p5".into(), "c", n, 2, 10_000).is_none());
+        let (id, reply) = provider.hold_or_answer("p6".into(), "c", n, 2, 10_000).expect("the older one answered");
+        assert_eq!(id, "p5");
+        assert!(FetchChunksResponse::held_ms(&reply).is_none());
+        assert!(matches!(FetchChunksResponse::decode(&reply), Ok(FetchChunksResponse::Chunks { next_offset: 2, done: false, ref framed }) if framed.is_empty()));
+        // The terminal frame answers a held poll too, with `done`.
+        let (id, reply) = provider.stream_append_waking(n, &done(3)).expect("woken");
+        assert_eq!((id.as_str(), read_held(&reply).1, read_held(&reply).2), ("p6", 3, true));
+        assert_eq!(provider.serve_commitments.lock().unwrap()[&n].tokens, 3);
+    }
+
+    #[test]
+    fn a_held_poll_is_answered_when_its_hold_runs_out_its_stream_goes_or_is_closed() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let n = [13u8; 16];
+        provider.stream_begin(n, "c", billing(None));
+        // A hold above the provider's longest is cut to it.
+        assert!(provider.hold_or_answer("p".into(), "c", n, 0, u32::MAX).is_none());
+        let (since, until) = {
+            let h = provider.held_polls.lock().unwrap();
+            let p = &h.by_nonce[&n];
+            (p.since, p.until)
+        };
+        assert_eq!(until - since, Duration::from_millis(MAX_STREAM_HOLD_MS.into()));
+        // Not due yet: kept.
+        assert!(provider.due_held_replies(since + Duration::from_secs(1)).is_empty());
+        assert!(!provider.held_polls.lock().unwrap().is_empty());
+        // Due: answered empty at its offset, saying how long it was held.
+        let replies = provider.due_held_replies(until);
+        assert_eq!(replies.len(), 1);
+        let (framed, next, over, held) = read_held(&replies[0].1);
+        assert_eq!((framed.is_empty(), next, over, held), (true, 0, false, MAX_STREAM_HOLD_MS));
+        assert!(provider.held_polls.lock().unwrap().is_empty());
+        // Its stream gone (settled, evicted, expired): answered at the next sweep, not after its hold.
+        assert!(provider.hold_or_answer("g".into(), "c", n, 0, 10_000).is_none());
+        let kept = provider.streams.lock().unwrap().remove(&n).unwrap();
+        let replies = provider.due_held_replies(std::time::Instant::now());
+        assert_eq!(replies.len(), 1);
+        assert!(matches!(FetchChunksResponse::decode(&replies[0].1), Ok(FetchChunksResponse::NotFound)));
+        provider.streams.lock().unwrap().insert(n, kept);
+        // A close answers a poll still held for the stream.
+        assert!(provider.hold_or_answer("q".into(), "c", n, 0, 10_000).is_none());
+        let mut close = n.to_vec();
+        close.extend_from_slice(&0u32.to_be_bytes());
+        let reply = provider.handle_stream_close("c", &close);
+        assert!(matches!(FetchChunksResponse::decode(&reply), Ok(FetchChunksResponse::Chunks { done: true, .. })));
+        assert!(provider.held_polls.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn a_stream_stops_generating_once_its_consumer_stops_polling() {
         /// Streams up to 1,000 fragments, stopping when asked (as every adapter checks `stop`).
@@ -5761,7 +6219,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce,
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None,
         };
         let run = |nonce: [u8; 16]| {
             generate_guarded(req(nonce), &provider.adapter, &mut |c| provider.stream_append(nonce, c), &mut |_| {

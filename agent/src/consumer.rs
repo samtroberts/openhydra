@@ -1428,6 +1428,12 @@ pub fn request_completion(
 /// relay poll traffic without adding much token latency on an active stream.
 const POLL_MIN: Duration = Duration::from_millis(50);
 const POLL_MAX: Duration = Duration::from_millis(750);
+/// How long a provider that holds polls (long-poll) may keep the stream's open and each poll before
+/// answering when it has nothing new. A held poll is answered the moment a frame lands, so a token
+/// reaches the client one network trip after the engine makes it, instead of after the next poll
+/// tick; while nothing comes, one poll per hold replaces a poll every [`POLL_MAX`]. Well inside
+/// [`STREAM_CALL_TIMEOUT`].
+const STREAM_HOLD: Duration = Duration::from_secs(10);
 /// Give up if no new chunk arrives for this much *accumulated idle time* — the "provider wedged"
 /// signal. Reset on every progress, so total generation is unbounded as long as tokens flow.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1958,6 +1964,46 @@ fn provider_error(msg: String, at_admission: bool) -> AdapterError {
 /// The text of a provider's shed reply to a request its full serve pool couldn't take.
 const SHED_REPLY: &str = "provider overloaded, retry";
 
+/// Send a stream poll, sending it again after a transport error (drop-resume: the provider still
+/// holds the un-fetched tail), within the retry budget and the stall clock (`idle`, to which the
+/// waits are added).
+fn fetch_resuming(
+    transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>,
+    sleep: &mut dyn FnMut(Duration),
+    cancel: &dyn Fn() -> bool,
+    poll: &[u8],
+    idle: &mut Duration,
+) -> Result<Vec<u8>, StreamFail> {
+    let mut attempt = 0u32;
+    let mut dropped_for = Duration::ZERO;
+    loop {
+        match transport(poll) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                attempt += 1;
+                let wait = stream_drop_wait(attempt);
+                if dropped_for + wait > STREAM_DROP_BUDGET {
+                    return Err(StreamFail::Error(AdapterError::Network(format!(
+                        "stream poll dropped past retry budget: {}", e.message()
+                    ))));
+                }
+                sleep(wait);
+                dropped_for += wait;
+                *idle += wait;
+                // Its client left while we waited.
+                if cancel() {
+                    return Err(StreamFail::Cancelled);
+                }
+                if *idle >= STREAM_STALL_TIMEOUT {
+                    return Err(StreamFail::Error(AdapterError::Network(
+                        "stream stalled (no progress before deadline)".into(),
+                    )));
+                }
+            }
+        }
+    }
+}
+
 /// Open a stream to a provider and drive the poll loop, delivering each delta to `on_delta`.
 ///
 /// `transport(framed) -> response` is a **single, raw** `proxy_forward` round-trip (no `0x11`
@@ -1994,7 +2040,33 @@ fn request_completion_streaming_with(
     let mut open = Vec::with_capacity(1 + request.messages.len() * 32);
     open.push(SERVE_STREAM);
     open.extend_from_slice(&request.encode());
-    let ack = transport(&open).map_err(StreamFail::Error)?;
+    let hold = request.stream_hold_ms.filter(|ms| *ms > 0).map(|ms| Duration::from_millis(ms.into()));
+    // Accumulated idle time (the stall clock), from the open on.
+    let mut idle = Duration::ZERO;
+    let mut resumed = false;
+    let ack = match transport(&open) {
+        Ok(bytes) => bytes,
+        // An open that asked to be held may have reached the provider, which began the stream and
+        // held the reply for its first frames, and then the reply was lost (the connection dropped,
+        // or our call timed out): ask for the stream from its start instead, as a lost poll is asked
+        // again, and carry on with it if it's there. Until we know, the stream may be open: if we
+        // can't reach the provider, our close finds and pays for whatever it counted, or nothing.
+        Err(e) if hold.is_some() => {
+            progress.opened = true;
+            let mut poll = Vec::with_capacity(1 + 16 + 4);
+            poll.push(FETCH_CHUNKS);
+            poll.extend_from_slice(&request.nonce);
+            poll.extend_from_slice(&0u32.to_be_bytes());
+            tracing::debug!(error = %e.message(), "a held stream open was lost; asking for the stream instead");
+            resumed = true;
+            fetch_resuming(transport, sleep, cancel, &poll, &mut idle)?
+        }
+        Err(e) => return Err(StreamFail::Error(e)),
+    };
+    // A provider that holds polls (long-poll) answers in the held shape, and only to a request that
+    // asked for holds; this stream's polls then ask too. Any other is polled on a timer.
+    let held_open = FetchChunksResponse::held_ms(&ack).is_some();
+    let holds = hold.is_some() && held_open;
     // A reply that doesn't decode as a FetchChunksResponse is a legacy provider's blob → fall back.
     let ack = FetchChunksResponse::decode(&ack).map_err(|_| StreamFail::Legacy)?;
 
@@ -2010,7 +2082,9 @@ fn request_completion_streaming_with(
         FetchChunksResponse::Forbidden => {
             return Err(StreamFail::Error(AdapterError::Network("stream open forbidden".into())))
         }
+        // (Asked for after a lost open: the open never began a stream.)
         FetchChunksResponse::NotFound => {
+            progress.opened = false;
             return Err(StreamFail::Error(AdapterError::Network("stream missing at open".into())))
         }
         // The open ack may already carry frames — e.g. a refusal delivered as a complete
@@ -2020,7 +2094,10 @@ fn request_completion_streaming_with(
             // it partway): a close starts after it, so nothing counted is counted twice.
             *offset_out = next_offset.max(offset);
             progress.opened = !done;
-            if let Some(summary) = dispatch_stream_slice(&framed, tool_calls, true, on_delta)? {
+            // A refusal is always answered at once, unheld; a held open (or the stream asked for
+            // after a lost one) carries what the serve produced, so an error in it came after
+            // admission (B3).
+            if let Some(summary) = dispatch_stream_slice(&framed, tool_calls, !held_open && !resumed, on_delta)? {
                 return Ok(summary);
             }
             offset = next_offset.max(offset);
@@ -2029,7 +2106,6 @@ fn request_completion_streaming_with(
 
     // ── Poll loop ──
     let mut interval = POLL_MIN;
-    let mut idle = Duration::ZERO;
     loop {
         // Its client left: stop reading (the caller closes the stream and pays for what was read).
         if cancel() {
@@ -2041,44 +2117,20 @@ fn request_completion_streaming_with(
                 "stream exceeded max total time".into(),
             )));
         }
-        let mut poll = Vec::with_capacity(1 + 16 + 4);
+        let mut poll = Vec::with_capacity(1 + 16 + 4 + 4);
         poll.push(FETCH_CHUNKS);
         poll.extend_from_slice(&request.nonce);
         poll.extend_from_slice(&offset.to_be_bytes());
+        if let (true, Some(hold)) = (holds, hold) {
+            poll.extend_from_slice(&(hold.as_millis() as u32).to_be_bytes());
+        }
+        let sent = std::time::Instant::now();
 
         // Drop-resume: a transport error re-polls the SAME offset (the provider still holds the
         // un-fetched tail), bounded by the retry budget + the stall clock.
-        let resp = {
-            let mut attempt = 0u32;
-            let mut dropped_for = Duration::ZERO;
-            loop {
-                match transport(&poll) {
-                    Ok(bytes) => break bytes,
-                    Err(e) => {
-                        attempt += 1;
-                        let wait = stream_drop_wait(attempt);
-                        if dropped_for + wait > STREAM_DROP_BUDGET {
-                            return Err(StreamFail::Error(AdapterError::Network(format!(
-                                "stream poll dropped past retry budget: {}", e.message()
-                            ))));
-                        }
-                        sleep(wait);
-                        dropped_for += wait;
-                        idle += wait;
-                        // Its client left while we waited.
-                        if cancel() {
-                            return Err(StreamFail::Cancelled);
-                        }
-                        if idle >= STREAM_STALL_TIMEOUT {
-                            return Err(StreamFail::Error(AdapterError::Network(
-                                "stream stalled (no progress before deadline)".into(),
-                            )));
-                        }
-                    }
-                }
-            }
-        };
+        let resp = fetch_resuming(transport, sleep, cancel, &poll, &mut idle)?;
 
+        let held = FetchChunksResponse::held_ms(&resp).map(|ms| Duration::from_millis(ms.into()));
         match FetchChunksResponse::decode(&resp) {
             Ok(FetchChunksResponse::Chunks { framed, next_offset, done }) => {
                 *offset_out = next_offset.max(offset); // as at the open, before the frames are handled
@@ -2088,19 +2140,34 @@ fn request_completion_streaming_with(
                 }
                 let _ = done; // a true `done` always carries a terminal frame → returned above
                 offset = next_offset.max(offset);
-                if progressed {
+                let pause = if progressed {
                     interval = POLL_MIN;
                     idle = Duration::ZERO;
+                    // Held: ask again at once, but no more often than every POLL_MIN (a nearby
+                    // provider answers each token; its poll limit is per second).
+                    if held.is_some() { POLL_MIN.saturating_sub(sent.elapsed()) } else { interval }
+                } else if let Some(waited) = held.filter(|w| holds && hold.is_some_and(|h| *w >= h / 2)) {
+                    // Held its full hold with nothing new: the wait was the provider's, so ask again
+                    // at once. (A held reply that came back early with nothing is paced below.) The
+                    // stall clock counts the hold as the provider reports it, no longer than we asked,
+                    // and no shorter than it really took.
+                    idle += waited.min(hold.unwrap_or(waited)).max(sent.elapsed());
+                    Duration::ZERO
                 } else {
                     interval = (interval * 2).min(POLL_MAX);
-                    idle += interval;
-                    if idle >= STREAM_STALL_TIMEOUT {
-                        return Err(StreamFail::Error(AdapterError::Network(
-                            "stream stalled (no progress before deadline)".into(),
-                        )));
-                    }
+                    // A held reply that came back early with nothing: the time it was held counts
+                    // too (it may have been held long, saying otherwise).
+                    idle += interval + if held.is_some() { sent.elapsed() } else { Duration::ZERO };
+                    interval
+                };
+                if idle >= STREAM_STALL_TIMEOUT {
+                    return Err(StreamFail::Error(AdapterError::Network(
+                        "stream stalled (no progress before deadline)".into(),
+                    )));
                 }
-                sleep(interval);
+                if !pause.is_zero() {
+                    sleep(pause);
+                }
             }
             // Buffer gone (provider restarted / TTL expired) — the caller re-serves from scratch.
             Ok(FetchChunksResponse::NotFound) => {
@@ -4882,6 +4949,9 @@ impl ConsumerNode {
             settlement_peg: self.settlement_peg,
             settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
             settlement_wallet: self.settlement_wallet(),
+            // Every serve offers to have its open and polls held (long-poll); only the streaming
+            // path uses it, and a provider that doesn't hold ignores it.
+            stream_hold_ms: Some(STREAM_HOLD.as_millis() as u32),
         }
     }
 
@@ -4933,7 +5003,13 @@ impl ConsumerNode {
                     let t = std::time::Instant::now();
                     let r = self.net.proxy_forward_timeout(provider_libp2p.to_string(), framed.to_vec(), STREAM_CALL_TIMEOUT);
                     if proxy_rt.get() == 0 {
-                        proxy_rt.set(t.elapsed().as_nanos() as u64); // first-ack RTT
+                        // First-ack RTT: a held open's reply waited at the provider for the first
+                        // frames, which it says; that wait is the serve's, not the network's.
+                        // No longer than it was asked to hold.
+                        let held = r.as_ref().ok().and_then(|b| FetchChunksResponse::held_ms(b));
+                        let held = held.unwrap_or(0).min(request.stream_hold_ms.unwrap_or(0));
+                        let rt = t.elapsed().saturating_sub(Duration::from_millis(held.into()));
+                        proxy_rt.set(rt.as_nanos().max(1) as u64);
                     }
                     r.map_err(AdapterError::Network)
                 };
@@ -7762,6 +7838,7 @@ mod tests {
             settlement_peg: None,
             settlement_domain: None,
             settlement_wallet: None,
+            stream_hold_ms: None,
         }
     }
 
@@ -8027,6 +8104,221 @@ mod tests {
         assert!(sleeps[1] > sleeps[0], "backs off on idle");
         assert_eq!(sleeps[2], POLL_MIN, "resets to tight after the next progress");
         assert!(sleeps[3] > sleeps[2], "backs off again on idle");
+    }
+
+    fn held_reply(frames: &[Vec<u8>], next_offset: u32, done: bool, held_ms: u32) -> Vec<u8> {
+        FetchChunksResponse::Chunks { framed: crate::serve::frame_response(frames), next_offset, done }.encode_held(held_ms)
+    }
+
+    fn held_request() -> ServeRequest {
+        ServeRequest { stream_hold_ms: Some(STREAM_HOLD.as_millis() as u32), ..request() }
+    }
+
+    #[test]
+    fn a_holding_provider_answers_the_open_with_the_first_frames_and_is_polled_without_a_timer() {
+        let hold = STREAM_HOLD.as_millis() as u32;
+        let script = vec![
+            held_reply(&[ServeChunk::Delta("b".into()).encode()], 2, false, 40), // the next token
+            held_reply(&[], 2, false, hold),                                   // a whole hold, nothing
+            held_reply(&[ServeChunk::Done { tokens: 2, metrics: Default::default() }.encode()], 3, true, 7),
+        ];
+        let mut polls: Vec<Vec<u8>> = Vec::new();
+        let mut idx = 0usize;
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                // The open asked for holds, and is answered with the first token.
+                assert_eq!(ServeRequest::decode(&f[1..]).unwrap().stream_hold_ms, Some(hold));
+                Ok(held_reply(&[ServeChunk::Delta("a".into()).encode()], 1, false, 900))
+            } else {
+                polls.push(f.to_vec());
+                idx += 1;
+                Ok(script[idx - 1].clone())
+            }
+        };
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleeper = |d: Duration| sleeps.push(d);
+        let mut text = String::new();
+        let summary = request_completion_streaming(&mut transport, &mut sleeper, &held_request(), &mut |d| text.push_str(d))
+            .unwrap_or_else(|_| panic!("should complete"));
+        assert_eq!((text.as_str(), summary.tokens), ("ab", 2));
+        // Each poll asks for the hold, from the offset it has read to.
+        assert_eq!(polls.len(), 3);
+        for (p, offset) in polls.iter().zip([1u32, 2, 2]) {
+            assert_eq!(p.len(), 1 + 16 + 4 + 4);
+            assert_eq!(p[17..21], offset.to_be_bytes());
+            assert_eq!(p[21..25], hold.to_be_bytes());
+        }
+        // No timer after a whole empty hold; after a token at most the POLL_MIN spacing.
+        assert!(sleeps.len() <= 1 && sleeps.iter().all(|d| *d <= POLL_MIN), "{sleeps:?}");
+    }
+
+    #[test]
+    fn a_provider_that_does_not_hold_is_polled_on_the_timer_as_before() {
+        // The open asked for holds; an older provider ignores that and answers in the plain shape.
+        let script = vec![
+            chunks_reply(&[], 0, false),
+            chunks_reply(&[ServeChunk::Done { tokens: 1, metrics: Default::default() }.encode()], 1, true),
+        ];
+        let mut polls: Vec<Vec<u8>> = Vec::new();
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                polls.push(f.to_vec());
+                Ok(script[polls.len() - 1].clone())
+            }
+        };
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleeper = |d: Duration| sleeps.push(d);
+        request_completion_streaming(&mut transport, &mut sleeper, &held_request(), &mut |_| {})
+            .unwrap_or_else(|_| panic!("should complete"));
+        assert!(polls.iter().all(|p| p.len() == 1 + 16 + 4), "no hold asked of it");
+        assert_eq!(sleeps, vec![POLL_MIN * 2], "the idle poll backs off on the timer");
+    }
+
+    #[test]
+    fn an_empty_held_reply_that_did_not_wait_is_paced_on_the_timer() {
+        // A held reply that came back at once with nothing (a provider gone wrong) must not have the
+        // consumer ask again at once, over and over.
+        let mut n = 0u32;
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                return Ok(held_reply(&[], 0, false, 0));
+            }
+            n += 1;
+            Ok(if n < 4 { held_reply(&[], 0, false, 0) } else {
+                held_reply(&[ServeChunk::Done { tokens: 0, metrics: Default::default() }.encode()], 1, true, 0)
+            })
+        };
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleeper = |d: Duration| sleeps.push(d);
+        request_completion_streaming(&mut transport, &mut sleeper, &held_request(), &mut |_| {})
+            .unwrap_or_else(|_| panic!("should complete"));
+        assert_eq!(sleeps, vec![POLL_MIN * 2, POLL_MIN * 4, POLL_MIN * 8]);
+    }
+
+    #[test]
+    fn a_stream_held_with_nothing_new_still_stalls_out() {
+        let hold = STREAM_HOLD.as_millis() as u32;
+        let mut polls = 0u32;
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() != Some(&SERVE_STREAM) {
+                polls += 1;
+            }
+            Ok(held_reply(&[], 0, false, hold))
+        };
+        let mut sleeper = |_: Duration| {};
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &held_request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(ref m))) if m.contains("stalled")));
+        assert_eq!(polls, (STREAM_STALL_TIMEOUT.as_millis() / STREAM_HOLD.as_millis()) as u32);
+    }
+
+    #[test]
+    fn an_error_in_a_held_open_came_after_admission() {
+        let shed = || frame_response_of(ServeChunk::Error(SHED_REPLY.into()));
+        // Refused at admission (answered at once, unheld): the provider is overloaded.
+        let mut plain = |_: &[u8]| Ok(chunks_reply_raw(shed(), 1, true));
+        let out = request_completion_streaming(&mut plain, &mut |_| {}, &held_request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Overloaded(_)))));
+        // The same text in a held open is the serve's own failure.
+        let mut held = |_: &[u8]| {
+            Ok(FetchChunksResponse::Chunks { framed: shed(), next_offset: 1, done: true }.encode_held(30))
+        };
+        let out = request_completion_streaming(&mut held, &mut |_| {}, &held_request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Provider(_)))));
+    }
+
+    #[test]
+    fn a_lost_held_open_carries_on_with_the_stream_it_began() {
+        // The open was held, then its reply was lost: the stream is asked for from its start,
+        // unheld, and read to the end; its first frames came after admission.
+        let mut polls: Vec<Vec<u8>> = Vec::new();
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                return Err(AdapterError::Network("connection closed".into()));
+            }
+            polls.push(f.to_vec());
+            Ok(match polls.len() {
+                1 => chunks_reply(&[ServeChunk::Delta("a".into()).encode()], 1, false),
+                _ => chunks_reply(&[ServeChunk::Done { tokens: 2, metrics: Default::default() }.encode()], 2, true),
+            })
+        };
+        let mut progress = StreamProgress::default();
+        let mut text = String::new();
+        let summary = request_completion_streaming_with(
+            &mut transport, &mut |_| {}, &held_request(), &|| false, &mut progress, &mut |d| text.push_str(d),
+        )
+        .unwrap_or_else(|_| panic!("should complete"));
+        assert_eq!((text.as_str(), summary.tokens), ("a", 2));
+        assert!(progress.opened);
+        assert_eq!(polls.len(), 2);
+        assert!(polls.iter().all(|p| p.len() == 1 + 16 + 4), "asked unheld: we don't know it holds");
+        assert_eq!(polls[0][17..21], 0u32.to_be_bytes(), "from the start");
+        assert_eq!(polls[1][17..21], 1u32.to_be_bytes());
+    }
+
+    #[test]
+    fn a_lost_held_open_that_began_nothing_fails_as_unopened() {
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Err(AdapterError::Network("timed out".into()))
+            } else {
+                Ok(FetchChunksResponse::NotFound.encode())
+            }
+        };
+        let mut progress = StreamProgress::default();
+        let out = request_completion_streaming_with(&mut transport, &mut |_| {}, &held_request(), &|| false, &mut progress, &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(_)))));
+        assert!(!progress.opened, "nothing to close or pay for");
+    }
+
+    #[test]
+    fn a_lost_held_open_on_a_dead_connection_is_closed_and_settled_later() {
+        // Nothing gets through: the stream may have begun, so it counts as opened (its close then
+        // finds and pays for whatever the provider counted, or nothing).
+        let mut sends = 0u32;
+        let mut transport = |_: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            sends += 1;
+            Err(AdapterError::Network("unreachable".into()))
+        };
+        let mut progress = StreamProgress::default();
+        let out = request_completion_streaming_with(&mut transport, &mut |_| {}, &held_request(), &|| false, &mut progress, &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(ref m))) if m.contains("retry budget")));
+        assert!(progress.opened);
+        assert!(sends > 2, "asked again within the retry budget");
+    }
+
+    #[test]
+    fn a_lost_open_that_asked_no_hold_fails_at_once_as_before() {
+        let mut sends = 0u32;
+        let mut transport = |_: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            sends += 1;
+            Err(AdapterError::Network("unreachable".into()))
+        };
+        let mut progress = StreamProgress::default();
+        let out = request_completion_streaming_with(&mut transport, &mut |_| {}, &request(), &|| false, &mut progress, &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(_))));
+        assert_eq!((sends, progress.opened), (1, false));
+    }
+
+    #[test]
+    fn a_hold_reported_longer_than_asked_counts_as_the_hold_asked() {
+        // A provider claiming each empty reply was held far longer than asked stalls out no sooner
+        // than an honest one.
+        let mut polls = 0u32;
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() != Some(&SERVE_STREAM) {
+                polls += 1;
+            }
+            Ok(held_reply(&[], 0, false, u32::MAX))
+        };
+        let out = request_completion_streaming(&mut transport, &mut |_| {}, &held_request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(ref m))) if m.contains("stalled")));
+        assert_eq!(polls, (STREAM_STALL_TIMEOUT.as_millis() / STREAM_HOLD.as_millis()) as u32);
+    }
+
+    fn frame_response_of(chunk: ServeChunk) -> Vec<u8> {
+        crate::serve::frame_response(&[chunk.encode()])
     }
 
     #[test]

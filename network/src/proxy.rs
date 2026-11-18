@@ -111,10 +111,18 @@ impl Codec for GrpcProxyCodec {
     }
 }
 
+/// Requests open at once on one connection, both directions together (libp2p's default is 100).
+/// A provider holds a streaming consumer's polls open for up to 15 s each (long-poll), one per
+/// stream, and a busy gateway–provider pair runs many streams on one connection: past the limit
+/// new opens, polls, closes and receipts on it would fail. Each open request costs one yamux
+/// substream, whose buffers grow only with data in flight.
+pub const MAX_CONCURRENT_STREAMS: usize = 256;
+
 pub fn proxy_behaviour() -> request_response::Behaviour<GrpcProxyCodec> {
-    let mut config = request_response::Config::default();
     // Increase timeout for model inference — CPU inference can take 10-30s.
-    config.set_request_timeout(std::time::Duration::from_secs(120));
+    let config = request_response::Config::default()
+        .with_request_timeout(std::time::Duration::from_secs(120))
+        .with_max_concurrent_streams(MAX_CONCURRENT_STREAMS);
     request_response::Behaviour::new(
         [(PROXY_PROTOCOL, ProtocolSupport::Full)],
         config,
