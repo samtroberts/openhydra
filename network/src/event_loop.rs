@@ -689,6 +689,10 @@ struct LoopState {
     /// When each `known_peers` entry was last received here (local clock): what the cache cap
     /// evicts by, since a record's own signed time isn't set by every node (round 9 C9-1).
     known_received: HashMap<String, u64>,
+    /// When we lost our last connection to each peer whose provider records we hold (local clock,
+    /// ms). Its records stay for [`LOST_PEER_GRACE_MS`] in case the connection comes back, as a
+    /// dropped one usually does at once (#30); cleared when it does.
+    lost_at_ms: HashMap<PeerId, u64>,
     /// This node's libp2p id: its own records are never evicted from `known_peers`.
     local_libp2p: String,
     /// C11: model_id → (unix_ms of our last *completed* discover, net_generation then). A
@@ -739,6 +743,12 @@ struct LoopState {
     relay_addrs: Vec<Multiaddr>,
     /// Pending proxy forward requests: request_id → reply channel.
     pending_proxy: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Proxy requests sent and not yet answered (or failed), per peer, and each one's peer: at most
+    /// [`MAX_PROXY_INFLIGHT_PER_PEER`] go out at once (#31).
+    proxy_inflight: HashMap<PeerId, usize>,
+    proxy_request_peer: HashMap<request_response::OutboundRequestId, PeerId>,
+    /// Proxy requests waiting for one of their peer's in-flight requests to finish, oldest first.
+    proxy_waiting: HashMap<PeerId, std::collections::VecDeque<WaitingProxy>>,
     /// C7: pending registry queries: outbound request_id → reply channel. The reply is completed
     /// when the bootstrap's `RegistryReply` (or an outbound failure) arrives.
     pending_registry: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>>,
@@ -1019,10 +1029,29 @@ pub const MODEL_WITHDRAWN_MAX_AGE_SECS: u64 = 120;
 /// matching the 300 s DHT record TTL; a provider that stops (re)announcing then
 /// ages out, while a live one is kept refreshed by each gossip.
 const KNOWN_PEER_TTL_MS: u64 = 300_000;
-/// Whether the reaper keeps a provider record: while we're connected to the provider, or for
-/// [`KNOWN_PEER_TTL_MS`] after we last received the record.
-fn keep_known_peer(connected: bool, received_at_ms: Option<u64>, now_ms: u64) -> bool {
-    connected || received_at_ms.is_some_and(|at| now_ms.saturating_sub(at) < KNOWN_PEER_TTL_MS)
+/// How long a provider's records outlive our last connection to it (#30). A connection that drops
+/// is usually back within seconds (the next request or a redial reopens it), and the provider with
+/// it; deleting its records at once left a gateway answering "no provider" until the provider's
+/// next announcement, up to two minutes later. A provider that really left goes after this (a
+/// departure notice removes it at once), checked every [`REAPER_EVERY`].
+const LOST_PEER_GRACE_MS: u64 = 30_000;
+/// How often the reaper runs.
+const REAPER_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether the reaper keeps a provider record: while we're connected to the provider; not once we
+/// lost our connection to it [`LOST_PEER_GRACE_MS`] ago with no record from it since; otherwise
+/// for [`KNOWN_PEER_TTL_MS`] after we last received the record.
+fn keep_known_peer(connected: bool, received_at_ms: Option<u64>, lost_at_ms: Option<u64>, now_ms: u64) -> bool {
+    if connected {
+        return true;
+    }
+    if let Some(lost) = lost_at_ms {
+        let heard_since = received_at_ms.is_some_and(|at| at > lost);
+        if !heard_since && now_ms.saturating_sub(lost) >= LOST_PEER_GRACE_MS {
+            return false;
+        }
+    }
+    received_at_ms.is_some_and(|at| now_ms.saturating_sub(at) < KNOWN_PEER_TTL_MS)
 }
 
 /// How far in the future a provider record's signed time may be (clock skew) before it is refused,
@@ -1273,6 +1302,7 @@ impl LoopState {
             gone_providers: HashMap::new(),
             model_seen: HashMap::new(),
             known_received: HashMap::new(),
+            lost_at_ms: HashMap::new(),
             local_libp2p: String::new(),
             discover_cache: HashMap::new(),
             discover_wait_for_lookup: HashMap::new(),
@@ -1287,6 +1317,9 @@ impl LoopState {
             kad_server_mode: false, // nodes start as Kad clients (R-DHT-2)
             relay_addrs: Vec::new(),
             pending_proxy: HashMap::new(),
+            proxy_inflight: HashMap::new(),
+            proxy_request_peer: HashMap::new(),
+            proxy_waiting: HashMap::new(),
             pending_registry: HashMap::new(),
             local_grpc_port: 50051,
             inbound_proxy_channels: HashMap::new(),
@@ -1497,7 +1530,7 @@ pub async fn run_event_loop(
 
     // Phase 1.4: Periodic known_peers reaper — safety net that catches
     // ghosts missed by individual eviction paths (1.1, 1.2, 1.3, 1.6, 1.7).
-    let mut reaper_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut reaper_interval = tokio::time::interval(REAPER_EVERY);
     reaper_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // C-N1: grace-window sweep — closes a peer's relay connection(s) once its
@@ -2091,6 +2124,7 @@ pub async fn run_event_loop(
                 let before = state.known_peers.len();
                 let now_ms = now_unix_ms();
                 let received = &state.known_received;
+                let lost = &state.lost_at_ms;
                 state.known_peers.retain(|key, record| {
                     if record.libp2p_peer_id.is_empty() {
                         return true; // keep records without libp2p binding
@@ -2107,7 +2141,12 @@ pub async fn run_event_loop(
                         // consumer with no connection to a provider lost it a minute after
                         // hearing of it (GPU test 2026-10-29), and a clock that's off mustn't
                         // decide it either.
-                        Ok(pid) => keep_known_peer(swarm.is_connected(&pid), received.get(key).copied(), now_ms),
+                        Ok(pid) => keep_known_peer(
+                            swarm.is_connected(&pid),
+                            received.get(key).copied(),
+                            lost.get(&pid).copied(),
+                            now_ms,
+                        ),
                         Err(_) => false, // unparseable peer_id = stale
                     }
                 });
@@ -2116,6 +2155,13 @@ pub async fn run_event_loop(
                 // Entries whose record went elsewhere (disconnect purge, departures, withdrawals).
                 let known = &state.known_peers;
                 state.known_received.retain(|k, _| known.contains_key(k));
+                // Lost peers past their grace have been dealt with above.
+                state.lost_at_ms.retain(|_, at| now_ms.saturating_sub(*at) < LOST_PEER_GRACE_MS);
+                // Proxy requests whose callers gave up while waiting for a slot (#31).
+                state.proxy_waiting.retain(|_, q| {
+                    q.retain(|(_, reply)| !reply.as_ref().is_some_and(|r| r.is_closed()));
+                    !q.is_empty()
+                });
                 let removed = before - state.known_peers.len();
                 if removed > 0 {
                     info!(removed, remaining = state.known_peers.len(), "known_peers reaper sweep");
@@ -4329,6 +4375,8 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
             state.relay_dial_backoff.remove(&peer_id);
+            // Back within the grace: its provider records stay (#30).
+            state.lost_at_ms.remove(&peer_id);
             state.lan_dialer.established(&connection_id, std::time::Instant::now());
             if endpoint.is_relayed() {
                 state.relayed_conns.insert(connection_id, peer_id);
@@ -4498,15 +4546,11 @@ fn handle_swarm_event(
             // Send any queued proxy forwards that were waiting for this connection.
             let mut flushed_for_peer = false;
             let mut remaining = Vec::new();
-            for (target, data, reply, enqueued_at) in state.pending_relay_forwards.drain(..) {
+            for (target, data, reply, enqueued_at) in std::mem::take(&mut state.pending_relay_forwards) {
                 if target == peer_id {
                     info!(%peer_id, "sending queued proxy forward after relay connection");
                     flushed_for_peer = true;
-                    let req_id = swarm
-                        .behaviour_mut()
-                        .grpc_proxy
-                        .send_request(&peer_id, ProxyRequest(data));
-                    state.pending_proxy.insert(req_id, reply);
+                    send_proxy_request(swarm, state, peer_id, data, Some(reply));
                 } else {
                     remaining.push((target, data, reply, enqueued_at));
                 }
@@ -4611,14 +4655,14 @@ fn handle_swarm_event(
                 swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
                 debug!(%peer_id, "evicted from kademlia routing table");
 
-                // Ghost-peer purge: known_peers cache
+                // Its provider records outlive the connection for LOST_PEER_GRACE_MS (#30): a dropped
+                // connection is usually back within seconds, and deleting them at once left us
+                // answering "no provider" until the provider's next announcement. The reaper
+                // deletes them once the grace runs out with no connection and no record since.
                 let libp2p_id_str = peer_id.to_string();
-                let before = state.known_peers.len();
-                state.known_peers.retain(|_openhydra_id, record| {
-                    record.libp2p_peer_id != libp2p_id_str
-                });
-                if state.known_peers.len() < before {
-                    info!(%peer_id, "evicted from known_peers cache on disconnect");
+                if state.known_peers.values().any(|record| record.libp2p_peer_id == libp2p_id_str) {
+                    state.lost_at_ms.insert(peer_id, now_unix_ms());
+                    debug!(%peer_id, "lost our last connection to a provider; its records stay for the grace period");
                 }
 
                 // E-N3: prune the remaining per-peer maps that keyed off this
@@ -6010,6 +6054,83 @@ fn extract_ip_from_multiaddr_str(addr_str: &str) -> Option<String> {
 
 // ── gRPC proxy event handling ─────────────────────────────────────────
 
+/// Most proxy requests out to one peer at once (#31). A connection carries at most
+/// [`crate::proxy::MAX_CONCURRENT_STREAMS`] requests both ways together, and past it libp2p fails
+/// the request ("max sub-streams reached"); held stream polls (long-poll) and queued opens each
+/// keep one open for seconds. Below that, leaving room for the peer's requests to us; more wait
+/// here for one to finish.
+const MAX_PROXY_INFLIGHT_PER_PEER: usize = crate::proxy::MAX_CONCURRENT_STREAMS * 3 / 4;
+/// Most proxy requests waiting for one peer; past it a request fails at once.
+const MAX_PROXY_WAITING_PER_PEER: usize = 1024;
+
+/// A proxy request waiting for a free slot to its peer: the bytes, and where its reply goes
+/// (`None`: fire-and-forget).
+type WaitingProxy = (Vec<u8>, Option<oneshot::Sender<Result<Vec<u8>, String>>>);
+
+/// libp2p's error for a request refused because its connection already carries as many as it may.
+fn is_local_stream_limit(e: &std::io::Error) -> bool {
+    e.to_string().contains("max sub-streams reached")
+}
+
+/// Send a proxy request to `peer` now, or queue it until one of the peer's in-flight requests
+/// finishes when [`MAX_PROXY_INFLIGHT_PER_PEER`] are out (#31).
+fn send_proxy_request(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    peer: PeerId,
+    data: Vec<u8>,
+    reply: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
+) {
+    if state.proxy_inflight.get(&peer).copied().unwrap_or(0) >= MAX_PROXY_INFLIGHT_PER_PEER {
+        let waiting = state.proxy_waiting.entry(peer).or_default();
+        if waiting.len() >= MAX_PROXY_WAITING_PER_PEER {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err("proxy_forward: too many requests waiting for this peer".into()));
+            }
+            return;
+        }
+        debug!(%peer, waiting = waiting.len() + 1, "proxy request waits for a free slot to its peer");
+        waiting.push_back((data, reply));
+        return;
+    }
+    let req_id = swarm.behaviour_mut().grpc_proxy.send_request(&peer, ProxyRequest(data));
+    *state.proxy_inflight.entry(peer).or_default() += 1;
+    state.proxy_request_peer.insert(req_id, peer);
+    if let Some(reply) = reply {
+        state.pending_proxy.insert(req_id, reply);
+    }
+}
+
+/// A proxy request was answered or failed: its peer has a slot free, which the oldest request
+/// still wanted takes (one whose caller has given up is dropped, not sent).
+fn proxy_request_finished(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    request_id: request_response::OutboundRequestId,
+) {
+    let Some(peer) = state.proxy_request_peer.remove(&request_id) else { return };
+    if let Some(n) = state.proxy_inflight.get_mut(&peer) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            state.proxy_inflight.remove(&peer);
+        }
+    }
+    while state.proxy_inflight.get(&peer).copied().unwrap_or(0) < MAX_PROXY_INFLIGHT_PER_PEER {
+        let Some(waiting) = state.proxy_waiting.get_mut(&peer) else { break };
+        let Some((data, reply)) = waiting.pop_front() else {
+            state.proxy_waiting.remove(&peer);
+            break;
+        };
+        if waiting.is_empty() {
+            state.proxy_waiting.remove(&peer);
+        }
+        if reply.as_ref().is_some_and(|r| r.is_closed()) {
+            continue;
+        }
+        send_proxy_request(swarm, state, peer, data, reply);
+    }
+}
+
 fn handle_grpc_proxy_event(
     event: request_response::Event<ProxyRequest, ProxyResponse>,
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
@@ -6059,6 +6180,7 @@ fn handle_grpc_proxy_event(
                     state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone(), rid));
                 }
                 request_response::Message::Response { request_id, response } => {
+                    proxy_request_finished(swarm, state, request_id);
                     if let Some(reply) = state.pending_proxy.remove(&request_id) {
                         // Outbound response received — deliver to waiting proxy forward.
                         // #zombie: a successful round-trip proves the current path is
@@ -6071,6 +6193,7 @@ fn handle_grpc_proxy_event(
         }
         request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
             warn!(%peer, ?error, "proxy outbound failure");
+            proxy_request_finished(swarm, state, request_id);
             if let Some(reply) = state.pending_proxy.remove(&request_id) {
                 let _ = reply.send(Err(format!("proxy outbound: {error:?}")));
             }
@@ -6082,13 +6205,15 @@ fn handle_grpc_proxy_event(
             // peer and redial fresh relay circuits so the NEXT dispatch rides a
             // live path (the roamed peer's new reservation is reachable — its
             // re-announced record was never the problem, our stale conns were).
-            let dead_path = matches!(
-                error,
+            let dead_path = match &error {
                 request_response::OutboundFailure::Timeout
-                    | request_response::OutboundFailure::ConnectionClosed
-                    | request_response::OutboundFailure::DialFailure
-                    | request_response::OutboundFailure::Io(_)
-            );
+                | request_response::OutboundFailure::ConnectionClosed
+                | request_response::OutboundFailure::DialFailure => true,
+                // The connection's own limit on requests at once says nothing about the path
+                // (#31): counting it closed a busy gateway's connections to a healthy provider.
+                request_response::OutboundFailure::Io(e) => !is_local_stream_limit(e),
+                _ => false,
+            };
             if record_proxy_failure(&mut state.proxy_failure_streak, peer, dead_path) {
                 warn!(%peer, threshold = ZOMBIE_FAILURE_THRESHOLD,
                     "zombie_evict: consecutive proxy path failures — closing presumed-dead connections and redialing via relay");
@@ -6180,11 +6305,7 @@ fn handle_proxy_forward(
         // path before the eviction threshold trips.
         let failure_streak = state.proxy_failure_streak.get(&peer_id).copied().unwrap_or(0);
         info!(%peer_id, path, direct_conns, relay_conns, failure_streak, bytes = data.len(), "proxy_forward dispatch");
-        let req_id = swarm
-            .behaviour_mut()
-            .grpc_proxy
-            .send_request(&peer_id, ProxyRequest(data));
-        state.pending_proxy.insert(req_id, reply);
+        send_proxy_request(swarm, state, peer_id, data, Some(reply));
         // A4: the provider dials us back over IPv6 once it accepts this request; punching toward
         // it now too means both ends' firewalls see outbound packets at the same time, which is
         // what a hole punch through two stateful firewalls needs (its rounds were one-sided).
@@ -6453,10 +6574,7 @@ fn handle_proxy_forward_no_wait(
     // Fire-and-forget over request_response.
     if swarm.is_connected(&peer_id) {
         debug!(%peer_id, %transport, bytes = data.len(), "proxy_forward_no_wait via request_response");
-        let _req_id = swarm
-            .behaviour_mut()
-            .grpc_proxy
-            .send_request(&peer_id, ProxyRequest(data));
+        send_proxy_request(swarm, state, peer_id, data, None);
     } else {
         info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing it");
         // Finding A: one multi-address dial across all relay circuits (see
@@ -7296,11 +7414,37 @@ mod tests {
     #[test]
     fn reaper_keeps_a_gossip_learned_provider_for_its_ttl() {
         let now = 10_000_000;
-        assert!(keep_known_peer(false, Some(now - 60_000), now), "heard a minute ago, never connected");
-        assert!(keep_known_peer(false, Some(now - KNOWN_PEER_TTL_MS + 1), now));
-        assert!(!keep_known_peer(false, Some(now - KNOWN_PEER_TTL_MS), now), "not heard of for the whole TTL");
-        assert!(!keep_known_peer(false, None, now));
-        assert!(keep_known_peer(true, None, now), "connected");
+        assert!(keep_known_peer(false, Some(now - 60_000), None, now), "heard a minute ago, never connected");
+        assert!(keep_known_peer(false, Some(now - KNOWN_PEER_TTL_MS + 1), None, now));
+        assert!(!keep_known_peer(false, Some(now - KNOWN_PEER_TTL_MS), None, now), "not heard of for the whole TTL");
+        assert!(!keep_known_peer(false, None, None, now));
+        assert!(keep_known_peer(true, None, None, now), "connected");
+    }
+
+    /// #30 (18 Nov): a cut connection to a provider deleted its records at once, so a gateway that
+    /// reconnected within seconds still answered "no provider" until the next announcement.
+    #[test]
+    fn a_provider_outlives_a_lost_connection_for_the_grace_only() {
+        let now = 10_000_000;
+        let heard = Some(now - 50_000);
+        // Lost moments ago: kept, connected again or not.
+        assert!(keep_known_peer(false, heard, Some(now - 5_000), now));
+        assert!(keep_known_peer(true, heard, Some(now - 5_000), now));
+        // Lost for the whole grace with no record since: gone, though the record is still fresh.
+        assert!(!keep_known_peer(false, heard, Some(now - LOST_PEER_GRACE_MS), now));
+        // ...unless we're connected again, or heard from it after losing the connection.
+        assert!(keep_known_peer(true, heard, Some(now - LOST_PEER_GRACE_MS), now));
+        assert!(keep_known_peer(false, Some(now - 1_000), Some(now - LOST_PEER_GRACE_MS), now));
+    }
+
+    /// #31 (18 Nov): libp2p's "max sub-streams reached" is the connection's own limit, not a dead
+    /// path; counting it closed a busy gateway's connections to a healthy provider.
+    #[test]
+    fn the_connections_own_request_limit_is_not_a_dead_path() {
+        let limit = std::io::Error::new(std::io::ErrorKind::Other, "max sub-streams reached");
+        assert!(is_local_stream_limit(&limit));
+        assert!(!is_local_stream_limit(&std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe")));
+        assert!(MAX_PROXY_INFLIGHT_PER_PEER < crate::proxy::MAX_CONCURRENT_STREAMS);
     }
 
     /// Review 2026-10-30: a replayed or re-forwarded copy of a provider's last record must neither
