@@ -136,6 +136,9 @@ where
     shutdown: Shutdown,
     /// The substream upgrade protocol override, if any.
     substream_upgrade_protocol_override: Option<upgrade::Version>,
+    /// OpenHydra patch: the lazily negotiable protocols this connection's peer has accepted in a
+    /// full (`V1`) negotiation; only these are then negotiated lazily on it.
+    lazy_proven: LazyProven,
     /// The maximum number of inbound streams concurrently negotiating on a
     /// connection. New inbound streams exceeding the limit are dropped and thus
     /// reset.
@@ -208,6 +211,7 @@ where
             negotiating_out: Default::default(),
             shutdown: Shutdown::None,
             substream_upgrade_protocol_override,
+            lazy_proven: Default::default(),
             max_negotiating_inbound_streams,
             requested_substreams: Default::default(),
             local_supported_protocols: initial_protocols,
@@ -258,6 +262,7 @@ where
             shutdown,
             max_negotiating_inbound_streams,
             substream_upgrade_protocol_override,
+            lazy_proven,
             local_supported_protocols: supported_protocols,
             remote_supported_protocols,
             protocol_buffer,
@@ -416,6 +421,7 @@ where
                             timeout,
                             upgrade,
                             *substream_upgrade_protocol_override,
+                            lazy_proven.clone(),
                             stream_counter.clone(),
                         ));
 
@@ -538,8 +544,26 @@ struct StreamUpgrade<UserData, TOk, TErr> {
 /// peer that doesn't speak one is still told apart from one that fails.
 pub const LAZY_PROTOCOL_PREFIXES: [&str; 2] = ["/openhydra/tensor/", "/openhydra/registry/"];
 
-/// Whether an outbound stream proposing `protocols` negotiates lazily: only when it proposes exactly
-/// one, and that one is OpenHydra's (lazy negotiation settles on the last protocol proposed).
+/// OpenHydra patch: a connection's protocols proven in a full negotiation (see `lazy_proven`),
+/// shared with its outbound negotiations.
+#[derive(Clone, Default)]
+struct LazyProven(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl LazyProven {
+    fn contains(&self, protocol: &str) -> bool {
+        self.0.lock().map(|v| v.iter().any(|p| p == protocol)).unwrap_or(false)
+    }
+    fn insert(&self, protocol: String) {
+        if let Ok(mut v) = self.0.lock() {
+            if !v.contains(&protocol) {
+                v.push(protocol);
+            }
+        }
+    }
+}
+
+/// Whether an outbound stream proposing `protocols` may negotiate lazily: only when it proposes
+/// exactly one, and that one is OpenHydra's (lazy negotiation settles on the last protocol proposed).
 fn lazy_protocols<P: AsRef<str>>(protocols: &[P]) -> bool {
     matches!(protocols, [p] if LAZY_PROTOCOL_PREFIXES.iter().any(|x| p.as_ref().starts_with(x)))
 }
@@ -566,6 +590,7 @@ impl<UserData, TOk, TErr> StreamUpgrade<UserData, TOk, TErr> {
         timeout: Delay,
         upgrade: Upgrade,
         version_override: Option<upgrade::Version>,
+        lazy_proven: LazyProven,
         counter: ActiveStreamCounter,
     ) -> Self
     where
@@ -585,12 +610,14 @@ impl<UserData, TOk, TErr> StreamUpgrade<UserData, TOk, TErr> {
         };
         let protocols: Vec<_> = upgrade.protocol_info().into_iter().collect();
         // OpenHydra patch: its own request protocols negotiate lazily (the request is sent with the
-        // protocol proposal instead of after its echo), one round trip less per request.
-        let effective_version = if lazy_protocols(&protocols) {
-            upgrade::Version::V1Lazy
-        } else {
-            effective_version
-        };
+        // protocol proposal instead of after its echo), one round trip less per request, once this
+        // connection's peer has accepted the protocol in a full negotiation. The first stream of
+        // each still negotiates fully, so a peer that doesn't speak it is reported as such, and a
+        // peer that never answers is caught by the upgrade timeout (review, 18 Nov).
+        let eligible = lazy_protocols(&protocols).then(|| protocols[0].as_ref().to_string());
+        let proven = eligible.as_ref().is_some_and(|p| lazy_proven.contains(p));
+        let effective_version = if proven { upgrade::Version::V1Lazy } else { effective_version };
+        let prove = eligible.filter(|_| !proven && effective_version == upgrade::Version::V1);
 
         Self {
             user_data: Some(user_data),
@@ -603,6 +630,9 @@ impl<UserData, TOk, TErr> StreamUpgrade<UserData, TOk, TErr> {
                 )
                 .await
                 .map_err(to_stream_upgrade_error)?;
+                if let Some(p) = prove {
+                    lazy_proven.insert(p);
+                }
 
                 let output = upgrade
                     .upgrade_outbound(Stream::new(stream, counter), info)

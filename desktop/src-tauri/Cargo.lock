@@ -3763,8 +3763,6 @@ dependencies = [
 [[package]]
 name = "libp2p-swarm"
 version = "0.45.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7dd6741793d2c1fb2088f67f82cf07261f25272ebe3c0b0c311e0c6b50e851a"
 dependencies = [
  "either",
  "fnv",

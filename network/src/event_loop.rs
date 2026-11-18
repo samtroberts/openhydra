@@ -3258,6 +3258,8 @@ fn peer_busy(state: &LoopState, peer: PeerId, pending_outbound: impl Fn(&request
         || state.responses_writing.values().any(|(p, _)| *p == peer)
         || state.pending_relay_forwards.iter().any(|(p, ..)| *p == peer)
         || state.pending_proxy.keys().any(|id| pending_outbound(id))
+        || state.proxy_inflight.contains_key(&peer)
+        || state.proxy_waiting.contains_key(&peer)
 }
 
 /// Count a failed ping on `connection`; true when it should be closed: a relayed connection that
@@ -6072,6 +6074,32 @@ fn is_local_stream_limit(e: &std::io::Error) -> bool {
     e.to_string().contains("max sub-streams reached")
 }
 
+/// multistream-select's error for a peer that refused the protocol: with lazy negotiation (the
+/// patched swarm, for OpenHydra's request protocols) it arrives as an I/O error once the reply is
+/// read, not as `UnsupportedProtocols`.
+fn is_negotiation_refusal(e: &std::io::Error) -> bool {
+    e.to_string().contains("Protocol negotiation failed")
+}
+
+/// Marks a proxy failure whose request never reached the peer's application, so the caller knows
+/// nothing was started there (the consumer then neither resumes nor closes a stream).
+pub const NEVER_SENT: &str = "(request never sent)";
+
+/// The error text a failed proxy request is answered with: its failure, marked [`NEVER_SENT`] when
+/// the request can't have reached the peer's application.
+fn proxy_failure_text(error: &request_response::OutboundFailure) -> String {
+    let never_sent = match error {
+        request_response::OutboundFailure::DialFailure | request_response::OutboundFailure::UnsupportedProtocols => true,
+        request_response::OutboundFailure::Io(e) => is_local_stream_limit(e) || is_negotiation_refusal(e),
+        _ => false,
+    };
+    if never_sent {
+        format!("proxy outbound: {error:?} {NEVER_SENT}")
+    } else {
+        format!("proxy outbound: {error:?}")
+    }
+}
+
 /// Send a proxy request to `peer` now, or queue it until one of the peer's in-flight requests
 /// finishes when [`MAX_PROXY_INFLIGHT_PER_PEER`] are out (#31).
 fn send_proxy_request(
@@ -6081,7 +6109,7 @@ fn send_proxy_request(
     data: Vec<u8>,
     reply: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
 ) {
-    if state.proxy_inflight.get(&peer).copied().unwrap_or(0) >= MAX_PROXY_INFLIGHT_PER_PEER {
+    if state.proxy_inflight.get(&peer).copied().unwrap_or(0) >= proxy_slots(state, peer) {
         let waiting = state.proxy_waiting.entry(peer).or_default();
         if waiting.len() >= MAX_PROXY_WAITING_PER_PEER {
             if let Some(reply) = reply {
@@ -6101,12 +6129,25 @@ fn send_proxy_request(
     }
 }
 
+/// How many proxy requests may be out to `peer` at once: [`MAX_PROXY_INFLIGHT_PER_PEER`], less any
+/// room the peer's own requests to us are taking on the shared per-connection limit.
+fn proxy_slots(state: &LoopState, peer: PeerId) -> usize {
+    let inbound = state.inbound_proxy_channels.values().filter(|(_, _, p, _)| *p == peer).count();
+    MAX_PROXY_INFLIGHT_PER_PEER.min(crate::proxy::MAX_CONCURRENT_STREAMS.saturating_sub(inbound + 1)).max(1)
+}
+
 /// A proxy request was answered or failed: its peer has a slot free, which the oldest request
-/// still wanted takes (one whose caller has given up is dropped, not sent).
+/// still wanted takes (one whose caller has given up is dropped, not sent). Only when `usable`
+/// (the peer is connected and that connection isn't being closed): otherwise every request still
+/// waiting for the peer takes the reconnect path instead (one dial, queued for the connection it
+/// opens), rather than each going out on a connection that is gone and failing at once (#31
+/// review: a dropped connection drained the whole queue as dial failures).
 fn proxy_request_finished(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
+    proxy_queue: &SharedProxyQueue,
     request_id: request_response::OutboundRequestId,
+    usable: bool,
 ) {
     let Some(peer) = state.proxy_request_peer.remove(&request_id) else { return };
     if let Some(n) = state.proxy_inflight.get_mut(&peer) {
@@ -6115,7 +6156,27 @@ fn proxy_request_finished(
             state.proxy_inflight.remove(&peer);
         }
     }
-    while state.proxy_inflight.get(&peer).copied().unwrap_or(0) < MAX_PROXY_INFLIGHT_PER_PEER {
+    if !usable {
+        let Some(waiting) = state.proxy_waiting.remove(&peer) else { return };
+        // A connection still up is being closed (zombie eviction, which also dials the peer again),
+        // and a dial already under way will bring a connection: either way queue for that one.
+        let mut dialing = swarm.is_connected(&peer)
+            || state.dials_in_flight.get(&peer).is_some_and(|d| !d.is_empty());
+        for (data, reply) in waiting {
+            let Some(reply) = reply.filter(|r| !r.is_closed()) else { continue };
+            if !dialing {
+                // The first one dials (or fails as a dial would, in back-off) and queues itself.
+                handle_proxy_forward(swarm, &peer.to_string(), data, reply, state, proxy_queue);
+                dialing = state.pending_relay_forwards.iter().any(|(p, ..)| *p == peer);
+            } else if state.pending_relay_forwards.len() >= MAX_PENDING_RELAY_FORWARDS {
+                let _ = reply.send(Err("proxy_forward: relay queue full".into()));
+            } else {
+                state.pending_relay_forwards.push((peer, data, reply, std::time::Instant::now()));
+            }
+        }
+        return;
+    }
+    while state.proxy_inflight.get(&peer).copied().unwrap_or(0) < proxy_slots(state, peer) {
         let Some(waiting) = state.proxy_waiting.get_mut(&peer) else { break };
         let Some((data, reply)) = waiting.pop_front() else {
             state.proxy_waiting.remove(&peer);
@@ -6180,7 +6241,8 @@ fn handle_grpc_proxy_event(
                     state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone(), rid));
                 }
                 request_response::Message::Response { request_id, response } => {
-                    proxy_request_finished(swarm, state, request_id);
+                    let usable = swarm.is_connected(&peer);
+                    proxy_request_finished(swarm, state, proxy_queue, request_id, usable);
                     if let Some(reply) = state.pending_proxy.remove(&request_id) {
                         // Outbound response received — deliver to waiting proxy forward.
                         // #zombie: a successful round-trip proves the current path is
@@ -6193,9 +6255,8 @@ fn handle_grpc_proxy_event(
         }
         request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
             warn!(%peer, ?error, "proxy outbound failure");
-            proxy_request_finished(swarm, state, request_id);
             if let Some(reply) = state.pending_proxy.remove(&request_id) {
-                let _ = reply.send(Err(format!("proxy outbound: {error:?}")));
+                let _ = reply.send(Err(proxy_failure_text(&error)));
             }
             // #zombie (#42 live-roam finding): `send_request` picks ANY existing
             // connection, so zombie pre-roam connections mask a roamed peer's
@@ -6211,10 +6272,17 @@ fn handle_grpc_proxy_event(
                 | request_response::OutboundFailure::DialFailure => true,
                 // The connection's own limit on requests at once says nothing about the path
                 // (#31): counting it closed a busy gateway's connections to a healthy provider.
-                request_response::OutboundFailure::Io(e) => !is_local_stream_limit(e),
+                // Nor does a peer that doesn't speak the protocol (lazy negotiation reports it as an
+                // I/O error, not as UnsupportedProtocols): it is alive and answering.
+                request_response::OutboundFailure::Io(e) => !is_local_stream_limit(e) && !is_negotiation_refusal(e),
                 _ => false,
             };
-            if record_proxy_failure(&mut state.proxy_failure_streak, peer, dead_path) {
+            let evicted = record_proxy_failure(&mut state.proxy_failure_streak, peer, dead_path);
+            // Its slot goes to the next waiting request only over a connection still up and not
+            // being closed below; otherwise the waiting ones take the reconnect path (#31 review).
+            let usable = !evicted && swarm.is_connected(&peer);
+            proxy_request_finished(swarm, state, proxy_queue, request_id, usable);
+            if evicted {
                 warn!(%peer, threshold = ZOMBIE_FAILURE_THRESHOLD,
                     "zombie_evict: consecutive proxy path failures — closing presumed-dead connections and redialing via relay");
                 let _ = swarm.disconnect_peer_id(peer);
@@ -7435,6 +7503,35 @@ mod tests {
         // ...unless we're connected again, or heard from it after losing the connection.
         assert!(keep_known_peer(true, heard, Some(now - LOST_PEER_GRACE_MS), now));
         assert!(keep_known_peer(false, Some(now - 1_000), Some(now - LOST_PEER_GRACE_MS), now));
+    }
+
+    /// Review (18 Nov): failures that can't have reached the peer's application are labelled so,
+    /// and a peer refusing a lazily negotiated protocol is told apart from a dead path.
+    #[test]
+    fn never_sent_failures_are_labelled_and_a_refused_protocol_is_not_a_dead_path() {
+        let refused = std::io::Error::from(libp2p::core::upgrade::NegotiationError::Failed);
+        assert!(is_negotiation_refusal(&refused));
+        let limit = std::io::Error::new(std::io::ErrorKind::Other, "max sub-streams reached");
+        for f in [
+            request_response::OutboundFailure::DialFailure,
+            request_response::OutboundFailure::UnsupportedProtocols,
+            request_response::OutboundFailure::Io(refused),
+            request_response::OutboundFailure::Io(limit),
+        ] {
+            assert!(proxy_failure_text(&f).ends_with(NEVER_SENT), "{f:?}");
+        }
+        for f in [request_response::OutboundFailure::Timeout, request_response::OutboundFailure::ConnectionClosed] {
+            assert!(!proxy_failure_text(&f).contains(NEVER_SENT), "{f:?}");
+        }
+    }
+
+    /// Review (18 Nov): the outbound cap leaves room for the peer's own requests on the shared
+    /// per-connection limit.
+    #[test]
+    fn the_outbound_cap_leaves_room_for_the_peers_requests() {
+        let state = LoopState::new();
+        let peer = PeerId::random();
+        assert_eq!(proxy_slots(&state, peer), MAX_PROXY_INFLIGHT_PER_PEER);
     }
 
     /// #31 (18 Nov): libp2p's "max sub-streams reached" is the connection's own limit, not a dead

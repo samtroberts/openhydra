@@ -30,6 +30,9 @@ libp2p-gossipsub = { path = "../../network/patched-deps/libp2p-gossipsub" }
 # Requests go on a direct connection when the peer has one, never alternating with a relay
 # circuit (see its CHANGELOG.md).
 libp2p-request-response = { path = "../../network/patched-deps/libp2p-request-response" }
+# OpenHydra's own request protocols negotiate lazily, one round trip less per request (see its
+# CHANGELOG.md); same reason.
+libp2p-swarm = { path = "../../network/patched-deps/libp2p-swarm" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

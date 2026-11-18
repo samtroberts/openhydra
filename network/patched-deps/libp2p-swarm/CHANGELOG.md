@@ -7,6 +7,11 @@
   protocols, and only when the stream proposes exactly one: ping, identify, Kademlia, relays and
   gossip keep `V1`, so a peer that doesn't speak them is still reported as unsupported rather than
   failing. See `lazy_protocols` in `src/connection.rs`.
+- A protocol is negotiated lazily on a connection only once its peer has accepted it there in a
+  full (`V1`) negotiation (`LazyProven`): the first stream of each still negotiates fully, so a peer
+  that doesn't speak it is reported as unsupported (not as an I/O error after the request went out),
+  and a peer that never answers is caught by the 10 s upgrade timeout rather than the request's
+  own (review, 18 Nov 2026). Every later request on the connection saves the round trip.
 
 ## 0.45.1
 
