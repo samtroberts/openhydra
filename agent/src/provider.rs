@@ -870,10 +870,16 @@ const STREAM_TTL_MS: u64 = RESULT_TTL_MS;
 /// Global cap on live stream buffers. Streams are tiny (prune-on-ack keeps only the un-fetched
 /// tail), so this is generous; the real bound on *generating* streams is the worker pool.
 const MAX_STREAM_ENTRIES: usize = 512;
-/// Per-peer fairness cap: one consumer can hold at most this many live streams. Admission
-/// evicts **that peer's own** oldest stream first, so one peer opening many streams can never
-/// evict another peer's active stream (the property the scale scenario demands).
+/// Per-peer fairness cap: one consumer can hold at most this many live streams, so one peer
+/// opening many streams can never crowd out another's. Past it, admission makes room only from
+/// **that peer's own** streams nobody is reading any more ([`STREAM_IDLE_EVICT_MS`]); with none,
+/// the new stream is refused as overloaded and its consumer backs off and tries again (#32: it
+/// used to evict the peer's oldest stream even mid-generation, ending replies being read).
 const MAX_STREAMS_PER_PEER: usize = 128;
+/// A stream its consumer hasn't polled for this long is no longer being read (a reading consumer
+/// polls at least every hold, at most 15 s, or every 750 ms on a timer): the first room made for a
+/// consumer's new stream past [`MAX_STREAMS_PER_PEER`].
+const STREAM_IDLE_EVICT_MS: u64 = 30_000;
 /// Global byte backstop across all live stream tails — a last-resort guard (deltas are small and
 /// pruned, so this rarely bites), evicting the globally-oldest stream if somehow exceeded.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
@@ -1429,21 +1435,24 @@ fn stream_begin_in(
     nonce: [u8; 16],
     reply_to: &str,
     now: u64,
-) {
+) -> bool {
     stream_begin_billed_in(map, nonce, reply_to, now, StreamBilling::default())
 }
 
 /// [`stream_begin_in`] for a serve whose commitment is recorded under `billing`.
+/// `false`: not admitted, the peer already holds [`MAX_STREAMS_PER_PEER`] streams that are all
+/// still being read.
 fn stream_begin_billed_in(
     map: &mut HashMap<[u8; 16], StreamBuffer>,
     nonce: [u8; 16],
     reply_to: &str,
     now: u64,
     billing: StreamBilling,
-) {
+) -> bool {
     map.retain(|_, b| !stream_expired(b, now));
-    // Per-peer fairness: while this peer already holds the cap, drop its own oldest. Only ever
-    // touches `reply_to`'s streams, so it cannot evict another peer's active stream.
+    // Per-peer fairness: while this peer already holds the cap, drop the one of its own streams
+    // read from least recently, if nobody is reading it any more; else refuse this one (#32).
+    // Only ever touches `reply_to`'s streams, so it cannot evict another peer's.
     loop {
         let mine = map.values().filter(|b| b.reply_to == reply_to).count();
         if mine < MAX_STREAMS_PER_PEER {
@@ -1451,14 +1460,14 @@ fn stream_begin_billed_in(
         }
         match map
             .iter()
-            .filter(|(_, b)| b.reply_to == reply_to)
-            .min_by_key(|(_, b)| b.recorded_ms)
+            .filter(|(_, b)| b.reply_to == reply_to && now.saturating_sub(b.last_poll_ms) >= STREAM_IDLE_EVICT_MS)
+            .min_by_key(|(_, b)| b.last_poll_ms)
             .map(|(k, _)| *k)
         {
-            Some(oldest) => {
-                map.remove(&oldest);
+            Some(idle) => {
+                map.remove(&idle);
             }
-            None => break,
+            None => return false,
         }
     }
     // Global backstops: evict until within the count + byte caps, unread streams first (oldest
@@ -1493,6 +1502,7 @@ fn stream_begin_billed_in(
             polled: false,
         },
     );
+    true
 }
 
 /// Append one encoded frame to the stream under `nonce` (no-op if the buffer was already reaped).
@@ -2708,10 +2718,11 @@ impl<A: EngineAdapter> Provider<A> {
     /// P1 streaming: admit a new stream under `nonce` (empty, `done=false`). Called at the start
     /// of an accepted `SERVE_STREAM` generation job, so the buffer exists before the ack is sent
     /// and never lingers without a producer (a shed submit never reaches this).
-    fn stream_begin(&self, nonce: [u8; 16], reply_to: &str, billing: StreamBilling) {
+    /// `false`: refused, its consumer already holds as many streams as it may, all being read.
+    fn stream_begin(&self, nonce: [u8; 16], reply_to: &str, billing: StreamBilling) -> bool {
         let now = now_unix_ms();
         let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
-        stream_begin_billed_in(&mut map, nonce, reply_to, now, billing);
+        stream_begin_billed_in(&mut map, nonce, reply_to, now, billing)
     }
 
     /// P1 streaming: append one encoded frame to the stream (a delta, or the terminal frame which
@@ -2972,7 +2983,14 @@ impl<A: EngineAdapter> Provider<A> {
         };
         // Create the buffer, then ack immediately (before generating), so the consumer starts
         // polling right away and never races an absent buffer (begin happens before the ack).
-        self.stream_begin(nonce, &reply_to, billing);
+        // Its consumer already holding as many streams as it may, all being read: refused as
+        // overloaded (nothing generated, nothing owed), and the consumer tries again shortly (#32).
+        if !self.stream_begin(nonce, &reply_to, billing) {
+            self.release_nonce(nonce, &source_peer);
+            tracing::debug!(consumer = %source_peer, cap = MAX_STREAMS_PER_PEER, "stream refused: its consumer holds as many as it may");
+            let _ = self.net.respond(request_id, FetchChunksResponse::Overloaded.encode());
+            return;
+        }
         // A consumer that asked for holds gets its open answered with the first frames (or when
         // the hold runs out), saving the round trip of a separate first poll; any other gets the
         // empty ack at once.
@@ -5450,6 +5468,38 @@ mod tests {
         assert!(map.contains_key(&bkey), "peer A's flood must not evict peer B's active stream");
         let a_count = map.values().filter(|b| b.reply_to == "peerA").count();
         assert!(a_count <= MAX_STREAMS_PER_PEER, "peer A bounded to its fair share, got {a_count}");
+    }
+
+    /// #32 (18 Nov): past its cap a consumer's new stream evicted its oldest one even while that
+    /// one was still generating and being read, ending replies mid-way. It is refused instead,
+    /// unless one of the consumer's streams has gone unread.
+    #[test]
+    fn past_its_cap_a_consumers_stream_is_refused_unless_one_of_its_own_went_unread() {
+        let mut map = HashMap::new();
+        let key = |i: usize| {
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            k
+        };
+        for i in 0..MAX_STREAMS_PER_PEER {
+            assert!(stream_begin_in(&mut map, key(i), "c", 1_000));
+        }
+        // All being read: the next is refused and none of the live ones goes.
+        assert!(!stream_begin_in(&mut map, key(500), "c", 1_000 + STREAM_IDLE_EVICT_MS - 1));
+        assert_eq!(map.len(), MAX_STREAMS_PER_PEER);
+        assert!((0..MAX_STREAMS_PER_PEER).all(|i| map.contains_key(&key(i))));
+        // Another consumer is unaffected.
+        assert!(stream_begin_in(&mut map, key(600), "other", 1_000));
+        // Its streams read since, but one not read for the idle time: that one makes room.
+        let now = 1_000 + STREAM_IDLE_EVICT_MS + 5_000;
+        for i in 1..MAX_STREAMS_PER_PEER {
+            map.get_mut(&key(i)).unwrap().last_poll_ms = now - 1_000;
+        }
+        assert!(stream_begin_in(&mut map, key(501), "c", now));
+        assert!(!map.contains_key(&key(0)), "the unread one went");
+        assert!(map.contains_key(&key(501)) && map.contains_key(&key(1)));
+        // Full again with every stream read recently: refused.
+        assert!(!stream_begin_in(&mut map, key(502), "c", now));
     }
 
     #[test]
