@@ -749,20 +749,27 @@ pub fn handle_serve_request_watched(
         match still_wanted {
             None => adapter.serve_stream(&infer, &mut on_delta),
             Some(still_wanted) => {
-                let finished = std::sync::atomic::AtomicBool::new(false);
+                // The watcher waits on `finished` rather than sleeping, so the engine finishing wakes
+                // it at once: the scope can't end, and the terminal frame can't go out, until it has
+                // returned (a sleep held every reply's `Done` back by up to STILL_WANTED_EVERY:
+                // 250 ms on a 1-token reply, measured 18 Nov).
+                let (finished, wait) = std::sync::mpsc::channel::<()>();
                 let watched = stop.clone();
                 std::thread::scope(|scope| {
-                    scope.spawn(|| {
-                        while !finished.load(std::sync::atomic::Ordering::Relaxed) && !watched.is_set() {
+                    scope.spawn(move || {
+                        while !watched.is_set() {
                             if !still_wanted() {
                                 watched.set();
                                 break;
                             }
-                            std::thread::sleep(STILL_WANTED_EVERY);
+                            match wait.recv_timeout(STILL_WANTED_EVERY) {
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                _ => break,
+                            }
                         }
                     });
                     let outcome = adapter.serve_stream(&infer, &mut on_delta);
-                    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                    drop(finished);
                     outcome
                 })
             }
@@ -1118,6 +1125,35 @@ mod tests {
         let mut frames = Vec::new();
         handle_serve_request_watched(req("p"), &Silent, &mut |c| frames.push(c.to_vec()), &mut |_| true, Some(&still_wanted));
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    /// An engine that answers one token at once.
+    struct Quick;
+    impl EngineAdapter for Quick {
+        fn engine_name(&self) -> &'static str {
+            "quick"
+        }
+        fn detect_models(&self) -> Result<Vec<crate::adapter::DetectedModel>, AdapterError> {
+            Ok(vec![])
+        }
+        fn serve_stream(&self, _: &InferenceRequest, on_delta: &mut dyn FnMut(&str)) -> Result<crate::adapter::ServeOutcome, AdapterError> {
+            on_delta("OK");
+            Ok(crate::adapter::ServeOutcome { tokens: 1, done: true, ..Default::default() })
+        }
+    }
+
+    /// 18 Nov: the watcher slept STILL_WANTED_EVERY between looks, and the serve waited for it, so a
+    /// reply's terminal frame went out up to 250 ms after the engine finished (every 1-token reply
+    /// took 250 ms at the provider).
+    #[test]
+    fn a_watched_serve_ends_as_soon_as_its_engine_does() {
+        let still_wanted = || true;
+        let mut frames = Vec::new();
+        let started = std::time::Instant::now();
+        handle_serve_request_watched(req("p"), &Quick, &mut |c| frames.push(c.to_vec()), &mut |_| true, Some(&still_wanted));
+        let took = started.elapsed();
+        assert!(took < STILL_WANTED_EVERY / 5, "the Done waited for the watcher: {took:?}");
+        assert!(matches!(ServeChunk::decode(frames.last().unwrap()), Ok(ServeChunk::Done { .. })));
     }
 
     fn req(reply_to: &str) -> ServeRequest {
