@@ -398,6 +398,18 @@ pub struct ServeRequest {
     pub stream_whole: bool,
 }
 
+impl ServeRequest {
+    /// This request, marked as taken whole (or not, #3); a whole one asks for the shorter hold
+    /// `whole_hold_ms` (when it asked for holds at all).
+    pub fn taken_whole_with(mut self, whole: bool, whole_hold_ms: u32) -> Self {
+        self.stream_whole = whole;
+        if whole && self.stream_hold_ms.is_some() {
+            self.stream_hold_ms = Some(whole_hold_ms);
+        }
+        self
+    }
+}
+
 /// Parameters for a deterministic (reproducible) serve. The model's quantisation is already pinned
 /// by the canonical model id the consumer routed to, so only the RNG seed needs carrying;
 /// temperature is forced to 0 by the provider when this is present. See [`ServeRequest::deterministic`].

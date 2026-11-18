@@ -1095,17 +1095,16 @@ impl HeldPolls {
     }
 
     /// A frame arrived for `nonce`'s held poll: answer it [`HOLD_COALESCE`] from `now` at the latest,
-    /// so frames that follow at once (its `Done`) go in the same answer. `false`: none held.
+    /// so frames that follow at once (its `Done`) go in the same answer. `true` only the first time,
+    /// when its due time moved (the sweep is then told; later frames change nothing it waits for).
     fn wake(&mut self, nonce: &[u8; 16], now: std::time::Instant) -> bool {
         match self.by_nonce.get_mut(nonce) {
-            Some(p) => {
-                if !p.woken {
-                    p.woken = true;
-                    p.until = p.until.min(now + HOLD_COALESCE);
-                }
+            Some(p) if !p.woken => {
+                p.woken = true;
+                p.until = p.until.min(now + HOLD_COALESCE);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 }
@@ -1470,8 +1469,26 @@ fn stream_begin_in(
 }
 
 /// [`stream_begin_in`] for a serve whose commitment is recorded under `billing`.
-/// `false`: not admitted, the peer already holds [`MAX_STREAMS_PER_PEER`] streams that are all
-/// still being read.
+/// A stream (of `peer`'s, or anyone's) that may make room for a new one, the best first: one that is
+/// over (closed, or done and read to its end: its frames have all been fetched, and what they owe
+/// is in its commitment, not its buffer), longest unpolled first; then one nobody has polled for
+/// [`STREAM_IDLE_EVICT_MS`]. `None`: every stream is still being read.
+fn evictable_stream(map: &HashMap<[u8; 16], StreamBuffer>, now: u64, peer: Option<&str>) -> Option<[u8; 16]> {
+    let theirs = |b: &&StreamBuffer| peer.map_or(true, |p| b.reply_to == p);
+    let over = |b: &StreamBuffer| b.closed || (b.done && b.fetched_hi as usize >= b.base_offset as usize + b.chunks.len());
+    map.iter()
+        .filter(|(_, b)| theirs(b) && over(b))
+        .min_by_key(|(_, b)| b.last_poll_ms)
+        .or_else(|| {
+            map.iter()
+                .filter(|(_, b)| theirs(b) && now.saturating_sub(b.last_poll_ms) >= STREAM_IDLE_EVICT_MS)
+                .min_by_key(|(_, b)| b.last_poll_ms)
+        })
+        .map(|(k, _)| *k)
+}
+
+/// `false`: not admitted, the peer already holds [`MAX_STREAMS_PER_PEER`] streams (or the provider
+/// [`MAX_STREAM_ENTRIES`]) that are all still being read.
 fn stream_begin_billed_in(
     map: &mut HashMap<[u8; 16], StreamBuffer>,
     nonce: [u8; 16],
@@ -1480,39 +1497,35 @@ fn stream_begin_billed_in(
     billing: StreamBilling,
 ) -> bool {
     map.retain(|_, b| !stream_expired(b, now));
-    // Per-peer fairness: while this peer already holds the cap, drop the one of its own streams
-    // read from least recently, if nobody is reading it any more; else refuse this one (#32).
-    // Only ever touches `reply_to`'s streams, so it cannot evict another peer's.
+    // Per-peer fairness: while this peer already holds the cap, make room from its own streams that
+    // are over (read to the end, or closed: #32 review, a finished stream held its place for 30 s),
+    // else ones nobody is reading any more; else refuse this one (#32). Only ever touches
+    // `reply_to`'s streams, so it cannot evict another peer's.
     loop {
         let mine = map.values().filter(|b| b.reply_to == reply_to).count();
         if mine < MAX_STREAMS_PER_PEER {
             break;
         }
-        match map
-            .iter()
-            .filter(|(_, b)| b.reply_to == reply_to && now.saturating_sub(b.last_poll_ms) >= STREAM_IDLE_EVICT_MS)
-            .min_by_key(|(_, b)| b.last_poll_ms)
-            .map(|(k, _)| *k)
-        {
-            Some(idle) => {
-                map.remove(&idle);
+        match evictable_stream(map, now, Some(reply_to)) {
+            Some(k) => {
+                map.remove(&k);
             }
             None => return false,
         }
     }
-    // Global backstops: evict until within the count + byte caps, unread streams first (oldest
-    // first): one its consumer read from is owed for what it read, and its consumer may still close
-    // it to settle (S8); evicting it would leave that unprovable (review round 4 S4-11).
+    // Global backstops, the same way across every peer: within the count + byte caps by evicting
+    // streams that are over, then ones nobody reads any more; never one still being read (it was
+    // the oldest unread one before, which included streams in their prefill).
     loop {
         let total: usize = map.values().map(|b| b.bytes).sum();
         if map.len() < MAX_STREAM_ENTRIES && total <= MAX_STREAM_BYTES {
             break;
         }
-        match map.iter().min_by_key(|(_, b)| (b.fetched_hi > 0, b.recorded_ms)).map(|(k, _)| *k) {
-            Some(oldest) => {
-                map.remove(&oldest);
+        match evictable_stream(map, now, None) {
+            Some(k) => {
+                map.remove(&k);
             }
-            None => break,
+            None => return false,
         }
     }
     map.insert(
@@ -5563,6 +5576,113 @@ mod tests {
         assert!(map.contains_key(&key(501)) && map.contains_key(&key(1)));
         // Full again with every stream read recently: refused.
         assert!(!stream_begin_in(&mut map, key(502), "c", now));
+    }
+
+    /// #32 review (18 Nov): a finished stream held its consumer's place for 30 s, so a fast local
+    /// agent (own gateway to own provider, never settled) was refused past 128 requests in 30 s.
+    #[test]
+    fn a_finished_stream_makes_room_at_once_and_a_live_one_never() {
+        let mut map = HashMap::new();
+        let key = |i: usize| {
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            k
+        };
+        for i in 0..MAX_STREAMS_PER_PEER {
+            assert!(stream_begin_in(&mut map, key(i), "c", 1_000));
+        }
+        // One finished and read to its end, one closed, the rest still generating: the finished
+        // and closed ones go first, at once (well inside the idle time).
+        stream_append_in(&mut map, &key(5), &done(1), 1_000);
+        let end = map[&key(5)].base_offset + map[&key(5)].chunks.len() as u32;
+        map.get_mut(&key(5)).unwrap().fetched_hi = end;
+        map.get_mut(&key(9)).unwrap().closed = true;
+        assert!(stream_begin_in(&mut map, key(500), "c", 1_100));
+        assert!(stream_begin_in(&mut map, key(501), "c", 1_100));
+        assert!(!map.contains_key(&key(5)) && !map.contains_key(&key(9)));
+        // Done but not yet read to its end: still being read, kept; so the next is refused.
+        stream_append_in(&mut map, &key(7), &done(1), 1_100);
+        assert!(!stream_begin_in(&mut map, key(502), "c", 1_200));
+        assert!(map.contains_key(&key(7)));
+    }
+
+    /// Review (18 Nov): the provider-wide cap evicted the oldest unread stream, which included
+    /// streams still in their prefill; now it refuses instead, unless a stream is over or idle.
+    #[test]
+    fn the_provider_wide_cap_refuses_rather_than_end_a_stream_being_read() {
+        let mut map = HashMap::new();
+        let key = |i: usize| {
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            k
+        };
+        // Fill to the global cap with many consumers, all live (never read from: in prefill).
+        for i in 0..MAX_STREAM_ENTRIES {
+            assert!(stream_begin_in(&mut map, key(i), &format!("c{}", i % 8), 1_000));
+        }
+        assert!(!stream_begin_in(&mut map, key(9_000), "new", 1_000), "refused, nothing ended");
+        assert_eq!(map.len(), MAX_STREAM_ENTRIES);
+        // One goes idle: it makes room.
+        map.get_mut(&key(3)).unwrap().last_poll_ms = 0;
+        assert!(stream_begin_in(&mut map, key(9_000), "new", STREAM_IDLE_EVICT_MS + 1));
+        assert!(!map.contains_key(&key(3)));
+    }
+
+    /// #32: past the cap, the stream open itself is refused (Overloaded), its nonce released, and
+    /// nothing is generated; under the cap the same request is served (the control).
+    #[test]
+    fn a_stream_open_past_the_cap_is_refused_and_its_nonce_released() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let provider = Arc::new(provider);
+        let open = |nonce: [u8; 16]| {
+            let req = ServeRequest {
+                reply_to: "12D3KooWConsumer".into(), model_ref: "qwen2.5:7b".into(), messages: vec![],
+                max_tokens: Some(8), temperature: None, tools: Vec::new(), think: None, nonce,
+                credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: None, stream_whole: false,
+            };
+            let mut data = vec![SERVE_STREAM];
+            data.extend_from_slice(&req.encode());
+            data
+        };
+        // Control: under the cap, the open is served (its stream exists, generated to the end).
+        provider.clone().run_stream_job("r0".into(), "12D3KooWConsumer".into(), open([200; 16]), 4, std::time::Instant::now());
+        assert!(provider.streams.lock().unwrap().get(&[200; 16]).is_some_and(|b| b.done), "control served");
+        // Fill the consumer's share with live streams, then open one more.
+        for i in 0..MAX_STREAMS_PER_PEER as u8 {
+            provider.stream_begin([i; 16], "12D3KooWConsumer", billing(None));
+        }
+        provider.clone().run_stream_job("r1".into(), "12D3KooWConsumer".into(), open([201; 16]), 4, std::time::Instant::now());
+        assert!(provider.streams.lock().unwrap().get(&[201; 16]).is_none(), "refused: no stream, nothing generated");
+        let again = ServeRequest::decode(&open([201; 16])[1..]).unwrap();
+        assert!(provider.nonce_refusal(&again, "12D3KooWConsumer").is_none(), "its nonce was released");
+    }
+
+    /// #3 review: the whole-reply flag on the request reaches the stream.
+    #[test]
+    fn a_request_taken_whole_marks_its_stream_whole() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let provider = Arc::new(provider);
+        let req = ServeRequest {
+            reply_to: "12D3KooWConsumer".into(), model_ref: "qwen2.5:7b".into(), messages: vec![],
+            max_tokens: Some(8), temperature: None, tools: Vec::new(), think: None, nonce: [202; 16],
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None, stream_hold_ms: Some(2_000), stream_whole: true,
+        };
+        let mut data = vec![SERVE_STREAM];
+        data.extend_from_slice(&req.encode());
+        provider.clone().run_stream_job("r".into(), "12D3KooWConsumer".into(), data, 4, std::time::Instant::now());
+        assert!(provider.streams.lock().unwrap().get(&[202; 16]).is_some_and(|b| b.whole));
+    }
+
+    /// Review (18 Nov): every frame notified the sweep; only the first of a held poll moves it.
+    #[test]
+    fn a_held_poll_wakes_the_sweep_once() {
+        let t = std::time::Instant::now();
+        let mut h = HeldPolls::default();
+        assert!(matches!(h.park([1; 16], held("a", 0, t + Duration::from_secs(10))), Park::Parked));
+        assert!(h.wake(&[1; 16], t));
+        assert!(!h.wake(&[1; 16], t + Duration::from_millis(1)));
+        assert!(!h.wake(&[2; 16], t), "nothing held");
+        assert_eq!(h.next_due(), Some(t + HOLD_COALESCE));
     }
 
     #[test]

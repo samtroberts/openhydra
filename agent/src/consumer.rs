@@ -1434,6 +1434,10 @@ const POLL_MAX: Duration = Duration::from_millis(750);
 /// tick; while nothing comes, one poll per hold replaces a poll every [`POLL_MAX`]. Well inside
 /// [`STREAM_CALL_TIMEOUT`].
 const STREAM_HOLD: Duration = Duration::from_secs(10);
+/// The hold asked for by a request whose client takes the reply whole (#3): its polls answer only
+/// at the reply's end or this hold's, so it is short enough that a client gone meanwhile is noticed
+/// (between polls) about as soon as on a stream (review, 18 Nov: 10 s otherwise).
+const STREAM_HOLD_WHOLE: Duration = Duration::from_secs(2);
 /// Give up if no new chunk arrives for this much *accumulated idle time* — the "provider wedged"
 /// signal. Reset on every progress, so total generation is unbounded as long as tokens flow.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1974,7 +1978,10 @@ const OPEN_RESUME_WAIT: Duration = Duration::from_secs(1);
 /// open kept an outsider's request retrying an unreachable provider for minutes.)
 fn never_sent(e: &AdapterError) -> bool {
     let m = e.message();
-    ["dial failed", "relay queue full", "too many requests waiting", "invalid peer_id", "Failed to negotiate"]
+    // The network marks the failures it knows never reached the peer's application; the rest are the
+    // texts of the gateway's own refusals to send (review, 18 Nov: a match on libp2p's wording
+    // missed most of them).
+    [openhydra_network::event_loop::NEVER_SENT, "dial failed", "relay queue full", "too many requests waiting", "invalid peer_id"]
         .iter()
         .any(|s| m.contains(s))
 }
@@ -4634,7 +4641,7 @@ impl ConsumerNode {
             .entered();
             // B-S1: the request commits a fresh receipt nonce up front, so the provider records
             // what it serves under it; the settlement receipt then reuses this exact nonce.
-            let request = ServeRequest { stream_whole: whole, ..self.serve_request_for(&provider, messages, max_tokens, temperature, tools, think) };
+            let request = self.serve_request_for(&provider, messages, max_tokens, temperature, tools, think).taken_whole_with(whole, STREAM_HOLD_WHOLE.as_millis() as u32);
             let provider_libp2p = provider.libp2p_peer_id.clone();
             let open = self.open_serve(&provider_libp2p);
             let t_serve = std::time::Instant::now();
@@ -6517,7 +6524,10 @@ impl ConsumerNode {
     /// The serve request an audit sends `provider`: built as a user's is ([`Self::serve_request_for`]),
     /// greedy.
     fn audit_request_for(&self, provider: &SelectedProvider, request: &AuditRequest) -> ServeRequest {
+        // Taken whole or streamed at random, as users' requests come both ways: always one way would
+        // tell a provider which requests can't be audits (review, 18 Nov).
         self.serve_request_for(provider, &request.messages, request.max_tokens, Some(0.0), &request.tools, request.think)
+            .taken_whole_with(rand::random::<bool>(), STREAM_HOLD_WHOLE.as_millis() as u32)
     }
 
     /// Serve `request` at `provider` for an audit, exactly as a user's serve goes (the same request
@@ -8381,6 +8391,35 @@ mod tests {
         let out = request_completion_streaming(&mut transport, &mut |_| {}, &held_request(), &mut |_| {});
         assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(ref m))) if m.contains("stalled")));
         assert_eq!(polls, (STREAM_STALL_TIMEOUT.as_millis() / STREAM_HOLD.as_millis()) as u32);
+    }
+
+    /// Review (18 Nov): the never-sent check matched texts libp2p doesn't produce; it now matches the
+    /// network's own label, on the real failure texts.
+    #[test]
+    fn never_sent_matches_the_networks_labelled_failures() {
+        let label = openhydra_network::event_loop::NEVER_SENT;
+        for m in [
+            format!("proxy outbound: DialFailure {label}"),
+            format!("proxy outbound: UnsupportedProtocols {label}"),
+            format!("proxy outbound: Io(Custom {{ kind: Other, error: Failed }}) {label}"),
+            "proxy_forward: dial failed (peer unreachable)".into(),
+            "proxy_forward: relay queue full".into(),
+        ] {
+            assert!(never_sent(&AdapterError::Network(m.clone())), "{m}");
+        }
+        for m in ["proxy outbound: Timeout", "proxy outbound: ConnectionClosed", "proxy outbound: Io(Kind(BrokenPipe))"] {
+            assert!(!never_sent(&AdapterError::Network(m.into())), "{m}");
+        }
+    }
+
+    /// Review (18 Nov): a request taken whole asks for the short hold; audits go both ways.
+    #[test]
+    fn a_whole_request_asks_for_the_short_hold() {
+        let base = ServeRequest { stream_hold_ms: Some(STREAM_HOLD.as_millis() as u32), ..request() };
+        let whole = base.clone().taken_whole_with(true, STREAM_HOLD_WHOLE.as_millis() as u32);
+        assert_eq!((whole.stream_whole, whole.stream_hold_ms), (true, Some(STREAM_HOLD_WHOLE.as_millis() as u32)));
+        let streamed = base.taken_whole_with(false, STREAM_HOLD_WHOLE.as_millis() as u32);
+        assert_eq!((streamed.stream_whole, streamed.stream_hold_ms), (false, Some(STREAM_HOLD.as_millis() as u32)));
     }
 
     fn frame_response_of(chunk: ServeChunk) -> Vec<u8> {
