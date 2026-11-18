@@ -2,6 +2,19 @@
 
 Vendored from crates.io `libp2p-gossipsub` 0.47.0 (MIT, unchanged apart from these):
 
+- (2026-11-19, #8) A message's signature is checked by the behaviour after its duplicate check,
+  not by the codec for every copy: a copy of a message already seen costs a lookup. A relay gets up
+  to six copies of each message, and checking them all took 22% of a CPU at saturation (load
+  simulation, 31 Oct). Only messages whose signature verified are ever cached, so a forged copy
+  (same id, other content) arriving first can't stand in for the real one. In strict mode the codec
+  still refuses a message carrying no signature at all, so every message reaching the behaviour
+  from the network has one. Tested in `openhydra_duplicates_are_dropped_before_signatures_...`.
+
+- (2026-11-19, #6) The duplicate cache holds at most `MAX_DUPLICATE_IDS` (100,000) message ids,
+  the oldest going first. OpenHydra keeps ids for 300 s, so a node waking from a pause doesn't
+  re-flood the network, and a flood of distinct messages must not make that unbounded (about
+  27 MB at the cap).
+
 - (2026-10-30) Our subscriptions are sent on every new connection to a peer, to that connection,
   not only on its first. When a peer restarted with the same identity while a connection of its
   previous process was still open here (a QUIC connection lingers until its idle timeout), upstream

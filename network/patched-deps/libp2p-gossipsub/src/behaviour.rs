@@ -1720,6 +1720,34 @@ where
         // Calculate the message id on the transformed data.
         let msg_id = self.config.message_id(&message);
 
+        // OpenHydra patch: a copy of a message already seen is dropped before its signature is
+        // checked (a relay gets up to six copies of each; checking them all took 22% of a CPU at
+        // saturation in the 31 Oct load simulation). Only messages whose signature verified are
+        // ever put in the cache, so a forged copy can't stand in for the real one.
+        if self.duplicate_cache.contains(&msg_id) {
+            crate::openhydra_counters::DUPLICATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(message=%msg_id, "Message already received, ignoring");
+            if let Some((peer_score, ..)) = &mut self.peer_score {
+                peer_score.duplicated_message(propagation_source, &msg_id, &message.topic);
+            }
+            self.mcache.observe_duplicate(&msg_id, propagation_source);
+            return;
+        }
+        // (The codec refused any message without a signature, so in strict mode every message that
+        // reaches here carries one; a test may hand the behaviour an unsigned one directly.)
+        if matches!(self.config.validation_mode(), ValidationMode::Strict) && raw_message.signature.is_some() {
+            crate::openhydra_counters::COPIES_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !crate::protocol::GossipsubCodec::verify_signature(&proto::Message::from(raw_message.clone())) {
+                tracing::warn!("Invalid signature for received message");
+                self.handle_invalid_message(
+                    propagation_source,
+                    &raw_message,
+                    RejectReason::ValidationError(ValidationError::InvalidSignature),
+                );
+                return;
+            }
+        }
+
         // Check the validity of the message
         // Peers get penalized if this message is invalid. We don't add it to the duplicate cache
         // and instead continually penalize peers that repeatedly send this message.
@@ -1727,11 +1755,7 @@ where
             return;
         }
 
-        if self.duplicate_cache.contains(&msg_id) {
-            crate::openhydra_counters::DUPLICATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            crate::openhydra_counters::UNIQUE_MESSAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        crate::openhydra_counters::UNIQUE_MESSAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.duplicate_cache.insert(msg_id.clone()) {
             tracing::debug!(message=%msg_id, "Message already received, ignoring");
             if let Some((peer_score, ..)) = &mut self.peer_score {

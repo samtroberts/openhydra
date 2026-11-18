@@ -970,6 +970,28 @@ const GOSSIP_INBOUND_QUEUE_MAX: usize = 256;
 /// property. Travels on the same single topic as the other control events.
 pub const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
 
+/// How old a gossip message may be and still be forwarded (#7): the gossip duplicate window
+/// ([`crate::swarm::GOSSIP_DUPLICATE_CACHE`], 300 s) less a minute for clocks that disagree. Every
+/// node that saw a message saw it no longer ago than its age, so a copy forwarded within this is
+/// still in their duplicate caches and dropped there; one forwarded later (by a node waking from a
+/// pause longer than the window) would be taken as new and flooded again. Older messages are still
+/// used where they arrive (a record is accepted up to an hour old), just not passed on.
+pub const GOSSIP_FORWARD_MAX_AGE_MS: u64 = 240_000;
+
+/// Whether a gossip message (parsed) is fresh enough to forward ([`GOSSIP_FORWARD_MAX_AGE_MS`]): by
+/// its record's signed time for an announce, by its `timestamp` (seconds) for a notice. One that
+/// carries no time (an older node's) is forwarded, as before.
+pub fn gossip_forwardable(v: &serde_json::Value, now_ms: u64) -> bool {
+    let at_ms = match v.get("type").and_then(|t| t.as_str()) {
+        Some(PROVIDER_ANNOUNCE_TYPE) => v.get("record").and_then(|r| r.get("updated_unix_ms")).and_then(|t| t.as_u64()),
+        _ => v.get("timestamp").and_then(|t| t.as_u64()).map(|secs| secs.saturating_mul(1000)),
+    };
+    match at_ms {
+        None | Some(0) => true,
+        Some(at) => now_ms.saturating_sub(at) <= GOSSIP_FORWARD_MAX_AGE_MS,
+    }
+}
+
 /// M6 (per-model tombstone): the gossipsub envelope `type` a provider publishes to
 /// withdraw a *single* model it has stopped serving (e.g. the operator toggled it off
 /// in the desktop) while the node itself stays up serving its other models. Consumers
@@ -1029,6 +1051,10 @@ pub const MODEL_WITHDRAWN_MAX_AGE_SECS: u64 = 120;
 /// matching the 300 s DHT record TTL; a provider that stops (re)announcing then
 /// ages out, while a live one is kept refreshed by each gossip.
 const KNOWN_PEER_TTL_MS: u64 = 300_000;
+/// How long a stopping node keeps its swarm running after publishing its departure, so the notice
+/// is sent before it goes (#19).
+const DEPARTURE_FLUSH: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// How long a provider's records outlive our last connection to it (#30). A connection that drops
 /// is usually back within seconds (the next request or a redial reopens it), and the provider with
 /// it; deleting its records at once left a gateway answering "no provider" until the provider's
@@ -2108,6 +2134,16 @@ pub async fn run_event_loop(
                         let local_peer_id = *swarm.local_peer_id();
                         swarm.behaviour_mut().kademlia.remove_peer(&local_peer_id);
 
+                        // 3. Keep the swarm running a moment, so the departure actually goes out
+                        // (#19: returning at once dropped it, queued but unsent).
+                        let until = tokio::time::Instant::now() + DEPARTURE_FLUSH;
+                        loop {
+                            tokio::select! {
+                                _ = futures::StreamExt::select_next_some(&mut swarm) => {}
+                                _ = tokio::time::sleep_until(until) => break,
+                            }
+                        }
+
                         let _ = reply.send(());
                         return;
                     }
@@ -2574,6 +2610,17 @@ fn handle_provider_pex(
             return false;
         }
     };
+    // The record we already hold, again (each provider's announce reaches us by several paths):
+    // nothing to check or change (#9: re-checking its signature took 19% of a relay's CPU at
+    // saturation). Still only from its own author, and only while within the age a record is
+    // accepted at.
+    let now = now_unix_ms();
+    if record.libp2p_peer_id == source_str
+        && dht::check_record_age(&record, now).is_ok()
+        && state.known_peers.get(&known_peer_key(&record)).is_some_and(|held| *held == record)
+    {
+        return true;
+    }
     if let Err(e) = dht::pex_record_is_authentic(&record, &source_str) {
         warn!(%source_str, %e, "provider_pex: rejected advert (failed authenticity)");
         return false;
@@ -4072,10 +4119,20 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Gossipsub(gossip_event)) => {
             if let libp2p::gossipsub::Event::Message {
                 propagation_source,
+                message_id,
                 message,
-                ..
             } = gossip_event
             {
+                // #7: passed on (gossipsub validates through us, `validate_messages`) only while
+                // fresh enough that every node it reaches still remembers it; used here either way.
+                let parsed = serde_json::from_slice::<serde_json::Value>(&message.data).ok();
+                let forward = parsed.as_ref().map_or(true, |v| gossip_forwardable(v, now_unix_ms()));
+                let acceptance = if forward {
+                    libp2p::gossipsub::MessageAcceptance::Accept
+                } else {
+                    libp2p::gossipsub::MessageAcceptance::Ignore
+                };
+                let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(&message_id, &propagation_source, acceptance);
                 // Phase 4.2: Fast-path eviction for PEER_DEPARTED messages.
                 // Parse and evict before queuing for Python to minimize the
                 // ghost peer window on clean shutdown.
@@ -4098,7 +4155,7 @@ fn handle_swarm_event(
                 // REQUEST_HOLE_PUNCH events out of the bounded inbound queue. This
                 // flag suppresses the queue push below for fully-handled messages.
                 let mut handled_internally = false;
-                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                if let Some(parsed) = parsed {
                     let msg_type = parsed.get("type").and_then(|v| v.as_str());
                     if msg_type == Some(PROVIDER_ANNOUNCE_TYPE) {
                         handled_internally = true;
@@ -4653,18 +4710,27 @@ fn handle_swarm_event(
                 // A round trip stands for a live path; with no connection left there is none.
                 state.peer_rtts.forget(&peer_id.to_base58());
 
-                // Ghost-peer purge: Kademlia routing table
-                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
-                debug!(%peer_id, "evicted from kademlia routing table");
+                // #16: connections nobody used close when idle, on either side, and a closed one
+                // says nothing about its peer: its routing entry and records stay (a provider that
+                // really left goes with its departure, the bootstraps' gone notice, or its records'
+                // age). Only a peer this node uses (or always keeps) is taken as lost.
+                if swarm.behaviour().keep.peers().wanted(&peer_id) {
+                    // Ghost-peer purge: Kademlia routing table
+                    swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                    debug!(%peer_id, "evicted from kademlia routing table");
 
-                // Its provider records outlive the connection for LOST_PEER_GRACE_MS (#30): a dropped
-                // connection is usually back within seconds, and deleting them at once left us
-                // answering "no provider" until the provider's next announcement. The reaper
-                // deletes them once the grace runs out with no connection and no record since.
-                let libp2p_id_str = peer_id.to_string();
-                if state.known_peers.values().any(|record| record.libp2p_peer_id == libp2p_id_str) {
-                    state.lost_at_ms.insert(peer_id, now_unix_ms());
-                    debug!(%peer_id, "lost our last connection to a provider; its records stay for the grace period");
+                    // Its provider records outlive the connection for LOST_PEER_GRACE_MS (#30): a
+                    // dropped connection is usually back within seconds, and deleting them at once
+                    // left us answering "no provider" until the provider's next announcement. The
+                    // reaper deletes them once the grace runs out with no connection and no record
+                    // since.
+                    let libp2p_id_str = peer_id.to_string();
+                    if state.known_peers.values().any(|record| record.libp2p_peer_id == libp2p_id_str) {
+                        state.lost_at_ms.insert(peer_id, now_unix_ms());
+                        debug!(%peer_id, "lost our last connection to a provider; its records stay for the grace period");
+                    }
+                } else {
+                    debug!(%peer_id, "an unused connection closed; the peer's routing entry and records stay");
                 }
 
                 // E-N3: prune the remaining per-peer maps that keyed off this
@@ -6109,6 +6175,7 @@ fn send_proxy_request(
     data: Vec<u8>,
     reply: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
 ) {
+    swarm.behaviour().keep.peers().note(peer);
     if state.proxy_inflight.get(&peer).copied().unwrap_or(0) >= proxy_slots(state, peer) {
         let waiting = state.proxy_waiting.entry(peer).or_default();
         if waiting.len() >= MAX_PROXY_WAITING_PER_PEER {
@@ -6200,6 +6267,8 @@ fn handle_grpc_proxy_event(
 ) {
     match event {
         request_response::Event::Message { peer, message } => {
+            // A peer we exchange requests with: its connections stay open (#16).
+            swarm.behaviour().keep.peers().note(peer);
             match message {
                 request_response::Message::Request { request_id: rid, request, channel } => {
                     // Phase 2.4: per-peer inflight cap. Count this peer's live
@@ -6981,6 +7050,52 @@ mod tests {
         // A connection made since then does.
         state.conn_remote_addrs.insert(conn(5), (a, "/ip4/45.79.190.172/tcp/4001".parse().unwrap(), t0 + std::time::Duration::from_secs(2)));
         assert_eq!(bootstrap_redials(&state), vec![(a, a6), (b, b4)]);
+    }
+
+    #[test]
+    fn gossip_is_forwarded_only_while_every_node_still_remembers_it() {
+        let now = 10_000_000_000u64;
+        let announce = |ms: u64| serde_json::json!({"type": PROVIDER_ANNOUNCE_TYPE, "record": {"updated_unix_ms": ms}});
+        assert!(gossip_forwardable(&announce(now), now));
+        assert!(gossip_forwardable(&announce(now - GOSSIP_FORWARD_MAX_AGE_MS), now));
+        assert!(!gossip_forwardable(&announce(now - GOSSIP_FORWARD_MAX_AGE_MS - 1), now), "older than the window allows");
+        assert!(gossip_forwardable(&announce(0), now), "an undated record (an older node's) as before");
+        let notice = |secs: u64| serde_json::json!({"type": "PEER_DEPARTED", "timestamp": secs});
+        assert!(gossip_forwardable(&notice(now / 1000 - 60), now));
+        assert!(!gossip_forwardable(&notice(now / 1000 - 600), now));
+        assert!(gossip_forwardable(&serde_json::json!({"type": "PEER_DEPARTED"}), now), "no time: as before");
+        // The window fits inside the duplicate cache's, with room for clocks that disagree.
+        assert!(GOSSIP_FORWARD_MAX_AGE_MS + 60_000 <= crate::swarm::GOSSIP_DUPLICATE_CACHE.as_millis() as u64);
+    }
+
+    #[test]
+    fn the_record_already_held_is_accepted_again_without_a_second_check_and_only_from_its_author() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let me = key.public().to_peer_id();
+        let unsigned = PeerRecord {
+            peer_id: "node".into(),
+            model_id: "qwen2.5-7b".into(),
+            host: "1.2.3.4".into(),
+            port: 4001,
+            libp2p_peer_id: me.to_base58(),
+            updated_unix_ms: now_unix_ms(),
+            ..Default::default()
+        };
+        let record = dht::sign_peer_record(&unsigned, &key).unwrap();
+        let advert = serde_json::json!({"type": PROVIDER_ANNOUNCE_TYPE, "record": record});
+        let mut state = LoopState::new();
+        assert!(handle_provider_pex(&mut state, &advert, Some(me)), "checked and installed");
+        assert_eq!(state.known_peers.get(&known_peer_key(&record)), Some(&record));
+        // The same record again: accepted (and so forwarded) as before.
+        assert!(handle_provider_pex(&mut state, &advert, Some(me)));
+        // From anyone else it is still refused.
+        assert!(!handle_provider_pex(&mut state, &advert, Some(PeerId::random())));
+        // A changed copy is checked, and fails (its signature no longer matches).
+        let mut forged = record.clone();
+        forged.host = "6.6.6.6".into();
+        let forged = serde_json::json!({"type": PROVIDER_ANNOUNCE_TYPE, "record": forged});
+        assert!(!handle_provider_pex(&mut state, &forged, Some(me)));
+        assert_eq!(state.known_peers.get(&known_peer_key(&record)), Some(&record), "the held one stays");
     }
 
     #[test]

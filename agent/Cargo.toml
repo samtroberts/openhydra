@@ -42,7 +42,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["fancy-re
 # is sync (blocking libp2p), so the handler runs it on spawn_blocking and streams deltas
 # through a channel.
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 tokio-stream = "0.1"
 # CLI for the `openhydra-agent` binary (provide / serve roles + node/engine flags).
 clap = { version = "4", features = ["derive"] }

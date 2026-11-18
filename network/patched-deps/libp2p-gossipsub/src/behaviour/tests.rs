@@ -5115,3 +5115,49 @@ fn test_graft_without_subscribe() {
     // We unsubscribe from the topic.
     let _ = gs.unsubscribe(&Topic::new(topic));
 }
+
+/// OpenHydra patch: signatures are checked by the behaviour after its duplicate check. A forged
+/// copy (same id, altered content) that arrives first is rejected and never cached, so the real
+/// message is still taken; a copy of a message already taken is dropped as a duplicate.
+#[test]
+fn openhydra_duplicates_are_dropped_before_signatures_and_a_forgery_never_enters_the_cache() {
+    let (mut gs, peers, topics) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .create_network();
+    let (mut publisher, _, _) = inject_nodes1()
+        .peer_no(0)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .create_network();
+    let raw = publisher.build_raw_message(topics[0].clone(), vec![1, 2, 3]).unwrap();
+    let id = gs.config.message_id(&gs.data_transform.inbound_transform(raw.clone()).unwrap());
+    let mut deliver = |gs: &mut Behaviour<IdentityTransform, AllowAllSubscriptionFilter>, from: PeerId, m: RawMessage| {
+        gs.on_connection_handler_event(
+            from,
+            ConnectionId::new_unchecked(0),
+            HandlerEvent::Message {
+                rpc: Rpc { messages: vec![m], subscriptions: vec![], control_msgs: vec![] },
+                invalid_messages: vec![],
+            },
+        );
+    };
+    let delivered = |gs: &Behaviour<IdentityTransform, AllowAllSubscriptionFilter>| {
+        gs.events.iter().filter(|e| matches!(e, ToSwarm::GenerateEvent(Event::Message { .. }))).count()
+    };
+
+    let mut forged = raw.clone();
+    forged.data = vec![6, 6, 6];
+    gs.events.clear();
+    deliver(&mut gs, peers[0], forged);
+    assert_eq!(delivered(&gs), 0, "a forged message isn't delivered");
+    assert!(!gs.duplicate_cache.contains(&id), "nor remembered");
+
+    deliver(&mut gs, peers[0], raw.clone());
+    assert_eq!(delivered(&gs), 1, "the real one still is");
+    assert!(gs.duplicate_cache.contains(&id));
+
+    deliver(&mut gs, peers[1], raw);
+    assert_eq!(delivered(&gs), 1, "its copy is a duplicate");
+}

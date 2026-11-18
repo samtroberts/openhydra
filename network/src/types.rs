@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Mirrors `peer/dht_announce.py::Announcement` dataclass.
 /// All fields optional except peer_id, model_id, host, port.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerRecord {
     // Required
     pub peer_id: String,

@@ -224,6 +224,8 @@ pub struct PushStreams {
     next_id: AtomicU64,
     /// Provider side: push stream opens handed to the agent so far.
     served: AtomicU64,
+    /// The peers whose connections stay open (#16): one a push stream was exchanged with is used.
+    app_peers: crate::keep::AppPeers,
 }
 
 /// Refuse a push stream: one empty message (a reply is never empty), then its end. What the
@@ -243,7 +245,7 @@ async fn refuse<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(mut rd: R, mut wr: 
 
 impl PushStreams {
     /// Must be called inside the swarm's tokio runtime.
-    pub fn new(control: libp2p_stream::Control, local: PeerId) -> Arc<Self> {
+    pub fn new(control: libp2p_stream::Control, local: PeerId, app_peers: crate::keep::AppPeers) -> Arc<Self> {
         Arc::new(Self {
             control: Mutex::new(control),
             rt: tokio::runtime::Handle::current(),
@@ -254,6 +256,7 @@ impl PushStreams {
             refusing: Arc::default(),
             next_id: AtomicU64::new(1),
             served: AtomicU64::new(0),
+            app_peers,
         })
     }
 
@@ -319,6 +322,7 @@ impl PushStreams {
         self.open.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), Outbox { tx });
         queue.push((id.clone(), peer.to_string(), open));
         self.served.fetch_add(1, Ordering::Relaxed);
+        self.app_peers.note(peer);
         // What the consumer writes after its open goes to the agent, paced; its end ends the push.
         let follow_ups = {
             let (queue, peer) = (Arc::clone(&queue), peer.to_string());
@@ -347,6 +351,7 @@ impl PushStreams {
             _ = follow_ups => {}
             _ = pushes => {}
         }
+        self.app_peers.note(peer);
         self.open.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     }
 
@@ -392,6 +397,7 @@ impl PushStreams {
             return Err(PushOpenError::NotSent("own node".into()));
         }
         let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        self.app_peers.note(peer);
         let (opened_tx, opened_rx) = std::sync::mpsc::channel::<Result<(), PushOpenError>>();
         let (inbox_tx, inbox) = std::sync::mpsc::channel::<Result<Vec<u8>, PushRecvError>>();
         let (outbox, mut outbox_rx) = mpsc::unbounded_channel::<Vec<u8>>();

@@ -38,6 +38,32 @@ impl StatusClient {
     }
 }
 
+/// A cloneable handle that can only stop the node: it tells the network it is leaving (#19).
+#[derive(Clone)]
+pub struct DepartureHandle {
+    cmd_tx: mpsc::Sender<SwarmCommand>,
+}
+
+impl DepartureHandle {
+    /// Publish this node's departure (`PEER_DEPARTED`), so peers drop it at once instead of when
+    /// its records time out, and stop the swarm. Blocks until it has gone out (under a second), or
+    /// `timeout`. Call it from outside a tokio runtime, as the handle's other methods.
+    pub fn depart(&self, timeout: Duration) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .try_send(SwarmCommand::Shutdown { reply: tx })
+            .map_err(|_| "swarm not running".to_string())?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(rx.blocking_recv().is_ok());
+        });
+        match done_rx.recv_timeout(timeout) {
+            Ok(true) => Ok(()),
+            _ => Err("departure not confirmed".into()),
+        }
+    }
+}
+
 /// A running swarm node, driven synchronously.
 pub struct NetworkHandle {
     cmd_tx: mpsc::Sender<SwarmCommand>,
@@ -385,6 +411,11 @@ impl NetworkHandle {
         timeout: Duration,
     ) -> Result<crate::push::PushStream, crate::push::PushOpenError> {
         self.push.open(peer_id, open, timeout)
+    }
+
+    /// A handle that can only stop the node, announcing its departure ([`DepartureHandle::depart`]).
+    pub fn departure_handle(&self) -> DepartureHandle {
+        DepartureHandle { cmd_tx: self.cmd_tx.clone() }
     }
 
     /// Push stream opens this node has served, as a provider.

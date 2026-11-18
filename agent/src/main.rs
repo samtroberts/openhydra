@@ -971,8 +971,8 @@ struct ProvideArgs {
     #[arg(long)]
     db: Option<PathBuf>,
 
-    /// Seconds between DHT re-announcements. Must stay below the relays' provider-record
-    /// TTL (300s) or the node periodically falls out of discovery.
+    /// Seconds between DHT re-announcements. At most 150 (higher is lowered to it): records last
+    /// 300 s, and nothing else refreshes them (#13).
     #[arg(long, default_value_t = 120)]
     reannounce_secs: u64,
 
@@ -1684,6 +1684,8 @@ fn run() -> Result<(), String> {
         net.libp2p_peer_id(),
         net.openhydra_peer_id(),
     );
+    // #19: stopped with SIGTERM or SIGINT (Ctrl-C), it tells the network it is leaving first.
+    spawn_departure_on_signal(net.departure_handle());
 
     // P0 introspection: shared transfer counters + the optional read-only status endpoint.
     // The provider role writes the counters; the gateway's transfers stay zero for now
@@ -2126,6 +2128,12 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     stats: std::sync::Arc<TransferStats>,
     economy: std::sync::Arc<EconomyStats>,
 ) -> Result<(), String> {
+    let mut args = args;
+    let most = openhydra_network::swarm::ANNOUNCE_REFRESH_MAX.as_secs();
+    if args.reannounce_secs > most {
+        eprintln!("openhydra-agent: --reannounce-secs {} lowered to {most} (records last 300 s, and nothing else refreshes them)", args.reannounce_secs);
+        args.reannounce_secs = most;
+    }
     // Open the receipt ledger: file-backed if --db was given (durable across restarts),
     // else an ephemeral in-memory ledger.
     let store = match &args.db {
@@ -2291,6 +2299,44 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         args.max_concurrency,
     )
 }
+
+/// Wait for SIGTERM or SIGINT (Ctrl-C elsewhere), then publish this node's departure, so its peers
+/// drop it at once instead of listing it until its records time out (#19: no departure was ever
+/// sent, so a stopped provider stayed listed for up to 300 s), and exit. A second signal while it
+/// departs changes nothing: it exits within [`DEPARTURE_WAIT`] either way.
+fn spawn_departure_on_signal(depart: openhydra_network::handle::DepartureHandle) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_io().build() else { return };
+        let signal = rt.block_on(async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+                    return None;
+                };
+                tokio::select! {
+                    _ = term.recv() => Some("SIGTERM"),
+                    _ = int.recv() => Some("SIGINT"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok().map(|_| "Ctrl-C")
+            }
+        });
+        drop(rt);
+        if let Some(signal) = signal {
+            eprintln!("openhydra-agent: {signal}: telling the network this node is leaving");
+            if let Err(e) = depart.depart(DEPARTURE_WAIT) {
+                eprintln!("openhydra-agent: departure not sent: {e}");
+            }
+            std::process::exit(0);
+        }
+    });
+}
+
+/// The most a stopping agent waits for its departure to go out.
+const DEPARTURE_WAIT: Duration = Duration::from_secs(2);
 
 /// Consumer role: run the HTTP/SSE gateway until the process exits.
 fn serve(

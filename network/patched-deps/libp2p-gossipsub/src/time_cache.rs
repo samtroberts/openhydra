@@ -153,9 +153,32 @@ where
     pub(crate) fn contains_key(&self, key: &Key) -> bool {
         self.map.contains_key(key)
     }
+
+    /// OpenHydra patch: entries held now.
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// OpenHydra patch: drop the entry that expires first (the oldest).
+    pub(crate) fn remove_oldest(&mut self) {
+        while let Some(element) = self.list.pop_front() {
+            if let Occupied(entry) = self.map.entry(element.element) {
+                if entry.get().expires == element.expires {
+                    entry.remove();
+                    return;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct DuplicateCache<Key>(TimeCache<Key, ()>);
+
+/// OpenHydra patch: message ids remembered at most, past which the oldest go first. OpenHydra keeps
+/// ids for minutes (so a node waking from a pause doesn't re-flood the network), and a flood of
+/// distinct messages must not make that cost unbounded: at about 270 bytes an id this is ~27 MB,
+/// about four times what 10,000 providers announcing every 120 s fill in 300 s.
+pub(crate) const MAX_DUPLICATE_IDS: usize = 100_000;
 
 impl<Key> DuplicateCache<Key>
 where
@@ -170,12 +193,16 @@ where
     // If the key was not present this returns `true`. If the value was already present this
     // returns `false`.
     pub(crate) fn insert(&mut self, key: Key) -> bool {
-        if let Entry::Vacant(entry) = self.0.entry(key) {
+        let inserted = if let Entry::Vacant(entry) = self.0.entry(key) {
             entry.insert(());
             true
         } else {
             false
+        };
+        if inserted && self.0.len() > MAX_DUPLICATE_IDS {
+            self.0.remove_oldest();
         }
+        inserted
     }
 
     pub(crate) fn contains(&self, key: &Key) -> bool {
@@ -197,6 +224,18 @@ mod test {
         // Should report that 't' and 't' already exists
         assert!(!cache.insert("t"));
         assert!(!cache.insert("e"));
+    }
+
+    #[test]
+    fn the_cache_holds_at_most_its_cap_and_drops_the_oldest() {
+        let mut cache = DuplicateCache::new(Duration::from_secs(300));
+        for i in 0..MAX_DUPLICATE_IDS + 5 {
+            assert!(cache.insert(i));
+        }
+        assert_eq!(cache.0.len(), MAX_DUPLICATE_IDS);
+        assert!(!cache.contains(&0) && !cache.contains(&4), "the oldest went");
+        assert!(cache.contains(&5) && cache.contains(&(MAX_DUPLICATE_IDS + 4)));
+        assert!(!cache.insert(MAX_DUPLICATE_IDS + 4), "still a duplicate");
     }
 
     #[test]

@@ -111,6 +111,8 @@ pub struct OpenHydraBehaviour {
     pub upnp: libp2p::upnp::tokio::Behaviour,
     /// Push streams (#4, [`crate::push`]).
     pub push: libp2p_stream::Behaviour,
+    /// Which idle connections stay open (#16, [`crate::keep`]).
+    pub keep: crate::keep::Behaviour,
 }
 
 #[cfg(test)]

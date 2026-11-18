@@ -3043,14 +3043,18 @@ pub fn router(
 /// `/v1/*`.
 #[allow(clippy::too_many_arguments)]
 /// Is `host` (a `Host` header or URI authority) a loopback name for this gateway's `port`?
-/// `127.0.0.1`, `localhost` or `[::1]`, with this port or none.
+/// Any address in `127.0.0.0/8`, `localhost` or `[::1]`, with this port or none. (A literal address
+/// can't be a name rebound to us; #25: only `127.0.0.1` passed, so a client using another of
+/// loopback's addresses was refused.)
 pub(crate) fn is_loopback_host(host: &str, port: u16) -> bool {
     let host = host.trim();
     let (name, p) = match host.rsplit_once(':') {
         Some((n, p)) if !n.is_empty() && (n.starts_with('[') == n.ends_with(']')) && !p.contains(']') => (n, Some(p)),
         _ => (host, None),
     };
-    let name_ok = name == "127.0.0.1" || name == "[::1]" || name.eq_ignore_ascii_case("localhost");
+    let name_ok = name.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+        || name == "[::1]"
+        || name.eq_ignore_ascii_case("localhost");
     name_ok && p.map_or(true, |p| p.parse::<u16>().ok() == Some(port))
 }
 
@@ -3227,10 +3231,10 @@ mod tests {
 
     #[test]
     fn loopback_host_names_pass_and_rebound_names_do_not() {
-        for ok in ["127.0.0.1:16527", "localhost:16527", "LOCALHOST:16527", "[::1]:16527", "127.0.0.1", "localhost", "[::1]"] {
+        for ok in ["127.0.0.1:16527", "localhost:16527", "LOCALHOST:16527", "[::1]:16527", "127.0.0.1", "localhost", "[::1]", "127.0.0.2:16527", "127.255.1.9"] {
             assert!(is_loopback_host(ok, 16527), "{ok}");
         }
-        for bad in ["evil.example:16527", "evil.example", "127.0.0.1:80", "localhost:1", "127.0.0.1.evil.example:16527", "[::1]:9", "", "localhost.evil:16527"] {
+        for bad in ["evil.example:16527", "evil.example", "127.0.0.1:80", "localhost:1", "127.0.0.1.evil.example:16527", "[::1]:9", "", "localhost.evil:16527", "128.0.0.1:16527", "127.0.0.2:80", "0127.0.0.1"] {
             assert!(!is_loopback_host(bad, 16527), "{bad}");
         }
     }

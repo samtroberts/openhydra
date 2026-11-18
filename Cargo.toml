@@ -30,6 +30,14 @@ strip = true
 opt-level = "s"
 lto = true
 
+# #26: the release build, symbols and line tables kept, so a profiler (perf, samply, flame graphs)
+# names every function: `cargo build --profile profiling -p openhydra-agent` (target/profiling/).
+# The release profile stays stripped, so what ships is no bigger.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+
 [patch.crates-io]
 libp2p-quic = { path = "network/patched-deps/libp2p-quic" }
 # LAN discovery between peers with many addresses (see its CHANGELOG.md).

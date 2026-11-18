@@ -895,8 +895,27 @@ impl Role {
         }
     }
 
+    /// Ask it to stop (SIGTERM), without waiting: [`Role::kill`] then waits for it. Lets two roles
+    /// stopping together depart at the same time rather than one after the other.
+    fn ask_to_stop(&self) {
+        #[cfg(unix)]
+        if let Some(child) = &self.child {
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        }
+    }
+
     fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
+            // #19: asked to stop first, so it can tell the network it is leaving (it exits within
+            // about a second); killed only if it hasn't by then.
+            #[cfg(unix)]
+            {
+                unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+                while std::time::Instant::now() < until && matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -3615,6 +3634,8 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 // ── App wiring: tray, hide-on-close, kill children on exit ──
 
 fn kill_all(state: &AppState) {
+    state.provider.lock().expect("role lock").ask_to_stop();
+    state.gateway.lock().expect("role lock").ask_to_stop();
     state.provider.lock().expect("role lock").kill();
     state.gateway.lock().expect("role lock").kill();
 }

@@ -8,6 +8,7 @@
 pub mod address_book;
 pub mod behaviour;
 pub mod card;
+pub mod keep;
 pub mod proxy;
 pub mod push;
 

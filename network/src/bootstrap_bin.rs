@@ -1118,6 +1118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 let acceptance = match verdict {
                                     GossipVerdict::Accept => gossipsub::MessageAcceptance::Accept,
+                                    GossipVerdict::Keep(why) => {
+                                        debug!(%propagation_source, source = ?message.source, why, "gossip: kept, not forwarded");
+                                        gossipsub::MessageAcceptance::Ignore
+                                    }
                                     GossipVerdict::Reject(why) => {
                                         gossip_rejected += 1;
                                         debug!(%propagation_source, source = ?message.source, why, "gossip: rejected");
@@ -1130,7 +1134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 };
                                 let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(&message_id, &propagation_source, acceptance);
-                                if verdict != GossipVerdict::Accept {
+                                if !matches!(verdict, GossipVerdict::Accept | GossipVerdict::Keep(_)) {
                                     continue;
                                 }
                                 // C7: retain verified PROVIDER_ANNOUNCE records into the registry.
@@ -1917,6 +1921,8 @@ fn multiaddr_ip(addr: &Multiaddr) -> Option<std::net::IpAddr> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GossipVerdict {
     Accept,
+    /// Sound and used here, but too old to pass on (#7): its neighbours may have forgotten it.
+    Keep(&'static str),
     Reject(&'static str),
     Ignore(&'static str),
 }
@@ -1967,6 +1973,9 @@ fn check_gossip(
             if openhydra_network::dht::pex_record_is_authentic(&rec, &author.to_base58()).is_err() {
                 return GossipVerdict::Reject("announce not signed by its author");
             }
+            if !el::gossip_forwardable(&v, now_ms) {
+                return GossipVerdict::Keep("announce too old to forward");
+            }
             GossipVerdict::Accept
         }
         k if k == el::MODEL_WITHDRAWN_TYPE => {
@@ -1982,7 +1991,13 @@ fn check_gossip(
             GossipVerdict::Accept
         }
         "PEER_DEPARTED" => {
-            if about_author() { GossipVerdict::Accept } else { GossipVerdict::Reject("departure for another peer") }
+            if !about_author() {
+                GossipVerdict::Reject("departure for another peer")
+            } else if !el::gossip_forwardable(&v, now_ms) {
+                GossipVerdict::Ignore("stale departure")
+            } else {
+                GossipVerdict::Accept
+            }
         }
         k if k == el::PROVIDER_GONE_TYPE => {
             if !bootstraps.contains(&author) {

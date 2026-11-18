@@ -37,10 +37,19 @@ pub fn gossip_topic_filter() -> gossipsub::WhitelistSubscriptionFilter {
 /// from that peer stops without an error (review 2026-10-29, reproduced at 32 KB).
 pub const GOSSIP_MAX_TRANSMIT: usize = 64 * 1024;
 
-/// How long a gossip message id is remembered to drop duplicates. Upstream's 60 s let a flood of
-/// distinct messages pile up ids for a minute; every honest copy of a message arrives within a few
-/// heartbeats.
-pub const GOSSIP_DUPLICATE_CACHE: std::time::Duration = std::time::Duration::from_secs(15);
+/// The longest a node may go between announcements of its records (#13): Kad no longer republishes
+/// them itself, so two must fit in the 300 s record TTL with room for one to fail.
+pub const ANNOUNCE_REFRESH_MAX: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// How long a gossip message id is remembered to drop duplicates (#6). Every honest copy of a
+/// message arrives within a few heartbeats, but a node that pauses (a laptop asleep, a stalled
+/// process) for longer than this forgets what it saw and floods the backlog it gets on waking
+/// back into the network, which with 15 s kept 1,000 providers in a self-sustaining storm (load
+/// simulation, 31 Oct: 120 s cleared it within 4 minutes; 300 s cut a wake's re-flood to 3–9 extra
+/// announcements). A flood of distinct messages can't make it costly: the patched gossipsub keeps
+/// at most `MAX_DUPLICATE_IDS` (see its CHANGELOG), and nothing older than
+/// [`crate::event_loop::GOSSIP_FORWARD_MAX_AGE_MS`] is forwarded (#7).
+pub const GOSSIP_DUPLICATE_CACHE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Heartbeats (1 s each) a received gossip message is kept for peers' IWANT requests. Every message
 /// is kept, so a flood costs about this many seconds of its bytes in memory; upstream's 5 made a
@@ -234,20 +243,23 @@ pub fn build_swarm(
     kad_config.disjoint_query_paths(true);
 
     // Republication coherence — reconcile every lifetime knob against the 300 s TTL
-    // so records never silently expire and the two republish mechanisms (Kad's own
-    // vs the agent's provider re-announce loop) stay comfortably inside the window:
+    // so records never silently expire:
     //   record TTL / provider TTL        = 300 s   (hard expiry)
-    //   record (re)publication interval  = 120 s   (publisher refreshes its records)
-    //   provider publication interval    = 120 s   (publisher refreshes provider recs)
+    //   the agent's re-announce          = 120 s   (a fresh signed record and provider record;
+    //                                               at most ANNOUNCE_REFRESH_MAX, 150 s)
+    //   Kad's own (re)publication        =  off    (#13: it repeated the agent's)
     //   record replication interval      =  60 s   (spread copies to K closest between
     //                                               publications — directly addresses
     //                                               "records aren't deliberately spread")
-    // All refresh intervals are << 300 s, so a record is re-published ~2× and
-    // re-replicated ~5× before it can lapse.
+    // A record is re-announced at least twice and re-replicated ~5× before it can lapse.
+    // #13: Kad's own publication of a node's records is off. The agent re-announces each of them
+    // every 120 s ([`ANNOUNCE_REFRESH_MAX`] at most), a fresh signed record each time, so Kad
+    // republishing the same ones on the same cadence sent every announce twice (measured: about
+    // 116 announces per provider per 120 s, half of them Kad's).
     kad_config.set_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_provider_record_ttl(Some(Duration::from_secs(300)));
-    kad_config.set_publication_interval(Some(Duration::from_secs(120)));
-    kad_config.set_provider_publication_interval(Some(Duration::from_secs(120)));
+    kad_config.set_publication_interval(None);
+    kad_config.set_provider_publication_interval(None);
     kad_config.set_replication_interval(Some(Duration::from_secs(60)));
 
     // Learned-record caching — on a successful lookup, cache the record at the
@@ -368,6 +380,9 @@ pub fn build_swarm(
         .history_gossip(1)
         .duplicate_cache_time(GOSSIP_DUPLICATE_CACHE)
         .flood_publish(true)
+        // #7: a message is forwarded once the event loop has looked at it (it reports every one),
+        // and only while fresh (`event_loop::gossip_forwardable`).
+        .validate_messages()
         // Ensure small meshes still exist; libp2p defaults assume large
         // swarms. The invariant the validator enforces is
         // ``mesh_outbound_min <= mesh_n_low <= mesh_n <= mesh_n_high``
@@ -472,16 +487,15 @@ pub fn build_swarm(
         ping,
         upnp,
         push: libp2p_stream::Behaviour::new(),
+        keep: crate::keep::Behaviour::new(crate::keep::AppPeers::default()),
     };
 
-    // F-N8 (note): a 300 s idle-connection timeout keeps an otherwise-silent
-    // connection open for up to 5 min. That is intentional for long inference
-    // sessions (a slow completion can idle the proxy stream between chunks), but
-    // it sits in tension with prompt dead-peer reaping — ping-failure eviction and
-    // the known_peers reaper are what actually detect a dead peer here, not this
-    // timeout. Kept at 300 s deliberately; revisit only if idle-conn count grows.
+    // #16: an unused connection closes after `keep::IDLE_TIMEOUT` (60 s; it was 300 s for every
+    // connection, so the DHT's traffic kept ~27 per provider open for good). A peer this node really
+    // uses keeps its connections for `keep::APP_KEEP` after its last use, idle or not, so a long
+    // inference session or the next request finds its connection still there (see `keep`).
     let swarm_config = SwarmConfig::with_tokio_executor()
-        .with_idle_connection_timeout(Duration::from_secs(300));
+        .with_idle_connection_timeout(crate::keep::IDLE_TIMEOUT);
 
     let combined_transport = if opts.fence_openhydra {
         crate::fence::FenceTransport::new(combined_transport, crate::fence::Fenced::openhydra()).boxed()

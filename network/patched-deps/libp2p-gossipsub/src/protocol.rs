@@ -171,7 +171,7 @@ impl GossipsubCodec {
     /// Verifies a gossipsub message. This returns either a success or failure. All errors
     /// are logged, which prevents error handling in the codec and handler. We simply drop invalid
     /// messages and log warnings, rather than propagating errors through the codec.
-    fn verify_signature(message: &proto::Message) -> bool {
+    pub(crate) fn verify_signature(message: &proto::Message) -> bool {
         use quick_protobuf::MessageWrite;
 
         let Some(from) = message.from.as_ref() else {
@@ -269,8 +269,13 @@ impl Decoder for GossipsubCodec {
 
             match self.validation_mode {
                 ValidationMode::Strict => {
-                    // Validate everything
-                    verify_signature = true;
+                    // Validate everything. OpenHydra patch: a message must carry a signature, but
+                    // the behaviour checks it, after its duplicate check, so a copy of a message
+                    // already seen costs a lookup, not a signature check (see
+                    // `handle_received_message`).
+                    if message.signature.is_none() {
+                        invalid_kind = Some(ValidationError::InvalidSignature);
+                    }
                     verify_sequence_no = true;
                     verify_source = true;
                 }
