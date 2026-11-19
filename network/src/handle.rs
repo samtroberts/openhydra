@@ -49,17 +49,19 @@ impl DepartureHandle {
     /// its records time out, and stop the swarm. Blocks until it has gone out (under a second), or
     /// `timeout`. Call it from outside a tokio runtime, as the handle's other methods.
     pub fn depart(&self, timeout: Duration) -> Result<(), String> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .try_send(SwarmCommand::Shutdown { reply: tx })
-            .map_err(|_| "swarm not running".to_string())?;
+        let cmd_tx = self.cmd_tx.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // Queued even behind a full command channel (a busy node), within the timeout (review
+        // 19 Nov: `try_send` skipped the departure exactly when the node was busiest).
         std::thread::spawn(move || {
-            let _ = done_tx.send(rx.blocking_recv().is_ok());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let done = cmd_tx.blocking_send(SwarmCommand::Shutdown { reply: tx }).is_ok() && rx.blocking_recv().is_ok();
+            let _ = done_tx.send(done);
         });
         match done_rx.recv_timeout(timeout) {
             Ok(true) => Ok(()),
-            _ => Err("departure not confirmed".into()),
+            Ok(false) => Err("swarm not running".into()),
+            Err(_) => Err("departure not confirmed in time".into()),
         }
     }
 }

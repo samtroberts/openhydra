@@ -263,17 +263,8 @@ pub fn start_node(
                 let keypair_for_loop = identity.keypair.clone();
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, peer_relay_leech)) => {
-                        // #16: its bootstraps' and relays' connections stay open, however idle.
-                        let app_peers = swarm.behaviour().keep.peers();
-                        app_peers.keep_always(bootstrap_peers_for_dial.iter().map(|(p, _)| *p));
-                        app_peers.keep_always(relays.iter().filter_map(|a| {
-                            a.iter().find_map(|p| match p {
-                                libp2p::multiaddr::Protocol::P2p(id) => Some(id),
-                                _ => None,
-                            })
-                        }));
                         // Push streams (#4): opened by this node as a consumer, accepted as a provider.
-                        let push = crate::push::PushStreams::new(swarm.behaviour().push.new_control(), *swarm.local_peer_id(), app_peers);
+                        let push = crate::push::PushStreams::new(swarm.behaviour().push.new_control(), *swarm.local_peer_id());
                         if let Err(e) = push.accept(Arc::clone(&proxy_queue_clone)) {
                             let _ = startup_tx.send(Err(format!("push streams: {e}")));
                             return;

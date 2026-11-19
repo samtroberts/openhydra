@@ -1051,6 +1051,19 @@ pub const MODEL_WITHDRAWN_MAX_AGE_SECS: u64 = 120;
 /// matching the 300 s DHT record TTL; a provider that stops (re)announcing then
 /// ages out, while a live one is kept refreshed by each gossip.
 const KNOWN_PEER_TTL_MS: u64 = 300_000;
+/// How old a `PEER_DEPARTED` may be and still be acted on: the gossip forward window (a copy can
+/// still be travelling that long), no longer.
+const PEER_DEPARTED_MAX_AGE_SECS: u64 = GOSSIP_FORWARD_MAX_AGE_MS / 1000;
+
+/// Evict the records of `libp2p_peer_id` its departure at `departed_at_ms` (its signed time) is
+/// newer than, or that carry no time (an older node's); one it signed since (it came back) stays.
+/// Returns how many went.
+fn evict_departed(known_peers: &mut HashMap<String, PeerRecord>, libp2p_peer_id: &str, departed_at_ms: u64) -> usize {
+    let before = known_peers.len();
+    known_peers.retain(|_, r| r.libp2p_peer_id != libp2p_peer_id || (r.updated_unix_ms != 0 && r.updated_unix_ms > departed_at_ms));
+    before - known_peers.len()
+}
+
 /// How long a stopping node keeps its swarm running after publishing its departure, so the notice
 /// is sent before it goes (#19).
 const DEPARTURE_FLUSH: std::time::Duration = std::time::Duration::from_millis(800);
@@ -2613,9 +2626,11 @@ fn handle_provider_pex(
     // The record we already hold, again (each provider's announce reaches us by several paths):
     // nothing to check or change (#9: re-checking its signature took 19% of a relay's CPU at
     // saturation). Still only from its own author, and only while within the age a record is
-    // accepted at.
+    // accepted at. Not an undated record (an older node's): its every receipt renews it (see
+    // `install_known_peer_in`), which skipping would stop (review 19 Nov).
     let now = now_unix_ms();
-    if record.libp2p_peer_id == source_str
+    if record.updated_unix_ms != 0
+        && record.libp2p_peer_id == source_str
         && dht::check_record_age(&record, now).is_ok()
         && state.known_peers.get(&known_peer_key(&record)).is_some_and(|held| *held == record)
     {
@@ -4167,12 +4182,21 @@ fn handle_swarm_event(
                     } else if msg_type == Some("PEER_DEPARTED") {
                         if let Some(departed_id_str) = parsed.get("libp2p_peer_id").and_then(|v| v.as_str()) {
                             if let Ok(departed_pid) = departed_id_str.parse::<PeerId>() {
-                                if message.source == Some(departed_pid) {
-                                    swarm.behaviour_mut().kademlia.remove_peer(&departed_pid);
-                                    info!(%departed_pid, "evicted departed peer via PEER_DEPARTED gossip");
-                                    state.known_peers.retain(|_, record| {
-                                        record.libp2p_peer_id != departed_id_str
-                                    });
+                                // #19 (review 19 Nov): taken only while fresh (a recorded one replayed
+                                // later is ignored), and only the records it is newer than go: a
+                                // provider that restarted under the same identity keeps the records
+                                // it announced since.
+                                let at_ms = parsed.get("timestamp").and_then(|v| v.as_u64()).map(|s| s.saturating_mul(1000));
+                                let fresh = at_ms.is_some_and(|at| withdrawal_is_fresh(at / 1000, now_unix_ms() / 1000, PEER_DEPARTED_MAX_AGE_SECS));
+                                if message.source == Some(departed_pid) && fresh {
+                                    let at = at_ms.unwrap_or(0);
+                                    let evicted = evict_departed(&mut state.known_peers, departed_id_str, at);
+                                    if !state.known_peers.values().any(|r| r.libp2p_peer_id == departed_id_str) {
+                                        swarm.behaviour_mut().kademlia.remove_peer(&departed_pid);
+                                    }
+                                    info!(%departed_pid, evicted, "evicted departed peer via PEER_DEPARTED gossip");
+                                } else if message.source == Some(departed_pid) {
+                                    debug!(%departed_pid, "ignored a stale or undated PEER_DEPARTED (replay?)");
                                 } else {
                                     warn!(
                                         ?message.source, %departed_pid,
@@ -4710,27 +4734,18 @@ fn handle_swarm_event(
                 // A round trip stands for a live path; with no connection left there is none.
                 state.peer_rtts.forget(&peer_id.to_base58());
 
-                // #16: connections nobody used close when idle, on either side, and a closed one
-                // says nothing about its peer: its routing entry and records stay (a provider that
-                // really left goes with its departure, the bootstraps' gone notice, or its records'
-                // age). Only a peer this node uses (or always keeps) is taken as lost.
-                if swarm.behaviour().keep.peers().wanted(&peer_id) {
-                    // Ghost-peer purge: Kademlia routing table
-                    swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
-                    debug!(%peer_id, "evicted from kademlia routing table");
+                // Ghost-peer purge: Kademlia routing table
+                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                debug!(%peer_id, "evicted from kademlia routing table");
 
-                    // Its provider records outlive the connection for LOST_PEER_GRACE_MS (#30): a
-                    // dropped connection is usually back within seconds, and deleting them at once
-                    // left us answering "no provider" until the provider's next announcement. The
-                    // reaper deletes them once the grace runs out with no connection and no record
-                    // since.
-                    let libp2p_id_str = peer_id.to_string();
-                    if state.known_peers.values().any(|record| record.libp2p_peer_id == libp2p_id_str) {
-                        state.lost_at_ms.insert(peer_id, now_unix_ms());
-                        debug!(%peer_id, "lost our last connection to a provider; its records stay for the grace period");
-                    }
-                } else {
-                    debug!(%peer_id, "an unused connection closed; the peer's routing entry and records stay");
+                // Its provider records outlive the connection for LOST_PEER_GRACE_MS (#30): a dropped
+                // connection is usually back within seconds, and deleting them at once left us
+                // answering "no provider" until the provider's next announcement. The reaper
+                // deletes them once the grace runs out with no connection and no record since.
+                let libp2p_id_str = peer_id.to_string();
+                if state.known_peers.values().any(|record| record.libp2p_peer_id == libp2p_id_str) {
+                    state.lost_at_ms.insert(peer_id, now_unix_ms());
+                    debug!(%peer_id, "lost our last connection to a provider; its records stay for the grace period");
                 }
 
                 // E-N3: prune the remaining per-peer maps that keyed off this
@@ -6175,7 +6190,6 @@ fn send_proxy_request(
     data: Vec<u8>,
     reply: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
 ) {
-    swarm.behaviour().keep.peers().note(peer);
     if state.proxy_inflight.get(&peer).copied().unwrap_or(0) >= proxy_slots(state, peer) {
         let waiting = state.proxy_waiting.entry(peer).or_default();
         if waiting.len() >= MAX_PROXY_WAITING_PER_PEER {
@@ -6267,8 +6281,6 @@ fn handle_grpc_proxy_event(
 ) {
     match event {
         request_response::Event::Message { peer, message } => {
-            // A peer we exchange requests with: its connections stay open (#16).
-            swarm.behaviour().keep.peers().note(peer);
             match message {
                 request_response::Message::Request { request_id: rid, request, channel } => {
                     // Phase 2.4: per-peer inflight cap. Count this peer's live
@@ -7050,6 +7062,35 @@ mod tests {
         // A connection made since then does.
         state.conn_remote_addrs.insert(conn(5), (a, "/ip4/45.79.190.172/tcp/4001".parse().unwrap(), t0 + std::time::Duration::from_secs(2)));
         assert_eq!(bootstrap_redials(&state), vec![(a, a6), (b, b4)]);
+    }
+
+    #[test]
+    fn a_departure_evicts_only_the_records_it_is_newer_than() {
+        let rec = |peer: &str, model: &str, ms: u64| PeerRecord { libp2p_peer_id: peer.into(), model_id: model.into(), updated_unix_ms: ms, ..Default::default() };
+        let mut known = HashMap::new();
+        for r in [rec("P", "a", 1_000), rec("P", "b", 0), rec("P", "c", 5_000), rec("Q", "a", 1_000)] {
+            known.insert(known_peer_key(&r), r);
+        }
+        // P departed at 3 s, then came back and announced "c" at 5 s.
+        assert_eq!(evict_departed(&mut known, "P", 3_000), 2, "the older one and the undated one");
+        let mut left: Vec<_> = known.values().map(|r| (r.libp2p_peer_id.clone(), r.model_id.clone())).collect();
+        left.sort();
+        assert_eq!(left, vec![("P".to_string(), "c".to_string()), ("Q".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn an_undated_record_is_checked_and_renewed_every_time_it_comes() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let me = key.public().to_peer_id();
+        let unsigned = PeerRecord { peer_id: "node".into(), model_id: "m".into(), host: "1.2.3.4".into(), port: 4001, libp2p_peer_id: me.to_base58(), updated_unix_ms: 0, ..Default::default() };
+        let record = dht::sign_peer_record(&unsigned, &key).unwrap();
+        let advert = serde_json::json!({"type": PROVIDER_ANNOUNCE_TYPE, "record": record});
+        let mut state = LoopState::new();
+        assert!(handle_provider_pex(&mut state, &advert, Some(me)));
+        let k = known_peer_key(&record);
+        state.known_received.insert(k.clone(), 1);
+        assert!(handle_provider_pex(&mut state, &advert, Some(me)));
+        assert!(state.known_received[&k] > 1, "renewed on receipt, as before #9");
     }
 
     #[test]

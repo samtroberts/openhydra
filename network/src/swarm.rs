@@ -38,8 +38,10 @@ pub fn gossip_topic_filter() -> gossipsub::WhitelistSubscriptionFilter {
 pub const GOSSIP_MAX_TRANSMIT: usize = 64 * 1024;
 
 /// The longest a node may go between announcements of its records (#13): Kad no longer republishes
-/// them itself, so two must fit in the 300 s record TTL with room for one to fail.
-pub const ANNOUNCE_REFRESH_MAX: std::time::Duration = std::time::Duration::from_secs(150);
+/// them itself, so after one announcement fails the next must still land inside the 300 s record
+/// TTL, with room for the provider loop's half-second ticks and a slow put (review 19 Nov: at 150 s
+/// a lost one met the TTL exactly).
+pub const ANNOUNCE_REFRESH_MAX: std::time::Duration = std::time::Duration::from_secs(140);
 
 /// How long a gossip message id is remembered to drop duplicates (#6). Every honest copy of a
 /// message arrives within a few heartbeats, but a node that pauses (a laptop asleep, a stalled
@@ -487,15 +489,16 @@ pub fn build_swarm(
         ping,
         upnp,
         push: libp2p_stream::Behaviour::new(),
-        keep: crate::keep::Behaviour::new(crate::keep::AppPeers::default()),
     };
 
-    // #16: an unused connection closes after `keep::IDLE_TIMEOUT` (60 s; it was 300 s for every
-    // connection, so the DHT's traffic kept ~27 per provider open for good). A peer this node really
-    // uses keeps its connections for `keep::APP_KEEP` after its last use, idle or not, so a long
-    // inference session or the next request finds its connection still there (see `keep`).
+    // F-N8 (note): a 300 s idle-connection timeout keeps an otherwise-silent
+    // connection open for up to 5 min. That is intentional for long inference
+    // sessions (a slow completion can idle the proxy stream between chunks), but
+    // it sits in tension with prompt dead-peer reaping — ping-failure eviction and
+    // the known_peers reaper are what actually detect a dead peer here, not this
+    // timeout. Kept at 300 s deliberately; revisit only if idle-conn count grows.
     let swarm_config = SwarmConfig::with_tokio_executor()
-        .with_idle_connection_timeout(crate::keep::IDLE_TIMEOUT);
+        .with_idle_connection_timeout(Duration::from_secs(300));
 
     let combined_transport = if opts.fence_openhydra {
         crate::fence::FenceTransport::new(combined_transport, crate::fence::Fenced::openhydra()).boxed()

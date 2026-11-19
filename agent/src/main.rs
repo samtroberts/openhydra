@@ -971,7 +971,7 @@ struct ProvideArgs {
     #[arg(long)]
     db: Option<PathBuf>,
 
-    /// Seconds between DHT re-announcements. At most 150 (higher is lowered to it): records last
+    /// Seconds between DHT re-announcements. At most 140 (higher is lowered to it): records last
     /// 300 s, and nothing else refreshes them (#13).
     #[arg(long, default_value_t = 120)]
     reannounce_secs: u64,
@@ -2300,39 +2300,78 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     )
 }
 
-/// Wait for SIGTERM or SIGINT (Ctrl-C elsewhere), then publish this node's departure, so its peers
-/// drop it at once instead of listing it until its records time out (#19: no departure was ever
-/// sent, so a stopped provider stayed listed for up to 300 s), and exit. A second signal while it
-/// departs changes nothing: it exits within [`DEPARTURE_WAIT`] either way.
+/// Wait for SIGTERM, SIGINT (Ctrl-C) or SIGHUP (its terminal closed), then publish this node's
+/// departure, so its peers drop it at once instead of listing it until its records time out (#19:
+/// none was ever sent, so a stopped provider stayed listed for up to 300 s), and exit. It exits
+/// within [`DEPARTURE_WAIT`], and at once on a second signal, with the status the signal would have
+/// given (128 + its number). `_exit`, not `exit`: like the signal's default action, it runs no
+/// destructors or exit handlers, which an in-process engine's (MLX) could block or crash on while a
+/// generation runs (review 19 Nov).
 fn spawn_departure_on_signal(depart: openhydra_network::handle::DepartureHandle) {
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_io().build() else { return };
-        let signal = rt.block_on(async {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build() else { return };
+        rt.block_on(async move {
             #[cfg(unix)]
-            {
+            let (name, code, mut again) = {
                 use tokio::signal::unix::{signal, SignalKind};
-                let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
-                    return None;
-                };
-                tokio::select! {
-                    _ = term.recv() => Some("SIGTERM"),
-                    _ = int.recv() => Some("SIGINT"),
+                // Each on its own, so one that can't be watched leaves the others watched.
+                let mut term = signal(SignalKind::terminate()).ok();
+                let mut int = signal(SignalKind::interrupt()).ok();
+                let mut hup = signal(SignalKind::hangup()).ok();
+                async fn next(s: &mut Option<tokio::signal::unix::Signal>) {
+                    match s {
+                        Some(s) => {
+                            s.recv().await;
+                        }
+                        None => std::future::pending().await,
+                    }
                 }
-            }
+                let (name, code) = tokio::select! {
+                    _ = next(&mut term) => ("SIGTERM", 128 + libc::SIGTERM),
+                    _ = next(&mut int) => ("SIGINT", 128 + libc::SIGINT),
+                    _ = next(&mut hup) => ("SIGHUP", 128 + libc::SIGHUP),
+                };
+                let again = async move {
+                    tokio::select! {
+                        _ = next(&mut term) => {}
+                        _ = next(&mut int) => {}
+                        _ = next(&mut hup) => {}
+                    }
+                };
+                (name, code, Box::pin(again))
+            };
             #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await.ok().map(|_| "Ctrl-C")
+            let (name, code, mut again) = {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                ("Ctrl-C", 130, Box::pin(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                }))
+            };
+            eprintln!("openhydra-agent: {name}: telling the network this node is leaving");
+            let leaving = tokio::task::spawn_blocking(move || depart.depart(DEPARTURE_WAIT));
+            tokio::select! {
+                r = leaving => {
+                    if let Ok(Err(e)) = r {
+                        eprintln!("openhydra-agent: departure not sent: {e}");
+                    }
+                }
+                _ = &mut again => eprintln!("openhydra-agent: signalled again: exiting at once"),
             }
+            exit_now(code);
         });
-        drop(rt);
-        if let Some(signal) = signal {
-            eprintln!("openhydra-agent: {signal}: telling the network this node is leaving");
-            if let Err(e) = depart.depart(DEPARTURE_WAIT) {
-                eprintln!("openhydra-agent: departure not sent: {e}");
-            }
-            std::process::exit(0);
-        }
     });
+}
+
+/// Exit with `code` at once: no destructors, no exit handlers (see [`spawn_departure_on_signal`]).
+fn exit_now(code: i32) -> ! {
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code)
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
 }
 
 /// The most a stopping agent waits for its departure to go out.

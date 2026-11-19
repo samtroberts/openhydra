@@ -105,13 +105,15 @@ fn sweep_stale_agents() {
     let _ = std::fs::remove_file(pidfile());
 }
 
-/// Kill the registered children and re-raise. Only async-signal-safe calls in here.
+/// Stop the registered children and re-raise. Only async-signal-safe calls in here. SIGTERM, not
+/// SIGKILL (#19): each departs and exits by itself within about two seconds (the agent bounds it),
+/// and one that somehow doesn't is reaped by the next launch's sweep.
 #[cfg(unix)]
 extern "C" fn on_signal(sig: libc::c_int) {
     for slot in [&PROVIDER_PID, &GATEWAY_PID] {
         let pid = slot.load(Ordering::SeqCst);
         if pid != 0 {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         }
     }
     unsafe {
@@ -895,33 +897,39 @@ impl Role {
         }
     }
 
-    /// Ask it to stop (SIGTERM), without waiting: [`Role::kill`] then waits for it. Lets two roles
-    /// stopping together depart at the same time rather than one after the other.
-    fn ask_to_stop(&self) {
-        #[cfg(unix)]
-        if let Some(child) = &self.child {
-            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-        }
-    }
-
-    fn kill(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            // #19: asked to stop first, so it can tell the network it is leaving (it exits within
-            // about a second); killed only if it hasn't by then.
-            #[cfg(unix)]
-            {
-                unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-                let until = std::time::Instant::now() + std::time::Duration::from_millis(2500);
-                while std::time::Instant::now() < until && matches!(child.try_wait(), Ok(None)) {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    /// Take its agent out to be stopped ([`stop_agents`], with no lock held), marking it stopped.
+    fn take_child(&mut self) -> Option<Child> {
+        let child = self.child.take();
         self.status.running = false;
         self.status.pid = None;
         registry_set(self.pid_slot, 0);
+        child
+    }
+}
+
+/// How long stopping agents have to tell the network they are leaving (#19: an agent asked to stop
+/// with SIGTERM departs and exits within about a second) before they are killed.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Stop agents taken out of their roles ([`Role::take_child`]): asked to stop (SIGTERM), all at
+/// once, then killed when [`STOP_GRACE`] runs out. Called with no role lock held: it waits, and the
+/// log pump and the window's state reads take those locks (review 19 Nov: holding one froze the
+/// window for the wait).
+fn stop_agents(children: impl IntoIterator<Item = Child>) {
+    let mut children: Vec<Child> = children.into_iter().collect();
+    #[cfg(unix)]
+    {
+        for child in &children {
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        }
+        let until = std::time::Instant::now() + STOP_GRACE;
+        while std::time::Instant::now() < until && children.iter_mut().any(|c| matches!(c.try_wait(), Ok(None))) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    for child in &mut children {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -1517,7 +1525,8 @@ fn restart_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     if !state.provider.lock().map(|r| r.status.running).unwrap_or(false) {
         return Err("not sharing".into());
     }
-    state.provider.lock().map_err(|e| e.to_string())?.kill();
+    let child = state.provider.lock().map_err(|e| e.to_string())?.take_child();
+    stop_agents(child);
     start_provider_now(state)
 }
 
@@ -2391,16 +2400,18 @@ fn gateway_subcommand(settings: &Settings, provider_id: Option<String>) -> Vec<S
     sub
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stop_provider(state: tauri::State<'_, AppState>) {
     let _one_at_a_time = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
-    state.provider.lock().expect("role lock").kill();
+    let child = state.provider.lock().expect("role lock").take_child();
+    stop_agents(child);
     set_sharing_enabled(&state, false); // user turned sharing off — don't resume on next launch
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stop_gateway(state: tauri::State<'_, AppState>) {
-    state.gateway.lock().expect("role lock").kill();
+    let child = state.gateway.lock().expect("role lock").take_child();
+    stop_agents(child);
 }
 
 #[derive(Serialize)]
@@ -3634,10 +3645,9 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 // ── App wiring: tray, hide-on-close, kill children on exit ──
 
 fn kill_all(state: &AppState) {
-    state.provider.lock().expect("role lock").ask_to_stop();
-    state.gateway.lock().expect("role lock").ask_to_stop();
-    state.provider.lock().expect("role lock").kill();
-    state.gateway.lock().expect("role lock").kill();
+    let provider = state.provider.lock().expect("role lock").take_child();
+    let gateway = state.gateway.lock().expect("role lock").take_child();
+    stop_agents(provider.into_iter().chain(gateway));
 }
 
 /// The pages the app window may show: its own bundled UI (`tauri://localhost` on macOS and Linux,
