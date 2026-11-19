@@ -10,17 +10,23 @@
 //!               [--sample-every K] [--models K] [--flood-rate PER_SEC] [--nat]
 //! `--models K`: a provider announces K models (sim-I, sim-I.1 … sim-I.K-1; record stuffing at K
 //! in the hundreds). `--nat`: listen on loopback only, like a peer behind NAT (no dial-backs).
-//! `--v6-prefix P`: peer I listens (and so dials, with port reuse) only from address P+I, e.g.
-//! `2406:da1b:c0:6601:1::` — many sources in one /64 (needs the prefix routed to this host).
+//! `--v6-prefix P`: peer I listens (TCP) only on address P+I, e.g. `2406:da1b:c0:6601:1::` (needs
+//! the prefix routed to this host). Its TCP dials still leave from the host's default address:
+//! libp2p-tcp reuses a listen port by binding the wildcard address, not the listen address.
 //! `flooder`: announces a new model `--flood-rate` times a second. `junk`: publishes invalid
 //! gossip (random bytes, oversized, unknown type, forged and stale announces) at `--flood-rate`.
 //! `--announce-every SECS` (default 120): how often a provider re-announces (a long one stands for
-//! announcing only on change, #11). `--listen-ip IP`: listen (and so dial, with port reuse) only
-//! from IP, one process per address on a host with several (per-address limits at the bootstrap).
+//! announcing only on change, #11). `--listen-ip IP`: listen only on IP, one process per address on
+//! a host with several (per-address limits at the bootstrap). Only QUIC dials leave from IP (they
+//! use the listening socket); TCP dials leave from the host's default address (libp2p-tcp binds the
+//! wildcard to reuse a port), so give the bootstraps as `/udp/…/quic-v1` addresses to spread the
+//! peers over the host's addresses (19 Nov: over TCP, a host's peers all counted as one address).
 //! Providers announce records the size of a real agent's (as `dht::pex_cost_measure`).
 //! Prints one JSON line of aggregate counters and percentiles per second to stdout, with the
 //! process's gossip counters (bytes received, unique and duplicate messages, signatures checked:
-//! one process's total; divide by `started` for a node's share, or run an observer with --count 1).
+//! one process's total; divide by `started` for a node's share, or run an observer with --count 1),
+//! and the sampled peers' gossip mesh: how many have no mesh peer, and their mesh and topic peers
+//! summed. Logs go to stderr only when RUST_LOG is set (e.g. RUST_LOG=warn).
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -46,6 +52,11 @@ struct Stats {
     sampled_known_models: AtomicU64,
     sampled_bootstrap_connected: AtomicU64,
     sampled_other_models: AtomicU64,
+    /// Sampled peers with no gossip mesh peer (they hear announces only through IHAVE, or not at all).
+    sampled_no_mesh: AtomicU64,
+    /// Sampled peers' gossip mesh and topic peers, summed.
+    sampled_mesh_peers: AtomicU64,
+    sampled_topic_peers: AtomicU64,
     errors: Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
@@ -108,6 +119,10 @@ fn main() {
     }
     std::fs::create_dir_all(&dir).expect("dir");
     openhydra_network::node::disable_mdns();
+    // Logs (stderr) only when asked: RUST_LOG=warn shows e.g. gossipsub giving up on a connection.
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_writer(std::io::stderr).try_init();
+    }
 
     let stats = Arc::new(Stats::default());
     let t0 = Instant::now();
@@ -142,6 +157,9 @@ fn main() {
                 "sampled_known_models": stats.sampled_known_models.load(Relaxed),
                 "sampled_bootstrap_connected": stats.sampled_bootstrap_connected.load(Relaxed),
                 "sampled_other_models": stats.sampled_other_models.load(Relaxed),
+                "sampled_no_mesh": stats.sampled_no_mesh.load(Relaxed),
+                "sampled_mesh_peers": stats.sampled_mesh_peers.load(Relaxed),
+                "sampled_topic_peers": stats.sampled_topic_peers.load(Relaxed),
                 "gossip_bytes_in": libp2p::gossipsub::openhydra_counters::RPC_BYTES_IN.load(Relaxed),
                 "gossip_unique": libp2p::gossipsub::openhydra_counters::UNIQUE_MESSAGES.load(Relaxed),
                 "gossip_duplicates": libp2p::gossipsub::openhydra_counters::DUPLICATES.load(Relaxed),
@@ -247,6 +265,7 @@ fn run_peer(
             .stack_size(256 * 1024)
             .spawn(move || {
                 let (mut reserved, mut connected, mut known, mut other) = (false, false, 0u64, 0u64);
+                let (mut no_mesh, mut mesh, mut topic) = (false, 0u64, 0u64);
                 loop {
                     std::thread::sleep(Duration::from_secs(5));
                     let Ok(s) = net.status() else { continue };
@@ -268,6 +287,17 @@ fn run_peer(
                     stats.sampled_other_models.fetch_add(o, Relaxed);
                     stats.sampled_other_models.fetch_sub(other, Relaxed);
                     other = o;
+                    let (m, t) = (s.gossip_mesh_peers.len() as u64, s.gossip_topic_peers.len() as u64);
+                    if (m == 0) != no_mesh {
+                        if m == 0 { stats.sampled_no_mesh.fetch_add(1, Relaxed); } else { stats.sampled_no_mesh.fetch_sub(1, Relaxed); }
+                        no_mesh = m == 0;
+                    }
+                    stats.sampled_mesh_peers.fetch_add(m, Relaxed);
+                    stats.sampled_mesh_peers.fetch_sub(mesh, Relaxed);
+                    mesh = m;
+                    stats.sampled_topic_peers.fetch_add(t, Relaxed);
+                    stats.sampled_topic_peers.fetch_sub(topic, Relaxed);
+                    topic = t;
                     stats.sampled_known_models.fetch_add(k, Relaxed);
                     stats.sampled_known_models.fetch_sub(known, Relaxed);
                     known = k;
