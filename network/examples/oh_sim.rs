@@ -14,7 +14,13 @@
 //! `2406:da1b:c0:6601:1::` — many sources in one /64 (needs the prefix routed to this host).
 //! `flooder`: announces a new model `--flood-rate` times a second. `junk`: publishes invalid
 //! gossip (random bytes, oversized, unknown type, forged and stale announces) at `--flood-rate`.
-//! Prints one JSON line of aggregate counters and percentiles per second to stdout.
+//! `--announce-every SECS` (default 120): how often a provider re-announces (a long one stands for
+//! announcing only on change, #11). `--listen-ip IP`: listen (and so dial, with port reuse) only
+//! from IP, one process per address on a host with several (per-address limits at the bootstrap).
+//! Providers announce records the size of a real agent's (as `dht::pex_cost_measure`).
+//! Prints one JSON line of aggregate counters and percentiles per second to stdout, with the
+//! process's gossip counters (bytes received, unique and duplicate messages, signatures checked:
+//! one process's total; divide by `started` for a node's share, or run an observer with --count 1).
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -93,7 +99,9 @@ fn main() {
     let flood_rate: f64 = arg(&args, "--flood-rate").and_then(|v| v.parse().ok()).unwrap_or(10.0);
     let nat = args.iter().any(|a| a == "--nat");
     let v6_prefix: Option<std::net::Ipv6Addr> = arg(&args, "--v6-prefix").map(|v| v.parse().expect("--v6-prefix"));
-    let opts = Opts { req_every, req_bytes, reply_bytes, prov_lo, prov_hi, models, flood_rate, nat, v6_prefix };
+    let announce_every: f64 = arg(&args, "--announce-every").and_then(|v| v.parse().ok()).unwrap_or(120.0);
+    let listen_ip: Option<std::net::Ipv4Addr> = arg(&args, "--listen-ip").map(|v| v.parse().expect("--listen-ip"));
+    let opts = Opts { req_every, req_bytes, reply_bytes, prov_lo, prov_hi, models, flood_rate, nat, v6_prefix, announce_every, listen_ip };
     if bootstraps.is_empty() {
         eprintln!("oh-sim: --bootstrap required");
         std::process::exit(2);
@@ -134,6 +142,10 @@ fn main() {
                 "sampled_known_models": stats.sampled_known_models.load(Relaxed),
                 "sampled_bootstrap_connected": stats.sampled_bootstrap_connected.load(Relaxed),
                 "sampled_other_models": stats.sampled_other_models.load(Relaxed),
+                "gossip_bytes_in": libp2p::gossipsub::openhydra_counters::RPC_BYTES_IN.load(Relaxed),
+                "gossip_unique": libp2p::gossipsub::openhydra_counters::UNIQUE_MESSAGES.load(Relaxed),
+                "gossip_duplicates": libp2p::gossipsub::openhydra_counters::DUPLICATES.load(Relaxed),
+                "gossip_checked": libp2p::gossipsub::openhydra_counters::COPIES_CHECKED.load(Relaxed),
                 "errors": errors,
             });
             println!("{line}");
@@ -178,6 +190,8 @@ struct Opts {
     flood_rate: f64,
     nat: bool,
     v6_prefix: Option<std::net::Ipv6Addr>,
+    announce_every: f64,
+    listen_ip: Option<std::net::Ipv4Addr>,
 }
 
 fn run_peer(
@@ -190,7 +204,7 @@ fn run_peer(
     stats: Arc<Stats>,
     opts: Opts,
 ) {
-    let Opts { req_every, req_bytes, reply_bytes, prov_lo, prov_hi, models, flood_rate, nat, v6_prefix } = opts;
+    let Opts { req_every, req_bytes, reply_bytes, prov_lo, prov_hi, models, flood_rate, nat, v6_prefix, announce_every, listen_ip } = opts;
     let listen = if let Some(p) = v6_prefix {
         let a = std::net::Ipv6Addr::from(u128::from(p) + i as u128);
         vec![format!("/ip6/{a}/tcp/0")]
@@ -198,6 +212,8 @@ fn run_peer(
         // Loopback only: no address another peer could dial directly, so every request to it
         // comes through the test bootstrap's relay (and hole punching has nothing to work with).
         vec!["/ip4/127.0.0.1/tcp/0".to_string()]
+    } else if let Some(ip) = listen_ip {
+        vec![format!("/ip4/{ip}/tcp/0"), format!("/ip4/{ip}/udp/0/quic-v1")]
     } else {
         vec!["/ip4/0.0.0.0/tcp/0".to_string(), "/ip4/0.0.0.0/udp/0/quic-v1".to_string()]
     };
@@ -262,11 +278,29 @@ fn run_peer(
 
     match role {
         "provider" | "relayed-provider" => {
+            // The size of a real agent's record (the fields `dht::pex_cost_measure` fills).
             let record = |model_id: String| PeerRecord {
                 peer_id: net.openhydra_peer_id().to_string(),
+                canonical_model_id: model_id.clone(),
+                runtime_model_id: model_id.clone(),
                 model_id,
-                host: "0.0.0.0".into(),
+                host: "203.0.113.25".into(),
                 port: 18001,
+                region: Some("ap-south".into()),
+                daemon_mode: "provider".into(),
+                runtime_backend: "ollama".into(),
+                runtime_target: "cuda".into(),
+                quantization_mode: "q4_k_m".into(),
+                quantization_bits: 4,
+                runtime_gpu_available: true,
+                runtime_estimated_tokens_per_sec: 42.0,
+                runtime_estimated_memory_mb: 6144,
+                context_length: 40960,
+                max_output_tokens: 8192,
+                hardware_class: "consumer-gpu".into(),
+                nat_type: "port_restricted".into(),
+                requires_relay: true,
+                relay_address: "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit".into(),
                 libp2p_peer_id: net.libp2p_peer_id().to_string(),
                 public_key: net.public_key_hex().to_string(),
                 ..Default::default()
@@ -274,17 +308,22 @@ fn run_peer(
             let records: Vec<PeerRecord> =
                 (0..models).map(|k| record(if k == 0 { format!("sim-{i}") } else { format!("sim-{i}.{k}") })).collect();
             std::thread::sleep(Duration::from_secs(3));
-            let mut next_announce = Instant::now();
+            // Started at a random point of the cycle, as real providers are (they don't start together).
+            let mut next_announce = Instant::now() + Duration::from_secs_f64(rand::random::<f64>() * announce_every.min(120.0));
+            let mut first = true;
             let reply = vec![b'x'; reply_bytes];
             loop {
-                if Instant::now() >= next_announce {
+                if first || Instant::now() >= next_announce {
                     for r in &records {
                         match net.announce(r.clone()) {
                             Ok(()) => { stats.announces.fetch_add(1, Relaxed); }
                             Err(e) => note_err(&stats, &format!("announce: {e}")),
                         }
                     }
-                    next_announce = Instant::now() + Duration::from_secs(120);
+                    if !first {
+                        next_announce = Instant::now() + Duration::from_secs_f64(announce_every);
+                    }
+                    first = false;
                 }
                 if let Some((request_id, source, _data)) = net.poll_inbound(Duration::from_secs(1)) {
                     net.serve_accepted(&source);

@@ -2629,6 +2629,24 @@ fn handle_provider_pex(
     // accepted at. Not an undated record (an older node's): its every receipt renews it (see
     // `install_known_peer_in`), which skipping would stop (review 19 Nov).
     let now = now_unix_ms();
+    // For measuring how often providers change (run with RUST_LOG=openhydra_pex_observe=debug):
+    // every announcement received, with a fingerprint of what it says apart from its time.
+    if tracing::enabled!(target: "openhydra_pex_observe", tracing::Level::DEBUG) {
+        let mut what = record.clone();
+        what.updated_unix_ms = 0;
+        what.signature = String::new();
+        what.load_pct = 0.0;
+        what.queue_depth = 0;
+        what.throughput_tok_s = 0.0;
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_string(&what).unwrap_or_default().hash(&mut h);
+            h.finish()
+        };
+        tracing::debug!(target: "openhydra_pex_observe", peer = %record.libp2p_peer_id, model = %record.model_id,
+            updated_ms = record.updated_unix_ms, fingerprint = format!("{fingerprint:016x}"), bytes = parsed.to_string().len(), "announce");
+    }
     if record.updated_unix_ms != 0
         && record.libp2p_peer_id == source_str
         && dht::check_record_age(&record, now).is_ok()
