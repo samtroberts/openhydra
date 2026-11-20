@@ -4185,6 +4185,16 @@ fn handle_swarm_event(
                 // fresh enough that every node it reaches still remembers it; used here either way.
                 let parsed = serde_json::from_slice::<serde_json::Value>(&message.data).ok();
                 let forward = parsed.as_ref().map_or(true, |v| gossip_forwardable(v, now_unix_ms()));
+                // Diagnostic (target oh_gossip_types): every delivered gossip message, by type, author,
+                // model and the record's own time, with its sequence number.
+                if tracing::enabled!(target: "oh_gossip_types", tracing::Level::DEBUG) {
+                    let p = parsed.as_ref();
+                    let ty = p.and_then(|v| v.get("type")).and_then(|v| v.as_str()).unwrap_or("?");
+                    let rec = p.and_then(|v| v.get("record"));
+                    let model = rec.and_then(|r| r.get("model_id")).and_then(|v| v.as_str()).unwrap_or("");
+                    let upd = rec.and_then(|r| r.get("updated_unix_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
+                    debug!(target: "oh_gossip_types", ty, source = ?message.source, model, updated_ms = upd, seqno = ?message.sequence_number, via = %propagation_source, bytes = message.data.len(), "gossip in");
+                }
                 let acceptance = if forward {
                     libp2p::gossipsub::MessageAcceptance::Accept
                 } else {
@@ -5284,8 +5294,10 @@ fn handle_kad_event(
         kad::Event::InboundRequest { request } => {
             handle_inbound_kad_request(request, swarm, state);
         }
-        kad::Event::RoutingUpdated { peer, .. } => {
+        kad::Event::RoutingUpdated { peer, addresses, is_new_peer, .. } => {
             debug!(%peer, "kademlia routing updated");
+            // Diagnostic (target oh_kad_diag): who enters the routing table, and by which address.
+            debug!(target: "oh_kad_diag", %peer, is_new_peer, addresses = ?addresses.iter().collect::<Vec<_>>(), "routing table add");
         }
         // Phase 1.2: UnroutablePeer is the strongest signal that a peer
         // should be evicted — Kademlia itself declares it unreachable.
