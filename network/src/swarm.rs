@@ -37,6 +37,10 @@ pub fn gossip_topic_filter() -> gossipsub::WhitelistSubscriptionFilter {
 /// from that peer stops without an error (review 2026-10-29, reproduced at 32 KB).
 pub const GOSSIP_MAX_TRANSMIT: usize = 64 * 1024;
 
+/// OpenHydra's Kademlia protocol. A peer lists it in identify only while it answers DHT requests
+/// (server mode); a client-mode peer (behind NAT, not yet confirmed reachable) does not.
+pub const KAD_PROTOCOL: libp2p::StreamProtocol = libp2p::StreamProtocol::new("/openhydra/kad/1.0.0");
+
 /// The longest a node may go between announcements of its records (#13): Kad no longer republishes
 /// them itself, so after one announcement fails the next must still land inside the 300 s record
 /// TTL, with room for the provider loop's half-second ticks and a slow put (review 19 Nov: at 150 s
@@ -220,7 +224,7 @@ pub fn build_swarm(
     // now set explicitly so the behaviour is intentional and survives upstream
     // default changes.
     let mut kad_config = kad::Config::new(
-        libp2p::StreamProtocol::new("/openhydra/kad/1.0.0"),
+        KAD_PROTOCOL,
     );
 
     // Query timeout. The iterative-lookup ceiling. Left at 10 s: long enough for a

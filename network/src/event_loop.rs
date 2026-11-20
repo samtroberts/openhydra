@@ -1528,7 +1528,13 @@ pub async fn run_event_loop(
         let warm = routing_cache::load(cache_path);
         let n = warm.len();
         for (peer_id, addr) in warm {
-            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            // A relayed entry (from a cache written before the 20 Nov identify rule) is a peer that
+            // doesn't answer DHT requests: kept for our own dials only.
+            if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) {
+                swarm.behaviour_mut().address_book.insert(peer_id, addr);
+            } else {
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            }
         }
         if n > 0 {
             info!(contacts = n, ?cache_path, "R-DHT-6: warm-started routing table from cache");
@@ -3922,8 +3928,20 @@ fn handle_swarm_event(
                     state.relay_self_addrs.insert(peer_id, own);
                 }
                 let trusted = trusted_relay_pids(state);
+                // Only a peer that answers DHT requests belongs in the routing table. A client-mode
+                // peer (a node behind NAT reachable only through its relay) doesn't list our Kad
+                // protocol; putting its circuit address in anyway made every DHT query dial it
+                // through the relay and hole-punch, for an answer that never came (20 Nov: ~250 such
+                // peers filled public providers' tables within minutes of a 1,500-node start, and
+                // the dials were part of a connection storm that ran them out of memory).
+                let serves_dht = info.protocols.iter().any(|p| *p == crate::swarm::KAD_PROTOCOL);
                 for addr in identify_routing_addrs(&info.listen_addrs, &peer_id, &trusted, state.ipv6_capable) {
-                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    if serves_dht {
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    } else {
+                        // Kept for our own redials only (a reconnect after a drop).
+                        swarm.behaviour_mut().address_book.insert(peer_id, addr);
+                    }
                 }
                 // Its direct addresses on the IP this connection really comes from are kept for our
                 // own dials to this peer only (a reconnect after a drop): the address book, which is
@@ -5488,9 +5506,13 @@ fn accept_and_install_record(
         if let Ok(pid) = peer_record.libp2p_peer_id.parse::<PeerId>() {
             let trusted = trusted_relay_pids(state);
             match crate::relay::safe_injectable_circuit_addr(&peer_record.relay_address, &pid, &trusted) {
+                // Kept for our own dials to it only (the address book), not put in the routing
+                // table: a provider reachable only through a relay doesn't answer DHT requests, and
+                // in the table every DHT query nearby would dial it through the relay for nothing
+                // and hand it to other peers in FIND_NODE answers (20 Nov; see the identify rule).
                 Some(ma) => {
-                    let update = swarm.behaviour_mut().kademlia.add_address(&pid, ma.clone());
-                    debug!(%pid, %ma, ?update, "discover_auto_added_address");
+                    let new = swarm.behaviour_mut().address_book.insert(pid, ma.clone());
+                    debug!(%pid, %ma, new, "discover_kept_relay_address");
                 }
                 None => {
                     warn!(%pid, addr = %peer_record.relay_address,
