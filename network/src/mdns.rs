@@ -95,6 +95,13 @@ impl LanDialer {
         }
     }
 
+    /// Whether mDNS currently lists `peer`: a peer on our LAN, not merely one reaching us over a
+    /// private address (inside one cloud network, a company network or a carrier's NAT every peer
+    /// does that).
+    pub fn knows(&self, peer: &PeerId) -> bool {
+        self.known.contains_key(peer)
+    }
+
     /// mDNS no longer lists `addr` for `peer`.
     pub fn expired(&mut self, peer: &PeerId, addr: &Multiaddr) {
         if let Some(addrs) = self.known.get_mut(peer) {
@@ -274,6 +281,20 @@ mod tests {
 
     fn lan(n: u8) -> Vec<Multiaddr> {
         vec![format!("/ip4/192.168.0.{n}/tcp/4001").parse().unwrap()]
+    }
+
+    #[test]
+    fn a_peer_is_on_the_lan_only_while_mdns_lists_it() {
+        let mut d = LanDialer::new();
+        let p = PeerId::random();
+        assert!(!d.knows(&p), "a peer reaching us over a private address alone isn't a LAN peer");
+        d.discovered(p, lan(5)[0].clone());
+        d.discovered(p, lan(6)[0].clone());
+        assert!(d.knows(&p));
+        d.expired(&p, &lan(5)[0]);
+        assert!(d.knows(&p), "still listed at another address");
+        d.expired(&p, &lan(6)[0]);
+        assert!(!d.knows(&p));
     }
 
     #[test]

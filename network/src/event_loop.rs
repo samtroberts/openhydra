@@ -3908,7 +3908,14 @@ fn handle_swarm_event(
                         c.seen_as = multiaddr_ip(&info.observed_addr).map(|ip| (ip, ours.contains(&ip)));
                     }
                 }
-                let on_lan = state.local_link_peers.contains_key(&peer_id);
+                // A LAN peer is one mDNS lists *and* that reaches us over a private address. A private
+                // address alone isn't enough: inside one cloud network, a company network or a
+                // carrier's NAT every peer has one, and then every new connection re-published our
+                // records to the whole network, at most every 10 s each (20 Nov: ~4 times the
+                // announce traffic in a 1,500-node test, which with connection churn overloaded the
+                // public nodes). Over the internet and in such networks, peers find providers through
+                // the DHT, the bootstraps' registry and the periodic announce.
+                let on_lan = state.local_link_peers.contains_key(&peer_id) && state.lan_dialer.knows(&peer_id);
                 debug!(%peer_id, openhydra, same_network, on_lan, due = ?state.lan_announce.due, "identify: LAN re-announce check");
                 // Once per peer while it stays connected: identify also runs every 5 minutes and on
                 // every push, and each re-announce floods the whole network (review 2026-10-29).
