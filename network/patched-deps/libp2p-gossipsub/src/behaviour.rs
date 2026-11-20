@@ -1371,6 +1371,7 @@ where
                     if let Some(backoff_time) = self.backoffs.get_backoff_time(&topic_hash, peer_id)
                     {
                         if backoff_time > now {
+                            tracing::debug!(target: "oh_gossip_graft", peer=%peer_id, mesh = peers.len(), "GRAFT refused: backoff");
                             tracing::warn!(
                                 peer=%peer_id,
                                 "[Penalty] Peer attempted graft within backoff time, penalizing"
@@ -1422,6 +1423,8 @@ where
                     if peers.len() >= self.config.mesh_n_high()
                         && !self.outbound_peers.contains(peer_id)
                     {
+                        // OpenHydra patch: upstream sends this PRUNE without a word.
+                        tracing::debug!(target: "oh_gossip_graft", peer=%peer_id, mesh = peers.len(), outbound = false, "GRAFT refused: mesh full");
                         to_prune_topics.insert(topic_hash.clone());
                         continue;
                     }
@@ -1432,6 +1435,7 @@ where
                         topic=%topic_hash,
                         "GRAFT: Mesh link added for peer in topic"
                     );
+                    tracing::debug!(target: "oh_gossip_graft", peer=%peer_id, mesh = peers.len(), outbound = self.outbound_peers.contains(peer_id), "GRAFT accepted");
 
                     if peers.insert(*peer_id) {
                         if let Some(m) = self.metrics.as_mut() {
@@ -2197,6 +2201,7 @@ where
                     }
 
                     // remove the peer
+                    tracing::debug!(target: "oh_gossip_graft", %peer, mesh = peers.len(), "mesh over mesh_n_high: pruned");
                     peers.remove(&peer);
                     let current_topic = to_prune.entry(peer).or_insert_with(Vec::new);
                     current_topic.push(topic_hash.clone());
@@ -2492,6 +2497,8 @@ where
                     keep_random(&mut peer_message_ids, self.config.max_ihave_length(), &mut rng);
                 }
 
+                // OpenHydra diagnostic (target oh_gossip_diag): who is sent IHAVE.
+                tracing::debug!(target: "oh_gossip_diag", %peer, ids = peer_message_ids.len(), "IHAVE to peer");
                 // send an IHAVE message
                 Self::control_pool_add(
                     &mut self.control_pool,
@@ -3052,23 +3059,23 @@ where
 
     fn handle_established_inbound_connection(
         &mut self,
-        _: ConnectionId,
-        _: PeerId,
+        connection_id: ConnectionId,
+        peer: PeerId,
         _: &Multiaddr,
         _: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(Handler::new(self.config.protocol_config()))
+        Ok(Handler::new(self.config.protocol_config()).for_connection(peer, connection_id))
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        _: ConnectionId,
-        _: PeerId,
+        connection_id: ConnectionId,
+        peer: PeerId,
         _: &Multiaddr,
         _: Endpoint,
         _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(Handler::new(self.config.protocol_config()))
+        Ok(Handler::new(self.config.protocol_config()).for_connection(peer, connection_id))
     }
 
     fn on_connection_handler_event(
@@ -3113,6 +3120,20 @@ where
                 invalid_messages,
             } => {
                 // Handle the gossipsub RPC
+                // OpenHydra diagnostic (target oh_gossip_diag): what each RPC carried, from whom.
+                if tracing::enabled!(target: "oh_gossip_diag", tracing::Level::DEBUG) {
+                    let (mut ihave, mut iwant, mut graft, mut prune) = (0, 0, 0, 0);
+                    for c in &rpc.control_msgs {
+                        match c {
+                            ControlAction::IHave { .. } => ihave += 1,
+                            ControlAction::IWant { .. } => iwant += 1,
+                            ControlAction::Graft { .. } => graft += 1,
+                            ControlAction::Prune { .. } => prune += 1,
+                        }
+                    }
+                    tracing::debug!(target: "oh_gossip_diag", peer = %propagation_source, connection = ?_connection_id,
+                        msgs = rpc.messages.len(), subs = rpc.subscriptions.len(), ihave, iwant, graft, prune, "RPC in");
+                }
 
                 // Handle subscriptions
                 // Update connected peers topics

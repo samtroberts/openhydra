@@ -27,11 +27,13 @@ use futures::future::Either;
 use futures::prelude::*;
 use futures::StreamExt;
 use libp2p_core::upgrade::DeniedUpgrade;
+use libp2p_identity::PeerId;
 use libp2p_swarm::handler::{
     ConnectionEvent, ConnectionHandler, ConnectionHandlerEvent, DialUpgradeError,
-    FullyNegotiatedInbound, FullyNegotiatedOutbound, StreamUpgradeError, SubstreamProtocol,
+    FullyNegotiatedInbound, FullyNegotiatedOutbound, ListenUpgradeError, StreamUpgradeError,
+    SubstreamProtocol,
 };
-use libp2p_swarm::Stream;
+use libp2p_swarm::{ConnectionId, Stream};
 use quick_protobuf::MessageWrite;
 use smallvec::SmallVec;
 use std::{
@@ -127,6 +129,11 @@ pub struct EnabledHandler {
     /// Keeps track of whether this connection is for a peer in the mesh. This is used to make
     /// decisions about the keep alive state for this connection.
     in_mesh: bool,
+
+    /// OpenHydra patch: the peer and connection this handler serves, for its logs (upstream's
+    /// handler doesn't know them, so "handler disabled" couldn't be traced to a connection).
+    peer: Option<PeerId>,
+    connection: Option<ConnectionId>,
 }
 
 pub enum DisabledHandler {
@@ -167,6 +174,7 @@ enum OutboundSubstreamState {
 impl Handler {
     /// Builds a new [`Handler`].
     pub fn new(protocol_config: ProtocolConfig) -> Self {
+        crate::openhydra_counters::HANDLERS_ALIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Handler::Enabled(EnabledHandler {
             listen_protocol: protocol_config,
             inbound_substream: None,
@@ -181,7 +189,18 @@ impl Handler {
             peer_kind_sent: false,
             last_io_activity: Instant::now(),
             in_mesh: false,
+            peer: None,
+            connection: None,
         })
+    }
+
+    /// OpenHydra patch: name the peer and connection this handler serves (see `EnabledHandler::peer`).
+    pub(crate) fn for_connection(mut self, peer: PeerId, connection: ConnectionId) -> Self {
+        if let Handler::Enabled(h) = &mut self {
+            h.peer = Some(peer);
+            h.connection = Some(connection);
+        }
+        self
     }
 }
 
@@ -210,11 +229,12 @@ impl EnabledHandler {
         if self.queued_bytes.saturating_add(size) > room || self.send_queue.len() >= MAX_QUEUED_MESSAGES {
             self.dropped += 1;
             if self.dropped.is_power_of_two() {
-                tracing::debug!(dropped = self.dropped, queued = self.queued_bytes, "Send queue full, dropping message");
+                tracing::debug!(peer = ?self.peer, connection = ?self.connection, dropped = self.dropped, queued = self.queued_bytes, "Send queue full, dropping message");
             }
             return;
         }
         self.queued_bytes += size;
+        crate::openhydra_counters::QUEUED_BYTES.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
         self.send_queue.push(rpc);
     }
 
@@ -228,7 +248,11 @@ impl EnabledHandler {
         }
 
         // new inbound substream. Replace the current one, if it exists.
-        tracing::trace!("New inbound substream request");
+        tracing::debug!(
+            peer = ?self.peer, connection = ?self.connection,
+            attempt = self.inbound_substream_attempts, replaces = self.inbound_substream.is_some(),
+            "New inbound gossip substream"
+        );
         self.inbound_substream = Some(InboundSubstreamState::WaitingInput(substream));
     }
 
@@ -249,6 +273,10 @@ impl EnabledHandler {
         assert!(
             self.outbound_substream.is_none(),
             "Established an outbound substream with one already available"
+        );
+        tracing::debug!(
+            peer = ?self.peer, connection = ?self.connection,
+            attempt = self.outbound_substream_attempts, "New outbound gossip substream"
         );
         self.outbound_substream = Some(OutboundSubstreamState::WaitingOutput(substream));
     }
@@ -292,7 +320,9 @@ impl EnabledHandler {
                 // outbound idle state
                 Some(OutboundSubstreamState::WaitingOutput(substream)) => {
                     if let Some(message) = self.send_queue.pop() {
-                        self.queued_bytes = self.queued_bytes.saturating_sub(message.get_size());
+                        let size = message.get_size().min(self.queued_bytes);
+                        crate::openhydra_counters::QUEUED_BYTES.fetch_sub(size as u64, std::sync::atomic::Ordering::Relaxed);
+                        self.queued_bytes -= size;
                         self.send_queue.shrink_to_fit();
                         self.outbound_substream =
                             Some(OutboundSubstreamState::PendingSend(substream, message));
@@ -312,16 +342,14 @@ impl EnabledHandler {
                                         Some(OutboundSubstreamState::PendingFlush(substream))
                                 }
                                 Err(e) => {
-                                    tracing::debug!(
-                                        "Failed to send message on outbound stream: {e}"
-                                    );
+                                    tracing::debug!(peer = ?self.peer, connection = ?self.connection, "Failed to send message on outbound stream: {e}");
                                     self.outbound_substream = None;
                                     break;
                                 }
                             }
                         }
                         Poll::Ready(Err(e)) => {
-                            tracing::debug!("Failed to send message on outbound stream: {e}");
+                            tracing::debug!(peer = ?self.peer, connection = ?self.connection, "Failed to send message on outbound stream: {e}");
                             self.outbound_substream = None;
                             break;
                         }
@@ -340,7 +368,7 @@ impl EnabledHandler {
                                 Some(OutboundSubstreamState::WaitingOutput(substream))
                         }
                         Poll::Ready(Err(e)) => {
-                            tracing::debug!("Failed to flush outbound stream: {e}");
+                            tracing::debug!(peer = ?self.peer, connection = ?self.connection, "Failed to flush outbound stream: {e}");
                             self.outbound_substream = None;
                             break;
                         }
@@ -376,7 +404,7 @@ impl EnabledHandler {
                             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(message));
                         }
                         Poll::Ready(Some(Err(error))) => {
-                            tracing::debug!("Failed to read from inbound stream: {error}");
+                            tracing::debug!(peer = ?self.peer, connection = ?self.connection, "Failed to read from inbound stream: {error}");
                             // Close this side of the stream. If the
                             // peer is still around, they will re-establish their
                             // outbound stream i.e. our inbound stream.
@@ -385,7 +413,7 @@ impl EnabledHandler {
                         }
                         // peer closed the stream
                         Poll::Ready(None) => {
-                            tracing::debug!("Inbound stream closed by remote");
+                            tracing::debug!(peer = ?self.peer, connection = ?self.connection, "Inbound stream closed by remote");
                             self.inbound_substream =
                                 Some(InboundSubstreamState::Closing(substream));
                         }
@@ -403,7 +431,7 @@ impl EnabledHandler {
                                 // Don't close the connection but just drop the inbound substream.
                                 // In case the remote has more to send, they will open up a new
                                 // substream.
-                                tracing::debug!("Inbound substream error while closing: {e}");
+                                tracing::debug!(peer = ?self.peer, connection = ?self.connection, "Inbound substream error while closing: {e}");
                             }
                             self.inbound_substream = None;
                             break;
@@ -508,8 +536,11 @@ impl ConnectionHandler for Handler {
 
                     if handler.inbound_substream_attempts == MAX_SUBSTREAM_ATTEMPTS {
                         tracing::warn!(
+                            peer = ?handler.peer, connection = ?handler.connection,
                             "The maximum number of inbound substreams attempts has been exceeded"
                         );
+                        crate::openhydra_counters::HANDLERS_DISABLED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         *self = Handler::Disabled(DisabledHandler::MaxSubstreamAttempts);
                         return;
                     }
@@ -522,8 +553,11 @@ impl ConnectionHandler for Handler {
 
                     if handler.outbound_substream_attempts == MAX_SUBSTREAM_ATTEMPTS {
                         tracing::warn!(
+                            peer = ?handler.peer, connection = ?handler.connection,
                             "The maximum number of outbound substream attempts has been exceeded"
                         );
+                        crate::openhydra_counters::HANDLERS_DISABLED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         *self = Handler::Disabled(DisabledHandler::MaxSubstreamAttempts);
                         return;
                     }
@@ -544,7 +578,7 @@ impl ConnectionHandler for Handler {
                         error: StreamUpgradeError::Timeout,
                         ..
                     }) => {
-                        tracing::debug!("Dial upgrade error: Protocol negotiation timeout");
+                        tracing::debug!(peer = ?handler.peer, connection = ?handler.connection, "Dial upgrade error: Protocol negotiation timeout");
                     }
                     ConnectionEvent::DialUpgradeError(DialUpgradeError {
                         error: StreamUpgradeError::Apply(e),
@@ -566,7 +600,10 @@ impl ConnectionHandler for Handler {
                         error: StreamUpgradeError::Io(e),
                         ..
                     }) => {
-                        tracing::debug!("Protocol negotiation failed: {e}")
+                        tracing::debug!(peer = ?handler.peer, connection = ?handler.connection, "Protocol negotiation failed: {e}")
+                    }
+                    ConnectionEvent::ListenUpgradeError(ListenUpgradeError { error, .. }) => {
+                        tracing::debug!(peer = ?handler.peer, connection = ?handler.connection, ?error, "Inbound gossip substream failed to negotiate");
                     }
                     _ => {}
                 }
@@ -600,5 +637,18 @@ pub fn openhydra_queue_selftest(n: usize, len: usize) -> (usize, usize, u64, usi
             (e.queued_bytes, e.send_queue.len(), e.dropped, MAX_QUEUED_BYTES)
         }
         Handler::Disabled(_) => (0, 0, 0, MAX_QUEUED_BYTES),
+    }
+}
+
+/// OpenHydra patch: keep the process-wide gauges (`openhydra_counters`) right when a connection's
+/// handler goes, with whatever its queue still held.
+impl Drop for Handler {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Only an enabled handler was counted (`Handler::new`); disabling one drops it here once.
+        if let Handler::Enabled(h) = self {
+            crate::openhydra_counters::HANDLERS_ALIVE.fetch_sub(1, Relaxed);
+            crate::openhydra_counters::QUEUED_BYTES.fetch_sub(h.queued_bytes as u64, Relaxed);
+        }
     }
 }

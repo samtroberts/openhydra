@@ -2,6 +2,14 @@
 
 Vendored from crates.io `libp2p-gossipsub` 0.47.0 (MIT, unchanged apart from these):
 
+- (2026-11-19/20) Diagnostics, all off by default. Each connection handler knows its peer and
+  connection, and logs them with every substream opened, failed or given up on. Process-wide
+  counters in `openhydra_counters`: `HANDLERS_DISABLED` (handlers that gave up after too many
+  substream attempts), `QUEUED_BYTES` and `HANDLERS_ALIVE` (gauges). Debug logs on their own
+  targets: `oh_gossip_graft` (each GRAFT accepted or refused, with the reason and mesh size, and
+  each peer pruned from an over-full mesh) and `oh_gossip_diag` (each IHAVE recipient, each RPC
+  received). Upstream sent the mesh-full PRUNE without a log line.
+
 - (2026-11-19, #36) Random choices take the elements `partial_shuffle` chose (`keep_random`).
   Upstream kept the first `n` of a list after `partial_shuffle`, but rand 0.8 puts its picks at the
   end, so the lowest peer ids were nearly always chosen and the middle half never: half the nodes

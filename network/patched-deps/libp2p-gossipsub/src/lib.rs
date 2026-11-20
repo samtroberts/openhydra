@@ -102,6 +102,15 @@ pub mod openhydra_counters {
     pub static COPIES_CHECKED: AtomicU64 = AtomicU64::new(0);
     pub static UNIQUE_MESSAGES: AtomicU64 = AtomicU64::new(0);
     pub static DUPLICATES: AtomicU64 = AtomicU64::new(0);
+    /// Connections whose gossip handler gave up after too many substream attempts (it then drops
+    /// everything sent to or from that peer on that connection, and the behaviour isn't told).
+    pub static HANDLERS_DISABLED: AtomicU64 = AtomicU64::new(0);
+    /// Bytes waiting in gossip send queues, all connections (a gauge).
+    pub static QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Connections whose gossip handler is enabled (a gauge; a handler disabled for a peer without
+    /// gossipsub, or after too many substream attempts, no longer counts). Process-wide: in the
+    /// load simulator it sums every simulated node in the process.
+    pub static HANDLERS_ALIVE: AtomicU64 = AtomicU64::new(0);
 }
 mod backoff;
 mod behaviour;
