@@ -7,7 +7,10 @@
 //!               --role idle|provider|relayed-provider|active|flooder|junk
 //!               --count N [--first I] --dir DIR [--rate PER_SEC] [--duration SECS]
 //!               [--providers A-B] [--req-every SECS] [--req-bytes B] [--reply-bytes B]
-//!               [--sample-every K] [--models K] [--flood-rate PER_SEC] [--nat]
+//!               [--sample-every K] [--models K] [--flood-rate PER_SEC] [--nat] [--vpc-is-public]
+//! `--vpc-is-public`: count 172.16.0.0/12 (the AWS simulation's VPC addresses) as public, so a
+//! node AutoNAT finds reachable there is promoted to DHT server as on the real internet (without it
+//! no simulated agent ever was: 20 Nov). 10/8 (the NAT homes) and 192.168/16 stay private.
 //! `--models K`: a provider announces K models (sim-I, sim-I.1 … sim-I.K-1; record stuffing at K
 //! in the hundreds). `--nat`: listen on loopback only, like a peer behind NAT (no dial-backs).
 //! `--v6-prefix P`: peer I listens (TCP) only on address P+I, e.g. `2406:da1b:c0:6601:1::` (needs
@@ -124,6 +127,9 @@ fn main() {
     }
     std::fs::create_dir_all(&dir).expect("dir");
     openhydra_network::node::disable_mdns();
+    if args.iter().any(|a| a == "--vpc-is-public") {
+        openhydra_network::event_loop::sim_treat_172_16_as_public();
+    }
     // Logs (stderr) only when asked: RUST_LOG=warn shows e.g. gossipsub giving up on a connection.
     if std::env::var_os("RUST_LOG").is_some() {
         let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_writer(std::io::stderr).try_init();

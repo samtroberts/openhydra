@@ -5939,6 +5939,23 @@ mod reversal_tests {
 }
 
 pub fn is_globally_reachable_addr(addr: &Multiaddr) -> bool {
+    reachable_addr_check(addr, SIM_172_16_IS_PUBLIC.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+static SIM_172_16_IS_PUBLIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Simulator only (`oh_sim --vpc-is-public`): count 172.16.0.0/12 as globally reachable for every
+/// node this process starts. The AWS simulation puts its "public" nodes on VPC addresses
+/// (172.31.x), which [`is_globally_reachable_addr`] treats as private, so no simulated agent was ever promoted to a
+/// DHT server and the simulated DHT was only the bootstraps (20 Nov). 10/8 and 192.168/16 stay
+/// private: the simulation's NAT homes (10.x) and home LANs keep behaving as they do for real. Not
+/// reachable from the agent's command line; a process-wide setting like [`crate::node::disable_mdns`].
+pub fn sim_treat_172_16_as_public() {
+    SIM_172_16_IS_PUBLIC.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`is_globally_reachable_addr`], with 172.16.0.0/12 counted as public when `vpc_public`.
+fn reachable_addr_check(addr: &Multiaddr, vpc_public: bool) -> bool {
     if addr.to_string().contains("/p2p-circuit") {
         return false;
     }
@@ -5951,7 +5968,8 @@ pub fn is_globally_reachable_addr(addr: &Multiaddr) -> bool {
                 // is_private(), but just as un-routable from the public internet.
                 let o = ip.octets();
                 let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
-                if ip.is_private()
+                let sim_public = vpc_public && o[0] == 172 && (o[1] & 0xf0) == 16;
+                if (ip.is_private() && !sim_public)
                     || ip.is_loopback()
                     || ip.is_link_local()
                     || ip.is_unspecified()
@@ -8167,6 +8185,27 @@ mod tests {
 
         // A relay-circuit address is never "us being reachable".
         assert!(!g("/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"));
+    }
+
+    #[test]
+    fn only_the_simulator_switch_makes_172_16_public() {
+        let check = |s: &str, sim: bool| reachable_addr_check(&s.parse::<Multiaddr>().unwrap(), sim);
+        // Off (every real node): 172.16.0.0/12 is private, as before.
+        assert!(!check("/ip4/172.31.72.84/udp/4001/quic-v1", false));
+        // On: all of 172.16.0.0/12 and nothing past it.
+        assert!(check("/ip4/172.31.72.84/udp/4001/quic-v1", true));
+        assert!(check("/ip4/172.16.0.1/tcp/4001", true));
+        // Just outside the range (public addresses anyway): the switch changes nothing.
+        for edge in ["/ip4/172.32.0.1/tcp/4001", "/ip4/172.15.255.255/tcp/4001"] {
+            assert_eq!(check(edge, true), check(edge, false), "{edge}");
+        }
+        // The NAT homes (10/8), home LANs (192.168/16), CGNAT and loopback stay private.
+        assert!(!check("/ip4/10.101.0.2/tcp/4001", true));
+        assert!(!check("/ip4/192.168.0.5/tcp/4001", true));
+        assert!(!check("/ip4/100.64.1.1/tcp/4001", true));
+        assert!(!check("/ip4/127.0.0.1/tcp/4001", true));
+        // A relay circuit through a 172.31 relay is still not "us being reachable".
+        assert!(!check("/ip4/172.31.72.89/udp/4001/quic-v1/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit", true));
     }
 
     #[test]
