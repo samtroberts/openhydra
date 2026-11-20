@@ -2,6 +2,12 @@
 
 Vendored from crates.io `libp2p-gossipsub` 0.47.0 (MIT, unchanged apart from these):
 
+- (2026-11-19, #36) Random choices take the elements `partial_shuffle` chose (`keep_random`).
+  Upstream kept the first `n` of a list after `partial_shuffle`, but rand 0.8 puts its picks at the
+  end, so the lowest peer ids were nearly always chosen and the middle half never: half the nodes
+  never got an IHAVE from a bootstrap, and a node with no mesh peer heard no gossip at all.
+  Affects IHAVE recipients, mesh grafts, fanout, peer exchange, IWANT and IHAVE id lists.
+
 - (2026-11-19, #8) A message's signature is checked by the behaviour after its duplicate check,
   not by the codec for every copy: a copy of a message already seen costs a lookup. A relay gets up
   to six copies of each message, and checking them all took 22% of a CPU at saturation (load

@@ -1253,9 +1253,7 @@ where
             // Ask in random order
             let mut iwant_ids_vec: Vec<_> = iwant_ids.into_iter().collect();
             let mut rng = thread_rng();
-            iwant_ids_vec.partial_shuffle(&mut rng, iask);
-
-            iwant_ids_vec.truncate(iask);
+            keep_random(&mut iwant_ids_vec, iask, &mut rng);
             *iasked += iask;
 
             for message_id in &iwant_ids_vec {
@@ -1587,8 +1585,7 @@ where
         if px.len() > n {
             // only use at most prune_peers many random peers
             let mut rng = thread_rng();
-            px.partial_shuffle(&mut rng, n);
-            px = px.into_iter().take(n).collect();
+            keep_random(&mut px, n, &mut rng);
         }
 
         for p in px {
@@ -2492,8 +2489,7 @@ where
                     // We do this per peer so that we emit a different set for each peer.
                     // we have enough redundancy in the system that this will significantly increase
                     // the message coverage when we do truncate.
-                    peer_message_ids.partial_shuffle(&mut rng, self.config.max_ihave_length());
-                    peer_message_ids.truncate(self.config.max_ihave_length());
+                    keep_random(&mut peer_message_ids, self.config.max_ihave_length(), &mut rng);
                 }
 
                 // send an IHAVE message
@@ -3355,11 +3351,25 @@ fn get_random_peers_dynamic(
 
     // we have more peers than needed, shuffle them and return n of them
     let mut rng = thread_rng();
-    gossip_peers.partial_shuffle(&mut rng, n);
+    keep_random(&mut gossip_peers, n, &mut rng);
 
     tracing::debug!("RANDOM PEERS: Got {:?} peers", n);
 
-    gossip_peers.into_iter().take(n).collect()
+    gossip_peers.into_iter().collect()
+}
+
+/// OpenHydra patch: keep `n` of `v`'s elements, chosen uniformly at random. Upstream called
+/// `partial_shuffle(rng, n)` and then kept the *first* `n` elements; rand 0.8 puts its random picks
+/// at the *end*, so what was kept was mostly the first elements in their original order. Peer lists
+/// come from sorted sets, so the lowest peer ids were nearly always picked, a few of the highest
+/// sometimes and the middle half never (19 Nov: with ~1,600 peers, peers ranked 30-70% by id got no
+/// IHAVE from any bootstrap, and nodes with no mesh peer heard no gossip at all, #36).
+fn keep_random<T>(v: &mut Vec<T>, n: usize, rng: &mut impl rand::Rng) {
+    if v.len() > n {
+        v.partial_shuffle(rng, n);
+        let drop = v.len() - n;
+        v.drain(..drop);
+    }
 }
 
 /// Helper function to get a set of `n` random gossipsub peers for a `topic_hash`

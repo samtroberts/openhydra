@@ -5161,3 +5161,56 @@ fn openhydra_duplicates_are_dropped_before_signatures_and_a_forgery_never_enters
     deliver(&mut gs, peers[1], raw);
     assert_eq!(delivered(&gs), 1, "its copy is a duplicate");
 }
+
+/// OpenHydra: every candidate is picked about equally often (#36). Upstream kept the first `n` of a
+/// sorted list after `partial_shuffle`, so peers in the middle of the id order were never picked.
+#[test]
+fn openhydra_random_peers_are_picked_uniformly() {
+    let topic = TopicHash::from_raw("t");
+    let peers: Vec<PeerId> = (0..400).map(|_| PeerId::random()).collect();
+    let mut topic_peers: HashMap<TopicHash, BTreeSet<PeerId>> = HashMap::new();
+    topic_peers.insert(topic.clone(), peers.iter().copied().collect());
+    let connected: HashMap<PeerId, PeerConnections> = peers
+        .iter()
+        .map(|p| (*p, PeerConnections { kind: PeerKind::Gossipsubv1_1, connections: vec![] }))
+        .collect();
+    let rounds = 2_000;
+    let mut picked: HashMap<PeerId, u32> = HashMap::new();
+    for _ in 0..rounds {
+        // a quarter of them, as for IHAVE (gossip_factor 0.25)
+        let got = get_random_peers_dynamic(&topic_peers, &connected, &topic, |m| m / 4, |_| true);
+        assert_eq!(got.len(), 100);
+        for p in got {
+            *picked.entry(p).or_default() += 1;
+        }
+    }
+    // Expected 500 each (sd about 19); the old code picked the middle half 0 times.
+    for p in &peers {
+        let n = picked.get(p).copied().unwrap_or(0);
+        assert!((350..=650).contains(&n), "peer picked {n} times of {rounds}, expected about 500");
+    }
+}
+
+/// OpenHydra: `keep_random` keeps exactly `n` distinct elements, each about equally often.
+#[test]
+fn openhydra_keep_random_is_uniform() {
+    let mut rng = rand::thread_rng();
+    let mut counts = [0u32; 20];
+    for _ in 0..10_000 {
+        let mut v: Vec<usize> = (0..20).collect();
+        keep_random(&mut v, 5, &mut rng);
+        assert_eq!(v.len(), 5);
+        let mut d = v.clone();
+        d.sort();
+        d.dedup();
+        assert_eq!(d.len(), 5);
+        for i in v {
+            counts[i] += 1;
+        }
+    }
+    // Expected 2,500 each (sd about 43).
+    assert!(counts.iter().all(|&c| (2_200..=2_800).contains(&c)), "{counts:?}");
+    let mut short = vec![1, 2, 3];
+    keep_random(&mut short, 5, &mut rng);
+    assert_eq!(short, vec![1, 2, 3]);
+}
