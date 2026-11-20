@@ -57,6 +57,11 @@ struct Stats {
     /// Sampled peers' gossip mesh and topic peers, summed.
     sampled_mesh_peers: AtomicU64,
     sampled_topic_peers: AtomicU64,
+    /// Sampled peers' connections, by kind, and their Kademlia routing-table entries, summed.
+    sampled_conns_quic: AtomicU64,
+    sampled_conns_tcp: AtomicU64,
+    sampled_conns_relay: AtomicU64,
+    sampled_kad_peers: AtomicU64,
     errors: Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
@@ -160,10 +165,18 @@ fn main() {
                 "sampled_no_mesh": stats.sampled_no_mesh.load(Relaxed),
                 "sampled_mesh_peers": stats.sampled_mesh_peers.load(Relaxed),
                 "sampled_topic_peers": stats.sampled_topic_peers.load(Relaxed),
+                "sampled_conns_quic": stats.sampled_conns_quic.load(Relaxed),
+                "sampled_conns_tcp": stats.sampled_conns_tcp.load(Relaxed),
+                "sampled_conns_relay": stats.sampled_conns_relay.load(Relaxed),
+                "sampled_kad_peers": stats.sampled_kad_peers.load(Relaxed),
+                "rss_bytes": std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())).map(|p| p * 4096),
+                "gossip_queued_bytes": libp2p::gossipsub::openhydra_counters::QUEUED_BYTES.load(Relaxed),
+                "gossip_handlers_alive": libp2p::gossipsub::openhydra_counters::HANDLERS_ALIVE.load(Relaxed),
                 "gossip_bytes_in": libp2p::gossipsub::openhydra_counters::RPC_BYTES_IN.load(Relaxed),
                 "gossip_unique": libp2p::gossipsub::openhydra_counters::UNIQUE_MESSAGES.load(Relaxed),
                 "gossip_duplicates": libp2p::gossipsub::openhydra_counters::DUPLICATES.load(Relaxed),
                 "gossip_checked": libp2p::gossipsub::openhydra_counters::COPIES_CHECKED.load(Relaxed),
+                "gossip_handlers_disabled": libp2p::gossipsub::openhydra_counters::HANDLERS_DISABLED.load(Relaxed),
                 "errors": errors,
             });
             println!("{line}");
@@ -266,6 +279,10 @@ fn run_peer(
             .spawn(move || {
                 let (mut reserved, mut connected, mut known, mut other) = (false, false, 0u64, 0u64);
                 let (mut no_mesh, mut mesh, mut topic) = (false, 0u64, 0u64);
+                let (mut cq, mut ct, mut cr, mut kp) = (0u64, 0u64, 0u64, 0u64);
+                // A sampled peer that has heard of no model for a minute after starting is deaf:
+                // say so once on stderr, with who it is connected to, and again if it recovers.
+                let mut deaf = false;
                 loop {
                     std::thread::sleep(Duration::from_secs(5));
                     let Ok(s) = net.status() else { continue };
@@ -298,6 +315,28 @@ fn run_peer(
                     stats.sampled_topic_peers.fetch_add(t, Relaxed);
                     stats.sampled_topic_peers.fetch_sub(topic, Relaxed);
                     topic = t;
+                    let now_deaf = k == 0 && started_at.elapsed() > Duration::from_secs(60);
+                    if now_deaf != deaf {
+                        deaf = now_deaf;
+                        let line = serde_json::json!({
+                            "deaf": deaf,
+                            "peer": net.libp2p_peer_id().to_string(),
+                            "secs": started_at.elapsed().as_secs(),
+                            "topic_peers": s.gossip_topic_peers,
+                            "mesh_peers": s.gossip_mesh_peers,
+                            "connected": s.peers.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
+                        });
+                        eprintln!("OH_SIM_DEAF {line}");
+                    }
+                    let q: u64 = s.peers.iter().map(|p| (p.quic_direct_v4 + p.quic_direct_v6) as u64).sum();
+                    let t: u64 = s.peers.iter().map(|p| p.tcp_direct as u64).sum();
+                    let r: u64 = s.peers.iter().map(|p| p.tcp_relay as u64).sum();
+                    let kad = s.kad_routing_peers as u64;
+                    for (gauge, old, new) in [(&stats.sampled_conns_quic, &mut cq, q), (&stats.sampled_conns_tcp, &mut ct, t), (&stats.sampled_conns_relay, &mut cr, r), (&stats.sampled_kad_peers, &mut kp, kad)] {
+                        gauge.fetch_add(new, Relaxed);
+                        gauge.fetch_sub(*old, Relaxed);
+                        *old = new;
+                    }
                     stats.sampled_known_models.fetch_add(k, Relaxed);
                     stats.sampled_known_models.fetch_sub(known, Relaxed);
                     known = k;
