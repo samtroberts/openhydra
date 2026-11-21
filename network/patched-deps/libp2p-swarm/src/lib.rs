@@ -542,19 +542,26 @@ where
                     );
                     let span = tracing::debug_span!(parent: tracing::Span::none(), "Transport::dial", %address);
                     span.follows_from(tracing::Span::current());
+                    // OpenHydra patch: the address goes with its attempt (see `ConcurrentDial`).
+                    let kept = address.clone();
                     match dial {
-                        Ok(fut) => fut
-                            .map(|r| (address, r.map_err(TransportError::Other)))
-                            .instrument(span)
-                            .boxed(),
-                        Err(err) => futures::future::ready((address, Err(err))).boxed(),
+                        Ok(fut) => (
+                            kept,
+                            fut.map(|r| (address, r.map_err(TransportError::Other)))
+                                .instrument(span)
+                                .boxed(),
+                        ),
+                        Err(err) => (kept, futures::future::ready((address, Err(err))).boxed()),
                     }
                 }
-                Err(address) => futures::future::ready((
+                Err(address) => (
                     address.clone(),
-                    Err(TransportError::MultiaddrNotSupported(address)),
-                ))
-                .boxed(),
+                    futures::future::ready((
+                        address.clone(),
+                        Err(TransportError::MultiaddrNotSupported(address)),
+                    ))
+                    .boxed(),
+                ),
             })
             .collect();
 

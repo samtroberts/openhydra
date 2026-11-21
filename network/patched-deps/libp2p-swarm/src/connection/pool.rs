@@ -414,7 +414,9 @@ where
     /// that establishes and negotiates the connection.
     pub(crate) fn add_outgoing(
         &mut self,
-        dials: Vec<
+        // OpenHydra patch: each attempt with its address, so `ConcurrentDial` can order them.
+        dials: Vec<(
+            Multiaddr,
             BoxFuture<
                 'static,
                 (
@@ -422,7 +424,7 @@ where
                     Result<(PeerId, StreamMuxerBox), TransportError<std::io::Error>>,
                 ),
             >,
-        >,
+        )>,
         peer: Option<PeerId>,
         role_override: Endpoint,
         port_use: PortUse,
