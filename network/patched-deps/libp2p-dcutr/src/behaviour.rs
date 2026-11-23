@@ -315,8 +315,10 @@ impl NetworkBehaviour for Behaviour {
                     .condition(dial_opts::PeerCondition::Always)
                     .addresses(remote_addrs)
                     .override_role()
-                    .build()
-                    .with_attempt_timeout(attempt_timeout);
+                    .build();
+                // Needs our patched libp2p-swarm (the `openhydra-swarm` feature, on by default).
+                #[cfg(feature = "openhydra-swarm")]
+                let opts = opts.with_attempt_timeout(attempt_timeout);
 
                 let maybe_direct_connection_id = opts.connection_id();
 

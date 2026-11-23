@@ -121,6 +121,13 @@ version = "0.8"
 version = "0.3"
 features = ["env-filter"]
 
+# OpenHydra: `openhydra-swarm` uses our patched libp2p-swarm's `DialOpts::with_attempt_timeout` (the
+# hole-punch attempt timeout). On by default, which is how the repository builds it through libp2p;
+# CI's standalone test of this crate builds against the published libp2p-swarm, without it.
+[features]
+default = ["openhydra-swarm"]
+openhydra-swarm = []
+
 [lints.clippy]
 dbg_macro = "warn"
 manual_let_else = "warn"

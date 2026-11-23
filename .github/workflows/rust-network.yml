@@ -48,8 +48,10 @@ jobs:
         run: cargo test --locked --manifest-path patched-deps/libp2p-mdns/Cargo.toml
       # Its library tests cover the patch; upstream's integration tests need a dev-dependency
       # (libp2p-swarm-test) that isn't published, so they can't build from the crate.
+      # Without its default `openhydra-swarm` feature: built on its own, it gets the published
+      # libp2p-swarm, which lacks the patched swarm's `DialOpts::with_attempt_timeout`.
       - name: Patched libp2p-dcutr tests
-        run: cargo test --locked --lib --manifest-path patched-deps/libp2p-dcutr/Cargo.toml
+        run: cargo test --locked --lib --no-default-features --manifest-path patched-deps/libp2p-dcutr/Cargo.toml
       # Its library tests cover the patch (a request goes on a direct connection when there is one).
       - name: Patched libp2p-request-response tests
         run: cargo test --locked --lib --manifest-path patched-deps/libp2p-request-response/Cargo.toml
