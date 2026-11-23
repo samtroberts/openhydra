@@ -339,6 +339,9 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     metrics: Option<Metrics>,
 }
 
+/// OpenHydra patch (RUSTSEC-2026-0537, upstream 55e4a646): the longest backoff a remote PRUNE may set.
+const MAX_REMOTE_PRUNE_BACKOFF_SECONDS: u64 = 3600;
+
 impl<D, F> Behaviour<D, F>
 where
     D: DataTransform + Default,
@@ -1332,18 +1335,9 @@ where
 
         let mut do_px = self.config.do_px();
 
-        // For each topic, if a peer has grafted us, then we necessarily must be in their mesh
-        // and they must be subscribed to the topic. Ensure we have recorded the mapping.
-        for topic in &topics {
-            self.peer_topics
-                .entry(*peer_id)
-                .or_default()
-                .insert(topic.clone());
-            self.topic_peers
-                .entry(topic.clone())
-                .or_default()
-                .insert(*peer_id);
-        }
+        // OpenHydra patch: RUSTSEC-2026-0536 (upstream 51ed5f00). A GRAFT no longer records its
+        // topics as the peer's subscriptions (a peer could grow those sets without bound with GRAFTs
+        // for made-up topics); a GRAFT for a topic the peer hasn't subscribed to is dropped below.
 
         // we don't GRAFT to/from explicit peers; complain loudly if this happens
         if self.explicit_peers.contains(peer_id) {
@@ -1356,6 +1350,11 @@ where
             let (below_zero, score) = self.score_below_threshold(peer_id, |_| 0.0);
             let now = Instant::now();
             for topic_hash in topics {
+                if !self.peer_topics.get(peer_id).is_some_and(|t| t.contains(&topic_hash)) {
+                    tracing::debug!(peer=%peer_id, topic=%topic_hash, "GRAFT: dropping unsubscribed topic from peer");
+                    do_px = false;
+                    continue;
+                }
                 if let Some(peers) = self.mesh.get_mut(&topic_hash) {
                     // if the peer is already in the mesh ignore the graft
                     if peers.contains(peer_id) {
@@ -1529,7 +1528,9 @@ where
         }
         if update_backoff {
             let time = if let Some(backoff) = backoff {
-                Duration::from_secs(backoff)
+                // OpenHydra patch: RUSTSEC-2026-0537 (upstream 55e4a646), a remote PRUNE's backoff is
+                // capped at an hour.
+                Duration::from_secs(std::cmp::min(backoff, MAX_REMOTE_PRUNE_BACKOFF_SECONDS))
             } else {
                 self.config.prune_backoff()
             };
@@ -1548,6 +1549,12 @@ where
         let (below_threshold, score) =
             self.score_below_threshold(peer_id, |pst| pst.accept_px_threshold);
         for (topic_hash, px, backoff) in prune_data {
+            // OpenHydra patch: RUSTSEC-2026-0534 (upstream 9c647828), a PRUNE for a topic we have no
+            // mesh in is ignored: its backoff entries (kept up to an hour) grew without bound.
+            if !self.mesh.contains_key(&topic_hash) {
+                tracing::debug!(peer=%peer_id, topic=%topic_hash, "PRUNE: ignoring topic we are not in");
+                continue;
+            }
             self.remove_peer_from_mesh(peer_id, &topic_hash, backoff, true, Churn::Prune);
 
             if self.mesh.contains_key(&topic_hash) {

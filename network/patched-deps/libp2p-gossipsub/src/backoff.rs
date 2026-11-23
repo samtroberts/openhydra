@@ -72,7 +72,12 @@ impl BackoffStorage {
     /// Updates the backoff for a peer (if there is already a more restrictive backoff then this call
     /// doesn't change anything).
     pub(crate) fn update_backoff(&mut self, topic: &TopicHash, peer: &PeerId, time: Duration) {
-        let instant = Instant::now() + time;
+        // OpenHydra patch (23 Nov 2026), backport of the RUSTSEC-2026-0535 fix (upstream 84153a55):
+        // a remote PRUNE's backoff could overflow the addition and panic.
+        let Some(instant) = Instant::now().checked_add(time) else {
+            tracing::warn!("ignoring oversized prune backoff");
+            return;
+        };
         let insert_into_backoffs_by_heartbeat =
             |heartbeat_index: HeartbeatIndex,
              backoffs_by_heartbeat: &mut Vec<HashSet<_>>,
@@ -152,7 +157,8 @@ impl BackoffStorage {
             let now = Instant::now();
             s.retain(|(topic, peer)| {
                 let keep = match Self::get_backoff_time_from_backoffs(backoffs, topic, peer) {
-                    Some(backoff_time) => backoff_time + slack > now,
+                    // OpenHydra patch: RUSTSEC-2026-0537 (upstream 55e4a646), no overflow here either.
+                    Some(backoff_time) => backoff_time.checked_add(slack).map(|b| b > now).unwrap_or(false),
                     None => false,
                 };
                 if !keep {
