@@ -6964,14 +6964,23 @@ mod tests {
         let (_pdir, provider) = test_provider(Slow(Arc::clone(&made)));
         let provider = Arc::new(provider.with_shared_models(["m"]));
         let provider_id = provider.net.libp2p_peer_id().to_string();
-        let addr = provider
-            .net
-            .status()
-            .unwrap()
-            .listen_addrs
-            .into_iter()
-            .find(|a| a.starts_with("/ip4/127.0.0.1/tcp/"))
-            .expect("a loopback listen address");
+        // The listener comes up just after the node starts: wait for it (under a busy full-suite run
+        // the first status could come before it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let addr = loop {
+            let found = provider
+                .net
+                .status()
+                .unwrap()
+                .listen_addrs
+                .into_iter()
+                .find(|a| a.starts_with("/ip4/127.0.0.1/tcp/"));
+            match found {
+                Some(a) => break a,
+                None if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                None => panic!("no loopback listen address within 10 s"),
+            }
+        };
         {
             let p = Arc::clone(&provider);
             std::thread::spawn(move || p.run_inbound(Duration::from_millis(20), Duration::from_secs(3600), 4));
