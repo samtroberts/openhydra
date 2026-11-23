@@ -24,6 +24,31 @@ ignore = [
     "RUSTSEC-2026-0367", # zip 4 SUID bits kept on extract — desktop only, via tauri-plugin-updater 2.10 (latest), which unzips an update only after verifying its signature against our key; fix = updater on zip >=9
     "RUSTSEC-2026-0368", # zip 4 symlink targets outside the destination — same path and reason as -0367
     "RUSTSEC-2026-0369", # zip 4 ZipStreamReader — same path and reason as -0367
+    # hickory-proto 0.24.4 / hickory-resolver 0.24.4 (23 Nov 2026). hickory-proto is used only by our
+    # patched libp2p-mdns, which decodes LAN packets from the binary wire format and never validates
+    # DNSSEC; hickory-resolver is in the lockfile through libp2p-dns but is never compiled. All are fixed
+    # only in 0.26.2 (or not at all), which needs a libp2p upgrade.
+    "RUSTSEC-2026-0491", # wire decode reserves memory for the header's record counts (~18 MB per packet) — MITIGATED: patched libp2p-mdns drops a packet whose header claims more than it can hold (query.rs header_counts_fit)
+    "RUSTSEC-2026-0487", # SVCB/HTTPS alpn panic — text/zone-file parsing only, not wire decoding
+    "RUSTSEC-2026-0489", # SVCB/HTTPS lone-quote panic — text/zone-file parsing only, not wire decoding
+    "RUSTSEC-2026-0490", # zone-file lexer assert on a 4096+ character token — zone files only
+    "RUSTSEC-2026-0505", # DNSSEC: NSEC3 owner names not checked against the zone — no DNSSEC validation in mDNS
+    "RUSTSEC-2026-0511", # DNSSEC: NXDOMAIN accepted for a proven empty non-terminal — no DNSSEC validation
+    "RUSTSEC-2026-0512", # DNSSEC: unrelated signed RRset accepted — no DNSSEC validation
+    "RUSTSEC-2026-0530", # DNSSEC: parent-side NSEC at a zone cut — no DNSSEC validation
+    "RUSTSEC-2026-0531", # DNSSEC: child-side NSEC/NSEC3 accepted — no DNSSEC validation
+    "RUSTSEC-2026-0550", # DNSSEC: unsigned NSEC/NSEC3 in a nonexistence proof — no DNSSEC validation
+    "RUSTSEC-2026-0551", # DNSSEC: records of another class marked secure — no DNSSEC validation
+    "RUSTSEC-2026-0514", # hickory-resolver lookup returned records that failed DNSSEC validation — resolver never compiled (libp2p-dns unused)
+    # Vendored crates (network/patched-deps; reported by ops/ci/audit-vendored.sh against the upstream
+    # version we copied). Each is FIXED in our copy by a backport of the upstream fix (23 Nov 2026), so
+    # the upstream version number still matches; network/tests/gossipsub_hostile_control.rs drives the
+    # gossipsub ones against a real node.
+    "RUSTSEC-2026-0534", # gossipsub PRUNE backoff state for unknown topics — FIXED: PRUNE for a topic outside our mesh is ignored (upstream 9c647828)
+    "RUSTSEC-2026-0535", # gossipsub oversized PRUNE backoff panic — FIXED: checked_add in BackoffStorage::update_backoff (upstream 84153a55)
+    "RUSTSEC-2026-0536", # gossipsub GRAFT for unsubscribed topics grows peer state — FIXED: GRAFT no longer records topics; unsubscribed ones dropped (upstream 51ed5f00)
+    "RUSTSEC-2026-0537", # gossipsub heartbeat panic from a large PRUNE backoff — FIXED: remote backoff capped at 3600 s, checked heartbeat arithmetic (upstream 55e4a646)
+    "RUSTSEC-2026-0525", # libp2p-quic panic when the peer certificate expires during the handshake — FIXED: remote_peer_id returns an error (upstream 212f3774)
     # ---- unmaintained / unsound (informational) ----
     "RUSTSEC-2024-0384", # instant unmaintained (transitive)
     "RUSTSEC-2024-0436", # paste unmaintained (transitive proc-macro)
