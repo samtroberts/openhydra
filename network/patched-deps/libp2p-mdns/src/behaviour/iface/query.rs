@@ -47,6 +47,9 @@ impl MdnsPacket {
         buf: &[u8],
         from: SocketAddr,
     ) -> Result<Option<MdnsPacket>, hickory_proto::error::ProtoError> {
+        if !header_counts_fit(buf) {
+            return Ok(None);
+        }
         let packet = Message::from_vec(buf)?;
 
         if packet.query().is_none() {
@@ -312,10 +315,49 @@ impl fmt::Debug for MdnsPeer {
     }
 }
 
+/// OpenHydra patch (23 Nov 2026, RUSTSEC-2026-0491): whether the four counts in a DNS header fit in
+/// `buf`. hickory-proto 0.24 reserves room for as many records as the header claims before reading
+/// any, so a 12-byte packet claiming 65,535 records made it reserve ~18 MB; any device on the LAN can
+/// send mDNS packets. On the wire a question takes at least 5 bytes (a 1-byte root name, type,
+/// class) and a record at least 11 (name, type, class, TTL, data length), so a header claiming more
+/// than its packet can hold is dropped unread. A packet too short for a header is left to the
+/// decoder, which refuses it. The fix upstream is hickory-proto 0.26.2 (a libp2p upgrade).
+fn header_counts_fit(buf: &[u8]) -> bool {
+    if buf.len() < 12 {
+        return true;
+    }
+    let count = |at: usize| u16::from_be_bytes([buf[at], buf[at + 1]]) as usize;
+    let questions = count(4);
+    let records = count(6) + count(8) + count(10);
+    12 + questions * 5 + records * 11 <= buf.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::dns::build_query_response;
     use super::*;
+
+    #[test]
+    fn a_header_claiming_more_records_than_the_packet_holds_is_dropped_unread() {
+        let from: SocketAddr = "192.0.2.7:5353".parse().unwrap();
+        // A response header (QR set) claiming 65,535 answers, and nothing after it.
+        let mut claim = vec![0u8; 12];
+        claim[2] = 0x84;
+        claim[6] = 0xff;
+        claim[7] = 0xff;
+        assert!(!header_counts_fit(&claim));
+        assert!(matches!(MdnsPacket::new_from_bytes(&claim, from), Ok(None)));
+        // Real packets pass: our own response and query.
+        let peer_id = PeerId::random();
+        let addr: Multiaddr = "/ip4/1.2.3.4/tcp/5000".parse().unwrap();
+        for packet in build_query_response(0x1234, peer_id, vec![&addr], Duration::from_secs(60)) {
+            assert!(header_counts_fit(&packet));
+        }
+        assert!(header_counts_fit(&super::super::dns::build_query()));
+        // Too short for a header: left to the decoder, which refuses it.
+        assert!(header_counts_fit(&[0u8; 5]));
+        assert!(MdnsPacket::new_from_bytes(&[0u8; 5], from).is_err());
+    }
 
     #[test]
     fn test_create_mdns_peer() {
