@@ -263,14 +263,17 @@ pub fn start_node(
                 let keypair_for_loop = identity.keypair.clone();
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, peer_relay_leech)) => {
+                        // The peers this node really uses (requests, push streams): their connections
+                        // are never closed as idle (`kad_idle`).
+                        let app_peers = crate::kad_idle::AppPeers::default();
                         // Push streams (#4): opened by this node as a consumer, accepted as a provider.
-                        let push = crate::push::PushStreams::new(swarm.behaviour().push.new_control(), *swarm.local_peer_id());
+                        let push = crate::push::PushStreams::new(swarm.behaviour().push.new_control(), *swarm.local_peer_id(), app_peers.clone());
                         if let Err(e) = push.accept(Arc::clone(&proxy_queue_clone)) {
                             let _ = startup_tx.send(Err(format!("push streams: {e}")));
                             return;
                         }
                         let _ = startup_tx.send(Ok(push));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, peer_rtts_loop, pcp_bind, pinned).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, peer_rtts_loop, pcp_bind, pinned, app_peers).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {}", crate::transport::error_chain(e.as_ref()))));

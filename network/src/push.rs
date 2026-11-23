@@ -224,6 +224,9 @@ pub struct PushStreams {
     next_id: AtomicU64,
     /// Provider side: push stream opens handed to the agent so far.
     served: AtomicU64,
+    /// The peers this node really uses: one a push stream was exchanged with is kept connected
+    /// (`kad_idle`).
+    app_peers: crate::kad_idle::AppPeers,
 }
 
 /// Refuse a push stream: one empty message (a reply is never empty), then its end. What the
@@ -243,7 +246,7 @@ async fn refuse<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(mut rd: R, mut wr: 
 
 impl PushStreams {
     /// Must be called inside the swarm's tokio runtime.
-    pub fn new(control: libp2p_stream::Control, local: PeerId) -> Arc<Self> {
+    pub fn new(control: libp2p_stream::Control, local: PeerId, app_peers: crate::kad_idle::AppPeers) -> Arc<Self> {
         Arc::new(Self {
             control: Mutex::new(control),
             rt: tokio::runtime::Handle::current(),
@@ -254,6 +257,7 @@ impl PushStreams {
             refusing: Arc::default(),
             next_id: AtomicU64::new(1),
             served: AtomicU64::new(0),
+            app_peers,
         })
     }
 
@@ -300,6 +304,9 @@ impl PushStreams {
 
     /// Provider side: one push stream, from its open to its end.
     async fn serve(self: Arc<Self>, peer: PeerId, stream: libp2p::Stream, queue: Arc<SharedProxyQueue>, opening: Slot) {
+        // The peer counts as used from the stream's start (its open may take up to OPEN_READ_TIMEOUT
+        // to arrive: review 22 Nov), while it is open, and for a while after.
+        let _held = self.app_peers.hold(peer);
         let (mut rd, mut wr) = stream.split();
         let open = match tokio::time::timeout(OPEN_READ_TIMEOUT, read_message(&mut rd, MAX_MESSAGE)).await {
             Ok(Ok(Some(open))) => open,
@@ -392,6 +399,8 @@ impl PushStreams {
             return Err(PushOpenError::NotSent("own node".into()));
         }
         let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        self.app_peers.note(peer);
+        let app_peers = self.app_peers.clone();
         let (opened_tx, opened_rx) = std::sync::mpsc::channel::<Result<(), PushOpenError>>();
         let (inbox_tx, inbox) = std::sync::mpsc::channel::<Result<Vec<u8>, PushRecvError>>();
         let (outbox, mut outbox_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -418,6 +427,9 @@ impl PushStreams {
                     }
                 };
                 let (mut rd, mut wr) = stream.split();
+                // The peer counts as used while the stream is open (until this task ends or is
+                // aborted), and for a while after.
+                let _held = app_peers.hold(peer);
                 // Read from the start, alongside the write: a refusal may come before the open has
                 // all gone out.
                 let reads = {

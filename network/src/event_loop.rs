@@ -910,6 +910,17 @@ struct LoopState {
     /// them on a network change (the startup list is otherwise consumed by the
     /// run-loop locals). Identity is stable across a roam; only addresses churn.
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    /// Closing idle Kademlia connections (`kad_idle`): the peers this node really uses, ...
+    app_peers: crate::kad_idle::AppPeers,
+    /// ... the peers whose identify says they know such closes ([`crate::kad_idle::AGENT_TOKEN`]),
+    kad_idle_peers: std::collections::HashSet<PeerId>,
+    /// ... the connections this node closed as idle (until their close arrives),
+    idle_closed: std::collections::HashSet<libp2p::swarm::ConnectionId>,
+    /// ... when it last looked for some, and how many it has closed.
+    last_idle_sweep: std::time::Instant,
+    /// Simulator only (`--kad-slow`): each model's last Kademlia announce (record fingerprint, when).
+    kad_announced: HashMap<String, (u64, std::time::Instant)>,
+    idle_closes: u64,
     /// The relays this node reserves on and dials others through (`relay::relay_addrs`): its
     /// bootstraps, plus the production relays on the public network.
     relays: Vec<Multiaddr>,
@@ -1415,6 +1426,12 @@ impl LoopState {
             // #42: set to the shared handle in run_event_loop; a real interface
             // change or watchdog rebuild bumps it.
             bootstrap_peers: Vec::new(),
+            app_peers: Default::default(),
+            kad_idle_peers: Default::default(),
+            idle_closed: Default::default(),
+            last_idle_sweep: std::time::Instant::now(),
+            kad_announced: HashMap::new(),
+            idle_closes: 0,
             relays: Vec::new(),
             net_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_rtts: Arc::new(crate::rtt::PeerRtts::default()),
@@ -1459,9 +1476,12 @@ pub async fn run_event_loop(
     pcp_bind: Option<crate::pcp::PcpBind>,
     // The own provider's loopback addresses (`crate::pinned`), shared with the Kademlia filter.
     pinned: crate::pinned::PinnedPeers,
+    // The peers this node really uses (requests, push streams), shared with the push streams.
+    app_peers: crate::kad_idle::AppPeers,
 ) {
     let mut state = LoopState::new();
     state.pinned = pinned;
+    state.app_peers = app_peers;
     state.local_libp2p = swarm.local_peer_id().to_base58();
     state.enable_connection_reversal = enable_connection_reversal;
     state.peer_relay_leech = peer_relay_leech; // WS-F F-4
@@ -2423,6 +2443,10 @@ pub async fn run_event_loop(
             _ = heal_ticker.tick() => {
                 drive_heal(&mut swarm, &mut state);
                 drive_lan_dials(&mut swarm, &mut state);
+                if state.last_idle_sweep.elapsed() >= crate::kad_idle::SWEEP_EVERY {
+                    state.last_idle_sweep = std::time::Instant::now();
+                    drive_kad_idle_close(&mut swarm, &mut state);
+                }
             }
             // #43-W2: a PCP pinhole confirmed an inbound v6 addr — advertise it
             // as an external candidate so AutoNAT probes it and, if reachable,
@@ -2483,6 +2507,42 @@ fn handle_announce(
             record.clone()
         }
     };
+    // Simulator only (`oh_sim --announce-gossip-only`): no Kademlia announcement, only gossip.
+    if SIM_ANNOUNCE_GOSSIP_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        install_known_peer(state, &signed_record, now_unix_ms());
+        info!(model_id = %signed_record.model_id, peer_id = %signed_record.peer_id, "announced by gossip only (simulator)");
+        publish_provider_pex(swarm, &signed_record);
+        let _ = reply.send(Ok(()));
+        return;
+    }
+    // Simulator only (`oh_sim --kad-slow SECS`): Kademlia as a slow index. The same record (apart
+    // from its time and load) announced to Kademlia within the interval goes by gossip only.
+    if let Some(every) = crate::swarm::kad_slow_interval() {
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut what = record.clone();
+            what.updated_unix_ms = 0;
+            what.signature = String::new();
+            what.load_pct = 0.0;
+            what.queue_depth = 0;
+            what.throughput_tok_s = 0.0;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_string(&what).unwrap_or_default().hash(&mut h);
+            h.finish()
+        };
+        let fresh = state
+            .kad_announced
+            .get(&signed_record.model_id)
+            .is_some_and(|(fp, at)| *fp == fingerprint && at.elapsed() < every);
+        if fresh {
+            install_known_peer(state, &signed_record, now_unix_ms());
+            info!(model_id = %signed_record.model_id, peer_id = %signed_record.peer_id, "announced by gossip only (Kademlia record still current)");
+            publish_provider_pex(swarm, &signed_record);
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        state.kad_announced.insert(signed_record.model_id.clone(), (fingerprint, std::time::Instant::now()));
+    }
     let local_libp2p_id = swarm.local_peer_id().to_base58();
     let key = dht::peer_record_key(&signed_record.model_id, &local_libp2p_id);
     match dht::encode_record(&signed_record) {
@@ -2491,7 +2551,7 @@ fn handle_announce(
                 key,
                 value,
                 publisher: Some(*swarm.local_peer_id()),
-                expires: Some(std::time::Instant::now() + std::time::Duration::from_secs(300)),
+                expires: Some(std::time::Instant::now() + crate::swarm::kad_record_ttl()),
             };
             match swarm
                 .behaviour_mut()
@@ -2527,6 +2587,15 @@ fn handle_announce(
             let _ = reply.send(Err(e));
         }
     }
+}
+
+static SIM_ANNOUNCE_GOSSIP_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Simulator only (`oh_sim --announce-gossip-only`): providers announce over gossip only, with no
+/// Kademlia record or provider record, to measure what Kademlia announcements cost. A process-wide
+/// setting like [`sim_treat_172_16_as_public`]; not reachable from the agent's command line.
+pub fn sim_announce_gossip_only() {
+    SIM_ANNOUNCE_GOSSIP_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// R-DHT-1: publish a signed `PeerRecord` as a `PROVIDER_ANNOUNCE` gossipsub
@@ -3942,19 +4011,31 @@ fn handle_swarm_event(
                 // peers filled public providers' tables within minutes of a 1,500-node start, and
                 // the dials were part of a connection storm that ran them out of memory).
                 let serves_dht = info.protocols.iter().any(|p| *p == crate::swarm::KAD_PROTOCOL);
+                if crate::kad_idle::peer_supports(&info.agent_version) {
+                    state.kad_idle_peers.insert(peer_id);
+                } else {
+                    state.kad_idle_peers.remove(&peer_id);
+                }
+                // Its relay circuits are kept for our own dials only (the address book), for every
+                // peer: a DHT server is directly reachable, and its circuits in the routing table made
+                // lookups dial it by relay and hand the circuits on in DHT answers (21 Nov: 23.6% of
+                // Kademlia's dials had only relay addresses; the routing table refuses circuits now,
+                // `swarm::kad_address_filter`). The direct-first dialler tries them only if the
+                // direct addresses fail.
                 for addr in identify_routing_addrs(&info.listen_addrs, &peer_id, &trusted, state.ipv6_capable) {
-                    if serves_dht {
-                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                    } else {
-                        // Kept for our own redials only (a reconnect after a drop).
-                        swarm.behaviour_mut().address_book.insert(peer_id, addr);
-                    }
+                    swarm.behaviour_mut().address_book.insert(peer_id, addr);
                 }
                 // Its direct addresses on the IP this connection really comes from are kept for our
-                // own dials to this peer only (a reconnect after a drop): the address book, which is
-                // never put in DHT answers. (`Swarm::add_peer_address` stores nothing: 2026-10-29.)
+                // own dials to this peer (a reconnect after a drop): the address book, which is never
+                // put in DHT answers. (`Swarm::add_peer_address` stores nothing: 2026-10-29.) For a
+                // DHT server, the globally reachable ones also go into the routing table, in place
+                // of its circuits.
                 let conn_addr = state.conn_remote_addrs.get(&connection_id).map(|(_, a, _)| a);
-                for addr in identify_dial_addrs(&info.listen_addrs, conn_addr, local_link, state.ipv6_capable) {
+                let direct = identify_dial_addrs(&info.listen_addrs, conn_addr, local_link, state.ipv6_capable);
+                for addr in kad_addrs_from_identify(serves_dht, on_public_network(state), &direct) {
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                }
+                for addr in direct {
                     swarm.behaviour_mut().address_book.insert(peer_id, addr);
                 }
                 // R-DHT-2 (revised after the 2026-06-15 live test): do NOT confirm
@@ -4707,7 +4788,15 @@ fn handle_swarm_event(
                 handle_trigger_repunch(swarm, peer_id, state);
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, cause, .. } => {
+            // A connection closed as idle (`kad_idle`), by us or by a peer that does that, says
+            // nothing about the peer: below, its routing entry and records stay.
+            // A close by the peer counts only when the peer closed on purpose (`closed_by_peer`):
+            // a crash, a reset or a timeout is a loss whatever the peer runs (review 22 Nov).
+            let closed_as_idle = state.idle_closed.remove(&connection_id)
+                || (state.kad_idle_peers.contains(&peer_id)
+                    && !state.app_peers.wanted(&peer_id)
+                    && closed_by_peer(cause.as_ref()));
             state.relay_ping_failures.remove(&connection_id);
             state.relay_conns.remove(&connection_id);
             state.relay_v6_quic_conns.remove(&connection_id);
@@ -4787,19 +4876,28 @@ fn handle_swarm_event(
                 // A round trip stands for a live path; with no connection left there is none.
                 state.peer_rtts.forget(&peer_id.to_base58());
 
-                // Ghost-peer purge: Kademlia routing table
-                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
-                debug!(%peer_id, "evicted from kademlia routing table");
+                if closed_as_idle {
+                    // Closed because nothing used it (`kad_idle`): not a lost peer. A peer that really
+                    // left goes with its departure notice, the bootstraps' gone notice, its records'
+                    // age, or Kademlia's own failed dials.
+                    debug!(%peer_id, "an idle connection closed; the peer's routing entry and records stay");
+                } else {
+                    // Ghost-peer purge: Kademlia routing table
+                    swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                    debug!(%peer_id, "evicted from kademlia routing table");
 
-                // Its provider records outlive the connection for LOST_PEER_GRACE_MS (#30): a dropped
-                // connection is usually back within seconds, and deleting them at once left us
-                // answering "no provider" until the provider's next announcement. The reaper
-                // deletes them once the grace runs out with no connection and no record since.
-                let libp2p_id_str = peer_id.to_string();
-                if state.known_peers.values().any(|record| record.libp2p_peer_id == libp2p_id_str) {
-                    state.lost_at_ms.insert(peer_id, now_unix_ms());
-                    debug!(%peer_id, "lost our last connection to a provider; its records stay for the grace period");
+                    // Its provider records outlive the connection for LOST_PEER_GRACE_MS (#30): a
+                    // dropped connection is usually back within seconds, and deleting them at once
+                    // left us answering "no provider" until the provider's next announcement. The
+                    // reaper deletes them once the grace runs out with no connection and no record
+                    // since.
+                    let libp2p_id_str = peer_id.to_string();
+                    if state.known_peers.values().any(|record| record.libp2p_peer_id == libp2p_id_str) {
+                        state.lost_at_ms.insert(peer_id, now_unix_ms());
+                        debug!(%peer_id, "lost our last connection to a provider; its records stay for the grace period");
+                    }
                 }
+                state.kad_idle_peers.remove(&peer_id);
 
                 // E-N3: prune the remaining per-peer maps that keyed off this
                 // peer. These grew unbounded because the disconnect cleanup
@@ -5348,6 +5446,51 @@ fn trusted_relay_pids(state: &LoopState) -> crate::relay::TrustedRelays {
 /// Which network this node is on ([`crate::relay::network_id`]), as its identify tells peers.
 fn our_network_id(state: &LoopState) -> String {
     crate::relay::network_id(&state.bootstrap_peers, on_public_network(state))
+}
+
+/// Close the connections only the DHT used, once idle (`kad_idle`): Kademlia dialled them, nothing
+/// else of ours uses the peer, and the peer knows such a close isn't a loss. Every
+/// [`crate::kad_idle::SWEEP_EVERY`], from the heal tick.
+fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &mut LoopState) {
+    let now = std::time::Instant::now();
+    let mesh: std::collections::HashSet<PeerId> = swarm.behaviour().gossipsub.all_mesh_peers().copied().collect();
+    let relays = trusted_relay_pids(state);
+    let pinned: std::collections::HashSet<PeerId> =
+        state.pinned.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+    let mut close = Vec::new();
+    for (cid, (peer, _, opened)) in &state.conn_remote_addrs {
+        let kad = &swarm.behaviour().kademlia;
+        let age = now.saturating_duration_since(*opened);
+        let facts = crate::kad_idle::ConnFacts {
+            kad_dialled: kad.kad_dialled(cid),
+            age,
+            since_kad_use: kad.last_activity(peer).map_or(age, |t| now.saturating_duration_since(t)),
+            peer_supports: state.kad_idle_peers.contains(peer),
+            kept: state.bootstrap_peers.iter().any(|(b, _)| b == peer)
+                || relays.contains_peer(peer)
+                || pinned.contains(peer)
+                || state.lan_dialer.knows(peer)
+                || mesh.contains(peer),
+            app_used: state.app_peers.wanted(peer),
+            in_flight: false,
+        };
+        // Only for one that would close: whether anything is under way with the peer (ours or its
+        // requests, a response being written, a queued forward; review 22 Nov: counting only our
+        // own requests let a connection serving a long job be closed under it).
+        if crate::kad_idle::should_close(&facts) {
+            let busy = peer_busy(state, *peer, |id| swarm.behaviour().grpc_proxy.is_pending_outbound(peer, id));
+            if !busy {
+                close.push((*cid, *peer));
+            }
+        }
+    }
+    for (cid, peer) in close {
+        if swarm.close_connection(cid) {
+            state.idle_closed.insert(cid);
+            state.idle_closes += 1;
+            debug!(target: "oh_kad_idle", me = %swarm.local_peer_id(), %peer, connection_id = ?cid, "closed an idle Kademlia connection");
+        }
+    }
 }
 
 /// Dial the LAN peers mDNS lists that are due a dial ([`crate::mdns::LanDialer::due`]). On every
@@ -6071,9 +6214,9 @@ const MAX_IDENTIFY_DIAL_ADDRS: usize = 4;
 /// Claimed IPv6 QUIC addresses dialled per hole-punch attempt (per peer, at most).
 const MAX_HOLEPUNCH_V6_ADDRS: usize = 2;
 
-/// The part of a peer's identify that goes into the routing table: its circuit addresses through a
-/// relay we use (the D-S5 check signed records go through), so a peer behind a home router stays
-/// reachable. Nothing direct: Kademlia lists a directly reachable peer itself after dialling it.
+/// A peer's circuit addresses from its identify, through a relay we use (the D-S5 check signed
+/// records go through), so a peer behind a home router stays reachable. Kept for our own dials only
+/// (the address book); the routing table takes no circuit (`swarm::kad_address_filter`, 21 Nov).
 fn identify_routing_addrs(
     listen_addrs: &[Multiaddr],
     peer: &PeerId,
@@ -6097,6 +6240,47 @@ fn identify_routing_addrs(
 /// The direct addresses from a peer's identify kept for our own dials to it: only on the IP the
 /// connection really comes from (`conn_addr`; none for a relayed one), so a peer can only point at
 /// itself, and only admissible ones (a LAN peer's LAN address is fine for a LAN dial).
+/// The routing-table addresses a peer's identify gives: for a DHT server, its direct addresses on its
+/// connection's IP ([`identify_dial_addrs`]) that are globally reachable (others will dial them from
+/// elsewhere); nothing for a peer that doesn't serve the DHT.
+/// On a private network (`public_network` false) any of them, as Kademlia's own address filter
+/// takes (review 22 Nov: a 10.x deployment otherwise got no routing entries this way).
+fn kad_addrs_from_identify(serves_dht: bool, public_network: bool, direct: &[Multiaddr]) -> Vec<Multiaddr> {
+    if !serves_dht {
+        return Vec::new();
+    }
+    direct.iter().filter(|a| !public_network || is_globally_reachable_addr(a)).cloned().collect()
+}
+
+/// Whether a connection's close `cause` says the peer closed it: over QUIC, an application close
+/// (a crashed process sends none: its connections time out, which is a loss); over TCP, the
+/// peer's end of the socket closing (yamux's orderly end, a broken pipe, a reset). TCP cannot tell
+/// a close the peer meant from its process dying (the kernel closes the socket either way): such a
+/// crash counts as a close here, and the peer goes with the bootstraps' gone notice, its records'
+/// age or Kademlia's failed dials. A timeout (the host vanished or moved) or our own close is not.
+fn closed_by_peer(cause: Option<&libp2p::swarm::ConnectionError>) -> bool {
+    let Some(libp2p::swarm::ConnectionError::IO(e)) = cause else { return false };
+    let Some(inner) = e.get_ref() else { return false };
+    if let Some(q) = inner.downcast_ref::<libp2p::quic::Error>() {
+        return matches!(q, libp2p::quic::Error::Connection(c) if c.closed_by_peer());
+    }
+    // yamux: its orderly end has only its text to go by; a socket error is in its source chain.
+    if inner.to_string() == "connection is closed" {
+        return true;
+    }
+    let mut source = inner.source();
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        source = err.source();
+    }
+    false
+}
+
 fn identify_dial_addrs(
     listen_addrs: &[Multiaddr],
     conn_addr: Option<&Multiaddr>,
@@ -6267,6 +6451,7 @@ fn send_proxy_request(
     data: Vec<u8>,
     reply: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
 ) {
+    state.app_peers.note(peer);
     if state.proxy_inflight.get(&peer).copied().unwrap_or(0) >= proxy_slots(state, peer) {
         let waiting = state.proxy_waiting.entry(peer).or_default();
         if waiting.len() >= MAX_PROXY_WAITING_PER_PEER {
@@ -6358,6 +6543,8 @@ fn handle_grpc_proxy_event(
 ) {
     match event {
         request_response::Event::Message { peer, message } => {
+            // A peer we exchange inference requests with: its connections are never closed as idle.
+            state.app_peers.note(peer);
             match message {
                 request_response::Message::Request { request_id: rid, request, channel } => {
                     // Phase 2.4: per-peer inflight cap. Count this peer's live
@@ -6463,7 +6650,10 @@ fn handle_grpc_proxy_event(
                 f(false);
             }
         }
-        request_response::Event::ResponseSent { request_id, .. } => {
+        request_response::Event::ResponseSent { peer, request_id, .. } => {
+            // Noted again when the reply goes out: a long request must not leave the peer looking
+            // unused (review of #16, finding 2).
+            state.app_peers.note(peer);
             state.responses_writing.remove(&request_id);
             if let Some((f, _, _)) = state.pending_sent.remove(&request_id) {
                 f(true);
@@ -7966,6 +8156,16 @@ mod tests {
     }
 
     #[test]
+    fn only_a_dht_servers_global_direct_addresses_go_into_the_routing_table() {
+        let ma = |s: &str| s.parse::<Multiaddr>().unwrap();
+        let direct = vec![ma("/ip4/45.79.190.172/udp/4001/quic-v1"), ma("/ip4/192.168.1.6/tcp/4111")];
+        assert_eq!(kad_addrs_from_identify(true, true, &direct), vec![ma("/ip4/45.79.190.172/udp/4001/quic-v1")]);
+        assert!(kad_addrs_from_identify(false, true, &direct).is_empty(), "a peer that doesn't serve the DHT gives none");
+        assert_eq!(kad_addrs_from_identify(true, false, &direct), direct, "a private network takes its private addresses");
+        assert!(kad_addrs_from_identify(false, false, &direct).is_empty());
+    }
+
+    #[test]
     fn holepunch_dials_only_a_few_global_ipv6_quic_addresses() {
         let claims = vec![
             ma("/ip6/::1/udp/4001/quic-v1"),
@@ -8903,5 +9103,69 @@ mod tests {
         let forwards = vec![(pid, vec![9], tx, now)];
         let kept = sweep_relay_forwards(forwards, std::time::Duration::from_secs(30), now);
         assert_eq!(kept.len(), 1);
+    }
+
+    /// The cause the other side sees when a peer closes a connection on purpose over `listen`
+    /// (a QUIC or TCP address on loopback), from real swarms.
+    async fn cause_seen_when_the_peer_closes(listen: &str) -> Option<libp2p::swarm::ConnectionError> {
+        use futures::StreamExt;
+        use libp2p::swarm::{dummy, SwarmEvent};
+        let build = || {
+            libp2p::SwarmBuilder::with_new_identity()
+                .with_tokio()
+                .with_tcp(libp2p::tcp::Config::default(), libp2p::noise::Config::new, libp2p::yamux::Config::default)
+                .unwrap()
+                .with_quic()
+                .with_behaviour(|_| dummy::Behaviour)
+                .unwrap()
+                .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
+                .build()
+        };
+        let (mut a, mut b) = (build(), build());
+        b.listen_on(listen.parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = b.select_next_some().await {
+                break address;
+            }
+        };
+        a.dial(addr.with(libp2p::multiaddr::Protocol::P2p(*b.local_peer_id()))).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut a_conn = None;
+        let mut b_up = false;
+        loop {
+            tokio::select! {
+                e = a.select_next_some() => {
+                    if let SwarmEvent::ConnectionEstablished { connection_id, .. } = e {
+                        a_conn = Some(connection_id);
+                    }
+                }
+                e = b.select_next_some() => match e {
+                    SwarmEvent::ConnectionEstablished { .. } => b_up = true,
+                    SwarmEvent::ConnectionClosed { cause, .. } => return cause,
+                    _ => {}
+                },
+                _ = tokio::time::sleep_until(deadline) => panic!("no close seen over {listen}"),
+            }
+            if b_up {
+                if let Some(c) = a_conn.take() {
+                    assert!(a.close_connection(c));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_the_peer_meant_is_told_from_a_crash() {
+        for listen in ["/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"] {
+            let cause = cause_seen_when_the_peer_closes(listen).await;
+            assert!(closed_by_peer(cause.as_ref()), "{listen}: {cause:?}");
+        }
+        use libp2p::swarm::ConnectionError;
+        assert!(!closed_by_peer(None), "our own close");
+        assert!(!closed_by_peer(Some(&ConnectionError::KeepAliveTimeout)));
+        let bare = ConnectionError::IO(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!closed_by_peer(Some(&bare)), "not from a muxer");
+        let timed_out = ConnectionError::IO(std::io::Error::new(std::io::ErrorKind::Other, "connection timed out"));
+        assert!(!closed_by_peer(Some(&timed_out)));
     }
 }

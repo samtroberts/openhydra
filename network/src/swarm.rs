@@ -144,15 +144,71 @@ pub fn routable_on_public_network(addr: &Multiaddr) -> bool {
 /// ([`crate::pinned::kad_allows`]), except for a configured bootstrap (the user gave that address: a
 /// one-machine network whose gateway bootstraps from its own provider, where without it the DHT
 /// would have nobody to ask). Public so the leak-guard test runs the node's own filter.
+///
+/// And never a relay circuit (21 Nov 2026). Only DHT servers belong in the table, and a DHT server
+/// is directly reachable: its circuits only made Kademlia's dials go through the bootstraps' relays
+/// (each a circuit request at every relay) and, put in DHT answers, made other nodes dial it by relay
+/// alone (23.6% of Kademlia's dials in a 1,500-node simulation). The filter also applies to the
+/// addresses other nodes' answers carry, so older nodes still handing circuits out don't reach our
+/// dials. The cost: a DHT server we can reach only through a relay (an IPv6-only one, seen from an
+/// IPv4-only host) is skipped by our lookups; a lookup asks several servers and keeps twenty per key.
 pub fn kad_address_filter(
     public_network: bool,
     bootstraps: std::collections::HashSet<PeerId>,
     pinned: crate::pinned::PinnedPeers,
 ) -> kad::AddressFilter {
     kad::AddressFilter::new(move |peer, addr| {
-        (!public_network || routable_on_public_network(addr))
+        !is_circuit(addr)
+            && (!public_network || routable_on_public_network(addr))
             && (bootstraps.contains(peer) || crate::pinned::kad_allows(&pinned, peer, addr))
     })
+}
+
+/// Simulator only (`oh_sim --kad-replication off|SECS`): the Kademlia record-replication interval for
+/// every node this process starts, to measure what replication costs (0 = the normal 60 s,
+/// `u64::MAX` = off). Not reachable from the agent's command line.
+static SIM_KAD_REPLICATION_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Simulator only: see [`SIM_KAD_REPLICATION_SECS`]. `None` turns replication off.
+pub fn sim_set_kad_replication(secs: Option<u64>) {
+    SIM_KAD_REPLICATION_SECS.store(secs.map_or(u64::MAX, |s| s.max(1)), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Simulator only (`oh_sim --kad-refresh off|SECS`): Kademlia's periodic routing-table refresh
+/// (0 = the normal 300 s, `u64::MAX` = off: Kademlia then refreshes only when its table runs low).
+static SIM_KAD_REFRESH_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Simulator only: see [`SIM_KAD_REFRESH_SECS`]. `None` turns the periodic refresh off.
+pub fn sim_set_kad_refresh(secs: Option<u64>) {
+    SIM_KAD_REFRESH_SECS.store(secs.map_or(u64::MAX, |s| s.max(1)), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Simulator only (`oh_sim --kad-slow SECS`): Kademlia as a slow index. A provider re-announces a
+/// model to Kademlia only when its record changes or after SECS (gossip still every announce), and
+/// records live 1.2 x SECS. 0 = off (records live 300 s, every announce goes to Kademlia).
+static SIM_KAD_SLOW_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Simulator only: see [`SIM_KAD_SLOW_SECS`].
+pub fn sim_set_kad_slow(secs: u64) {
+    SIM_KAD_SLOW_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The slow-index interval (`None` = normal announcing).
+pub fn kad_slow_interval() -> Option<Duration> {
+    match SIM_KAD_SLOW_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        s => Some(Duration::from_secs(s)),
+    }
+}
+
+/// How long a Kademlia record and provider record live: 300 s, or 1.2 x the slow-index interval.
+pub fn kad_record_ttl() -> Duration {
+    kad_slow_interval().map_or(Duration::from_secs(300), |d| d * 6 / 5)
+}
+
+/// Whether `addr` goes through a relay (`/p2p-circuit`).
+pub fn is_circuit(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
 }
 
 /// Build and configure a libp2p Swarm with the OpenHydra behaviour.
@@ -262,11 +318,15 @@ pub fn build_swarm(
     // every 120 s ([`ANNOUNCE_REFRESH_MAX`] at most), a fresh signed record each time, so Kad
     // republishing the same ones on the same cadence sent every announce twice (measured: about
     // 116 announces per provider per 120 s, half of them Kad's).
-    kad_config.set_record_ttl(Some(Duration::from_secs(300)));
-    kad_config.set_provider_record_ttl(Some(Duration::from_secs(300)));
+    kad_config.set_record_ttl(Some(kad_record_ttl()));
+    kad_config.set_provider_record_ttl(Some(kad_record_ttl()));
     kad_config.set_publication_interval(None);
     kad_config.set_provider_publication_interval(None);
-    kad_config.set_replication_interval(Some(Duration::from_secs(60)));
+    kad_config.set_replication_interval(match SIM_KAD_REPLICATION_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => Some(Duration::from_secs(60)),
+        u64::MAX => None,
+        secs => Some(Duration::from_secs(secs)),
+    });
 
     // Learned-record caching — on a successful lookup, cache the record at the
     // closest nodes that didn't return it (up to max_peers), so a popular model's
@@ -277,7 +337,11 @@ pub fn build_swarm(
     // Active maintenance — periodically re-run bootstrap() to refresh buckets and
     // evict dead nodes (pairs with R-DHT-6's persistent routing table). Explicit
     // 5 min interval.
-    kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(300)));
+    kad_config.set_periodic_bootstrap_interval(match SIM_KAD_REFRESH_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => Some(Duration::from_secs(300)),
+        u64::MAX => None,
+        secs => Some(Duration::from_secs(secs)),
+    });
 
     // D-S3 (write-side record verification): reject poisoned records on the
     // *inbound-PUT* side, not just at read time. Read-side verification
@@ -331,7 +395,7 @@ pub fn build_swarm(
         identify::Config::new(opts.protocol_version.clone(), keypair.public())
             // Which network we're on (`net=…`), so a node of another one on the same LAN isn't
             // joined to ours (review 2026-10-29).
-            .with_agent_version(format!("openhydra-agent/{} net={}", env!("CARGO_PKG_VERSION"), opts.network_id))
+            .with_agent_version(format!("openhydra-agent/{} net={} {}", env!("CARGO_PKG_VERSION"), opts.network_id, crate::kad_idle::AGENT_TOKEN))
             .with_push_listen_addr_updates(true)
             // No address cache: identify would offer every address a peer claims (its loopback, its
             // LAN) to our dials. The admissible ones reach Kademlia, which offers those (L10).
@@ -357,7 +421,17 @@ pub fn build_swarm(
     // and reports per-address verdicts that drive R-DHT-2 promotion, `nat_info`,
     // and UPnP-re-assert suppression. No-op until a v2 server (a bootstrap) is
     // reachable.
-    let autonat_v2_client = autonat::v2::client::Behaviour::default();
+    // Probing: at most 3 untested address candidates a minute (the default is 10 every 5 s). Each
+    // test makes an AutoNAT server dial us back, and behind NATs that give every connection a new
+    // port, new candidates never run out: in a 1,500-node simulation each bootstrap made 32,942
+    // dial-backs in ten minutes (22 Nov). A public node is confirmed (and promoted to DHT server)
+    // within about a minute instead of seconds.
+    let autonat_v2_client = autonat::v2::client::Behaviour::new(
+        rand::rngs::OsRng,
+        autonat::v2::client::Config::default()
+            .with_probe_interval(Duration::from_secs(60))
+            .with_max_candidates(3),
+    );
 
     // gRPC proxy (cross-ISP tunneling through relay).
     let grpc_proxy = crate::proxy::proxy_behaviour();
@@ -548,5 +622,22 @@ mod tests {
         assert!(f.can_subscribe(&gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC).hash()));
         assert!(!f.can_subscribe(&gossipsub::IdentTopic::new("junk-1").hash()));
         assert!(!f.can_subscribe(&gossipsub::IdentTopic::new("openhydra/swarm/v1/other").hash()));
+    }
+
+    #[test]
+    fn kademlia_never_takes_a_relay_circuit() {
+        let peer: PeerId = "12D3KooWHWC996zfy6r8dDoCzN6ZJkszgzaoRUnvBhCAB4nDn84g".parse().unwrap();
+        let relay = "12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb";
+        let circuit: Multiaddr = format!("/ip4/45.79.190.172/udp/4001/quic-v1/p2p/{relay}/p2p-circuit").parse().unwrap();
+        let direct: Multiaddr = "/ip4/45.79.190.173/udp/4001/quic-v1".parse().unwrap();
+        for public_network in [false, true] {
+            let f = kad_address_filter(public_network, Default::default(), Default::default());
+            assert!(!f.allows(&peer, &circuit), "public_network={public_network}");
+            assert!(f.allows(&peer, &direct), "public_network={public_network}");
+            // Not even for a bootstrap.
+            let f = kad_address_filter(public_network, [peer].into_iter().collect(), Default::default());
+            assert!(!f.allows(&peer, &circuit));
+        }
+        assert!(is_circuit(&circuit) && !is_circuit(&direct));
     }
 }
