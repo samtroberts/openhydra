@@ -112,3 +112,17 @@ pub struct ConnectError(quinn::ConnectError);
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct ConnectionError(quinn::ConnectionError);
+
+impl ConnectionError {
+    /// OpenHydra patch (22 Nov 2026): whether the peer closed the connection on purpose (a QUIC
+    /// application close, or the APPLICATION_ERROR transport close it becomes when sent before the
+    /// handshake is confirmed, RFC 9000 §10.2.3), as opposed to a reset, a timeout or a protocol
+    /// error.
+    pub fn closed_by_peer(&self) -> bool {
+        match &self.0 {
+            quinn::ConnectionError::ApplicationClosed(_) => true,
+            quinn::ConnectionError::ConnectionClosed(c) => c.error_code == quinn::TransportErrorCode::APPLICATION_ERROR,
+            _ => false,
+        }
+    }
+}

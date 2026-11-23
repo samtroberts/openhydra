@@ -44,6 +44,8 @@ use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
 use std::{
@@ -75,6 +77,15 @@ pub struct GenTransport<P: Provider> {
     listeners: SelectAll<Listener<P>>,
     /// Dialer for each socket family if no matching listener exists.
     dialer: HashMap<SocketFamily, quinn::Endpoint>,
+    /// OpenHydra patch (22 Nov 2026): the endpoint `PortUse::New` dials go out from, one per socket
+    /// family, never a listener's. Upstream bound a new endpoint for every such dial, each with its
+    /// own UDP socket and a ~100 KB receive buffer, and they outlived their connections: a bootstrap
+    /// answering AutoNAT dial-back requests held 32,942 of them (3.5 GB) after ten minutes of a
+    /// 1,500-node simulation. One shared endpoint is still not the listening port, which is all a
+    /// "new port" dial needs (an AutoNAT dial-back must not reuse the flow the peer opened).
+    /// The flag is set by a dial that found the endpoint stopped (quinn stops an endpoint for good
+    /// on a socket error); the next such dial then binds a new one (review 22 Nov).
+    new_port_dialer: HashMap<SocketFamily, (quinn::Endpoint, Arc<AtomicBool>)>,
     /// Waker to poll the transport again when a new dialer or listener is added.
     waker: Option<Waker>,
     /// Holepunching attempts
@@ -92,6 +103,7 @@ impl<P: Provider> GenTransport<P> {
             quinn_config,
             handshake_timeout,
             dialer: HashMap::new(),
+            new_port_dialer: HashMap::new(),
             waker: None,
             support_draft_29,
             hole_punch_attempts: Default::default(),
@@ -274,6 +286,8 @@ impl<P: Provider> Transport for GenTransport<P> {
 
         match (dial_opts.role, dial_opts.port_use) {
             (Endpoint::Dialer, _) | (Endpoint::Listener, PortUse::Reuse) => {
+                // Set when this dial goes out from the shared new-port endpoint.
+                let mut stopped_flag: Option<Arc<AtomicBool>> = None;
                 let endpoint = if let Some(listener) = dial_opts
                     .port_use
                     .eq(&PortUse::Reuse)
@@ -292,7 +306,19 @@ impl<P: Provider> Transport for GenTransport<P> {
                             endpoint
                         }
                     } else {
-                        self.bound_socket(socket_addr)?
+                        match self.new_port_dialer.get(&socket_family) {
+                            Some((shared, stopped)) if !stopped.load(Ordering::Relaxed) => {
+                                stopped_flag = Some(Arc::clone(stopped));
+                                shared.clone()
+                            }
+                            _ => {
+                                let endpoint = self.bound_socket(socket_addr)?;
+                                let stopped = Arc::new(AtomicBool::new(false));
+                                stopped_flag = Some(Arc::clone(&stopped));
+                                self.new_port_dialer.insert(socket_family, (endpoint.clone(), stopped));
+                                endpoint
+                            }
+                        }
                     };
                     dialer
                 };
@@ -307,7 +333,12 @@ impl<P: Provider> Transport for GenTransport<P> {
                     // is based upon the assumption that we do.
                     let connecting = endpoint
                         .connect_with(client_config, socket_addr, "l")
-                        .map_err(ConnectError)?;
+                        .map_err(|e| {
+                            if let (quinn::ConnectError::EndpointStopping, Some(flag)) = (&e, &stopped_flag) {
+                                flag.store(true, Ordering::Relaxed);
+                            }
+                            ConnectError(e)
+                        })?;
                     Connecting::new(connecting, handshake_timeout).await
                 }))
             }
