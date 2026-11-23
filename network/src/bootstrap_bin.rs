@@ -839,9 +839,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         serde_json::json!({"key": String::from_utf8_lossy(&k[..k.len().min(120)]), "adds": n, "stored": stored})
                     }).collect()
                 };
+                // Memory attribution (22 Nov): what each part holds, beside the process's RSS.
+                let (kad_records, kad_provider_records, kad_store_bytes) = swarm.behaviour_mut().kademlia.store_mut().oh_sizes();
+                let kad_routing_peers: usize = swarm.behaviour_mut().kademlia.kbuckets().map(|b| b.num_entries()).sum();
                 let g = &swarm.behaviour().gossipsub;
                 let counters = swarm.network_info().connection_counters().clone();
                 let json = serde_json::json!({
+                    "kad_records": kad_records,
+                    "kad_provider_records": kad_provider_records,
+                    "kad_store_bytes": kad_store_bytes,
+                    "kad_routing_peers": kad_routing_peers,
+                    "gossip_queued_bytes": libp2p::gossipsub::openhydra_counters::QUEUED_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+                    "gossip_handlers_alive": libp2p::gossipsub::openhydra_counters::HANDLERS_ALIVE.load(std::sync::atomic::Ordering::Relaxed),
+                    "gossip_handlers_disabled": libp2p::gossipsub::openhydra_counters::HANDLERS_DISABLED.load(std::sync::atomic::Ordering::Relaxed),
+                    "pending_out": counters.num_pending_outgoing(),
                     "t_ms": now_ms(),
                     "connected_peers": swarm.connected_peers().count(),
                     "connections": counters.num_established(),

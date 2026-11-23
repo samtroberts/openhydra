@@ -8,6 +8,15 @@
 //!               --count N [--first I] --dir DIR [--rate PER_SEC] [--duration SECS]
 //!               [--providers A-B] [--req-every SECS] [--req-bytes B] [--reply-bytes B]
 //!               [--sample-every K] [--models K] [--flood-rate PER_SEC] [--nat] [--vpc-is-public]
+//!               [--kad-replication off|SECS] [--announce-gossip-only] [--kad-refresh off|SECS] [--kad-slow SECS]
+//! `--kad-refresh`: Kademlia's periodic routing-table refresh (default 300 s; off = only when the
+//! table runs low). `--kad-slow SECS`: Kademlia as a slow index (re-announce only on change or
+//! after SECS; records live 1.2 x SECS). `--role lookup`: a just-joined node times 10 lookups of
+//! models from `--providers A-B` through the registry and through discovery (OH_SIM_LOOKUP lines).
+//! `--announce-gossip-only`: providers announce over gossip only (no Kademlia record or provider
+//! record), to measure what Kademlia announcements cost.
+//! `--kad-replication`: Kademlia's record-replication interval for every node (default 60 s), to
+//! measure what replication costs.
 //! `--vpc-is-public`: count 172.16.0.0/12 (the AWS simulation's VPC addresses) as public, so a
 //! node AutoNAT finds reachable there is promoted to DHT server as on the real internet (without it
 //! no simulated agent ever was: 20 Nov). 10/8 (the NAT homes) and 192.168/16 stay private.
@@ -127,6 +136,18 @@ fn main() {
     }
     std::fs::create_dir_all(&dir).expect("dir");
     openhydra_network::node::disable_mdns();
+    if let Some(v) = arg(&args, "--kad-refresh") {
+        openhydra_network::swarm::sim_set_kad_refresh(if v == "off" { None } else { Some(v.parse().expect("--kad-refresh off|SECS")) });
+    }
+    if let Some(v) = arg(&args, "--kad-slow") {
+        openhydra_network::swarm::sim_set_kad_slow(v.parse().expect("--kad-slow SECS"));
+    }
+    if args.iter().any(|a| a == "--announce-gossip-only") {
+        openhydra_network::event_loop::sim_announce_gossip_only();
+    }
+    if let Some(v) = arg(&args, "--kad-replication") {
+        openhydra_network::swarm::sim_set_kad_replication(if v == "off" { None } else { Some(v.parse().expect("--kad-replication off|SECS")) });
+    }
     if args.iter().any(|a| a == "--vpc-is-public") {
         openhydra_network::event_loop::sim_treat_172_16_as_public();
     }
@@ -241,6 +262,8 @@ fn run_peer(
     stats: Arc<Stats>,
     opts: Opts,
 ) {
+    // The lookup role checks its connection against these; the sampling thread below takes its own.
+    let lookup_bootstraps = bootstrap_ids.clone();
     let Opts { req_every, req_bytes, reply_bytes, prov_lo, prov_hi, models, flood_rate, nat, v6_prefix, announce_every, listen_ip } = opts;
     let listen = if let Some(p) = v6_prefix {
         let a = std::net::Ipv6Addr::from(u128::from(p) + i as u128);
@@ -440,6 +463,49 @@ fn run_peer(
                 }
                 let jitter = 0.5 + ((n >> 20) % 1000) as f64 / 1000.0;
                 std::thread::sleep(Duration::from_secs_f64(req_every * jitter));
+            }
+        }
+        "lookup" => {
+            // A node that has just joined looks up 10 models it hasn't heard of (from --providers
+            // A-B): the bootstraps' registry and the normal discovery, each timed. One OH_SIM_LOOKUP
+            // line (stderr) per model.
+            // Wait for a bootstrap connection first (the registry answers empty at once without one),
+            // then a moment for its protocols to be negotiated.
+            let joined = Instant::now();
+            while joined.elapsed() < Duration::from_secs(60)
+                && !net.status().is_ok_and(|s| s.peers.iter().any(|p| lookup_bootstraps.contains(&p.peer_id)))
+            {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let connected_after_ms = joined.elapsed().as_millis() as u64;
+            std::thread::sleep(Duration::from_secs(2));
+            let span = prov_hi.saturating_sub(prov_lo).max(1);
+            let mut n: u64 = i.wrapping_mul(2654435761).wrapping_add(17);
+            for _ in 0..10 {
+                n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let model = format!("sim-{}", prov_lo + (n >> 33) % span);
+                // Discovery first: the registry's answer goes into the node's cache, which discovery
+                // would then answer from.
+                let t = Instant::now();
+                let disc = net.discover(model.clone());
+                let disc_ms = t.elapsed().as_millis() as u64;
+                let t = Instant::now();
+                let reg = net.query_registry(model.clone());
+                let reg_ms = t.elapsed().as_millis() as u64;
+                let line = serde_json::json!({
+                    "connected_after_ms": connected_after_ms,
+                    "model": model,
+                    "registry_ms": reg_ms,
+                    "registry_found": reg.as_ref().map(|v| v.len()).unwrap_or(0),
+                    "registry_err": reg.err(),
+                    "discover_ms": disc_ms,
+                    "discover_found": disc.as_ref().map(|v| v.len()).unwrap_or(0),
+                    "discover_err": disc.err(),
+                });
+                eprintln!("OH_SIM_LOOKUP {line}");
+            }
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
             }
         }
         "flooder" => {
