@@ -69,6 +69,16 @@ impl Default for MemoryStoreConfig {
 }
 
 impl MemoryStore {
+    /// OpenHydra patch (22 Nov 2026): how many regular records and provider records are stored, and
+    /// their approximate bytes (record values; provider records counted by their address lists), for
+    /// a bootstrap's memory metrics.
+    pub fn oh_sizes(&self) -> (usize, usize, usize) {
+        let provider_records: usize = self.providers.values().map(|v| v.len()).sum();
+        let bytes = self.records.values().map(|r| r.key.as_ref().len() + r.value.len()).sum::<usize>()
+            + self.providers.values().flat_map(|v| v.iter()).map(|p| p.key.as_ref().len() + p.addresses.iter().map(|a| a.as_ref().len()).sum::<usize>()).sum::<usize>();
+        (self.records.len(), provider_records, bytes)
+    }
+
     /// Creates a new `MemoryRecordStore` with a default configuration.
     pub fn new(local_id: PeerId) -> Self {
         Self::with_config(local_id, Default::default())

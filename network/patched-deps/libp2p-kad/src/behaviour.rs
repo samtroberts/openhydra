@@ -67,6 +67,13 @@ pub struct Behaviour<TStore> {
     /// The k-bucket insertion strategy.
     kbucket_inserts: BucketInserts,
 
+    /// OpenHydra patch (21 Nov 2026): the connections Kademlia dialled (until they close or fail),
+    /// so the node can close the ones only the DHT used once idle ([`Behaviour::kad_dialled`]).
+    oh_dialled: HashMap<ConnectionId, PeerId>,
+    /// OpenHydra patch: when Kademlia last exchanged anything with each peer
+    /// ([`Behaviour::last_activity`]).
+    oh_last_activity: HashMap<PeerId, std::time::Instant>,
+
     /// OpenHydra patch: which addresses may enter the routing table.
     address_filter: Option<AddressFilter>,
 
@@ -179,7 +186,8 @@ impl AddressFilter {
         Self(std::sync::Arc::new(f))
     }
 
-    fn allows(&self, peer: &PeerId, addr: &Multiaddr) -> bool {
+    /// Whether `addr` may be kept and dialled for `peer` (public for OpenHydra's filter tests).
+    pub fn allows(&self, peer: &PeerId, addr: &Multiaddr) -> bool {
         (self.0)(peer, addr)
     }
 }
@@ -535,6 +543,8 @@ where
             kbuckets: KBucketsTable::new(local_key, config.kbucket_config),
             kbucket_inserts: config.kbucket_inserts,
             address_filter: config.address_filter,
+            oh_dialled: HashMap::new(),
+            oh_last_activity: HashMap::new(),
             protocol_config: config.protocol_config,
             record_filtering: config.record_filtering,
             queued_events: VecDeque::with_capacity(config.query_config.replication_factor.get()),
@@ -682,9 +692,9 @@ where
                         RoutingUpdate::Failed
                     }
                     kbucket::InsertResult::Pending { disconnected } => {
-                        self.queued_events.push_back(ToSwarm::Dial {
-                            opts: DialOpts::peer_id(disconnected.into_preimage()).build(),
-                        });
+                        if let Some(opts) = self.oh_liveness_dial(disconnected.into_preimage()) {
+                            self.queued_events.push_back(ToSwarm::Dial { opts });
+                        }
                         RoutingUpdate::Pending
                     }
                 }
@@ -1341,11 +1351,46 @@ where
         self.queries.add_iter_closest(target.clone(), peers, info);
     }
 
-    /// Updates the routing table with a new connection status and address of a peer.
-    /// OpenHydra patch: whether `addr` may enter the routing table for `peer`.
+    /// OpenHydra patch: whether Kademlia dialled this (still open) connection.
+    pub fn kad_dialled(&self, connection: &ConnectionId) -> bool {
+        self.oh_dialled.contains_key(connection)
+    }
+
+    /// OpenHydra patch: when Kademlia last sent `peer` a request or received anything from it.
+    pub fn last_activity(&self, peer: &PeerId) -> Option<std::time::Instant> {
+        self.oh_last_activity.get(peer).copied()
+    }
+
+    /// OpenHydra patch: note Kademlia traffic with `peer`.
+    fn oh_note_activity(&mut self, peer: PeerId) {
+        oh_note_activity(&mut self.oh_last_activity, peer);
+    }
+
+    /// OpenHydra patch: a dial of `peer`, one of its routing-table entries checked for liveness, at
+    /// the addresses that entry holds through the address filter, and none the other behaviours
+    /// would add (OpenHydra's address book keeps relay circuits; a Kademlia dial must not go
+    /// through a relay). `None` when no address passes: the entry is then replaced once its
+    /// pending replacement's timeout runs out, as for a failed dial.
+    fn oh_liveness_dial(&mut self, peer: PeerId) -> Option<DialOpts> {
+        let mut addrs: Vec<Multiaddr> = match self.kbuckets.entry(&kbucket::Key::from(peer)) {
+            Some(kbucket::Entry::Present(mut entry, _)) => entry.value().iter().cloned().collect(),
+            _ => Vec::new(),
+        };
+        let filter = &self.address_filter;
+        addrs.retain(|a| filter.as_ref().map_or(true, |f| f.allows(&peer, a)));
+        if addrs.is_empty() {
+            return None;
+        }
+        let opts = DialOpts::peer_id(peer).addresses(addrs).build();
+        self.oh_dialled.insert(opts.connection_id(), peer);
+        Some(opts)
+    }
+
     fn address_allowed(&self, peer: &PeerId, addr: &Multiaddr) -> bool {
         self.address_filter.as_ref().map_or(true, |f| f.allows(peer, addr))
     }
+
+    /// Updates the routing table with a new connection status and address of a peer.
 
     fn connection_updated(
         &mut self,
@@ -1450,10 +1495,9 @@ where
                                 //
                                 // Only try dialing peer if not currently connected.
                                 if !self.connected_peers.contains(disconnected.preimage()) {
-                                    self.queued_events.push_back(ToSwarm::Dial {
-                                        opts: DialOpts::peer_id(disconnected.into_preimage())
-                                            .build(),
-                                    })
+                                    if let Some(opts) = self.oh_liveness_dial(disconnected.into_preimage()) {
+                                        self.queued_events.push_back(ToSwarm::Dial { opts })
+                                    }
                                 }
                             }
                         }
@@ -1599,8 +1643,17 @@ where
                         get_closest_peers_stats: q.stats,
                     },
                 };
+                // OpenHydra patch (23 Nov 2026): the second phase keeps the addresses the first one
+                // learned. Query dials use only the routing table's and the query's own addresses
+                // (no other behaviour's), so without them a peer found by the first phase whose
+                // connection has since closed could not be dialled again.
+                let mut peers = q.peers;
+                let addresses = std::mem::take(&mut peers.addresses);
                 self.queries
-                    .continue_fixed(query_id, q.peers.into_peerids_iter(), info);
+                    .continue_fixed(query_id, peers.into_peerids_iter(), info);
+                if let Some(next) = self.queries.get_mut(&query_id) {
+                    next.peers.addresses = addresses;
+                }
                 None
             }
 
@@ -1666,8 +1719,17 @@ where
                         get_closest_peers_stats: q.stats,
                     },
                 };
+                // OpenHydra patch (23 Nov 2026): the second phase keeps the addresses the first one
+                // learned. Query dials use only the routing table's and the query's own addresses
+                // (no other behaviour's), so without them a peer found by the first phase whose
+                // connection has since closed could not be dialled again.
+                let mut peers = q.peers;
+                let addresses = std::mem::take(&mut peers.addresses);
                 self.queries
-                    .continue_fixed(query_id, q.peers.into_peerids_iter(), info);
+                    .continue_fixed(query_id, peers.into_peerids_iter(), info);
+                if let Some(next) = self.queries.get_mut(&query_id) {
+                    next.peers.addresses = addresses;
+                }
                 None
             }
 
@@ -2323,6 +2385,8 @@ where
         connection: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
+        // OpenHydra patch: anything from the peer's Kademlia handler is traffic with it.
+        self.oh_note_activity(source);
         match event {
             HandlerEvent::ProtocolConfirmed { endpoint } => {
                 debug_assert!(self.connected_peers.contains(&source));
@@ -2689,16 +2753,42 @@ where
                         }
 
                         if self.connected_peers.contains(&peer_id) {
+                            // OpenHydra patch: Kademlia traffic with this peer (`last_activity`).
+                            oh_note_activity(&mut self.oh_last_activity, peer_id);
                             self.queued_events.push_back(ToSwarm::NotifyHandler {
                                 peer_id,
                                 event,
                                 handler: NotifyHandler::Any,
                             });
                         } else if &peer_id != self.kbuckets.local_key().preimage() {
-                            query.pending_rpcs.push((peer_id, event));
-                            self.queued_events.push_back(ToSwarm::Dial {
-                                opts: DialOpts::peer_id(peer_id).build(),
-                            });
+                            // OpenHydra patch (21 Nov 2026): dial only at the addresses Kademlia
+                            // itself knows (its routing table, this query's answers), through the
+                            // address filter, and none the other behaviours would add: OpenHydra's
+                            // address book keeps relay circuits, and a Kademlia dial through a relay
+                            // costs a circuit request at every relay. Knowing none, the peer counts
+                            // as failed for this query, which moves on to the next.
+                            let mut addrs: Vec<Multiaddr> = match self.kbuckets.entry(&kbucket::Key::from(peer_id)) {
+                                Some(kbucket::Entry::Present(mut entry, _)) => entry.value().iter().cloned().collect(),
+                                _ => Vec::new(),
+                            };
+                            if let Some(learned) = query.peers.addresses.get(&peer_id) {
+                                for a in learned.iter() {
+                                    if !addrs.contains(a) {
+                                        addrs.push(a.clone());
+                                    }
+                                }
+                            }
+                            let filter = &self.address_filter;
+                            addrs.retain(|a| filter.as_ref().map_or(true, |f| f.allows(&peer_id, a)));
+                            if addrs.is_empty() {
+                                query.on_failure(&peer_id);
+                            } else {
+                                query.pending_rpcs.push((peer_id, event));
+                                let opts = DialOpts::peer_id(peer_id).addresses(addrs).build();
+                                self.oh_dialled.insert(opts.connection_id(), peer_id);
+                                oh_note_activity(&mut self.oh_last_activity, peer_id);
+                                self.queued_events.push_back(ToSwarm::Dial { opts });
+                            }
                         }
                     }
                     QueryPoolState::Waiting(None) | QueryPoolState::Idle => break,
@@ -2717,6 +2807,19 @@ where
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
+        // OpenHydra patch: a connection Kademlia dialled is forgotten once it closes or fails.
+        match &event {
+            FromSwarm::ConnectionClosed(c) => {
+                self.oh_dialled.remove(&c.connection_id);
+                if c.remaining_established == 0 {
+                    self.oh_last_activity.remove(&c.peer_id);
+                }
+            }
+            FromSwarm::DialFailure(d) => {
+                self.oh_dialled.remove(&d.connection_id);
+            }
+            _ => {}
+        }
         self.listen_addresses.on_swarm_event(&event);
         let external_addresses_changed = self.external_addresses.on_swarm_event(&event);
 
@@ -3503,4 +3606,19 @@ where
         .map(|addr| addr.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// OpenHydra patch: note Kademlia traffic with `peer` in `activity` (bounded: past 8,192 peers,
+/// those quiet for ten minutes are forgotten, and past that the quietest go).
+fn oh_note_activity(activity: &mut HashMap<PeerId, std::time::Instant>, peer: PeerId) {
+    const MAX: usize = 8192;
+    let now = std::time::Instant::now();
+    if activity.len() >= MAX && !activity.contains_key(&peer) {
+        activity.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(600));
+        while activity.len() >= MAX {
+            let Some(oldest) = activity.iter().min_by_key(|(_, at)| **at).map(|(p, _)| *p) else { break };
+            activity.remove(&oldest);
+        }
+    }
+    activity.insert(peer, now);
 }
