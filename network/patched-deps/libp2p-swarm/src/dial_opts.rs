@@ -74,6 +74,8 @@ pub struct DialOpts {
     dial_concurrency_factor_override: Option<NonZeroU8>,
     connection_id: ConnectionId,
     port_use: PortUse,
+    /// OpenHydra patch: see [`DialOpts::with_attempt_timeout`].
+    attempt_timeout: Option<std::time::Duration>,
 }
 
 impl DialOpts {
@@ -158,6 +160,19 @@ impl DialOpts {
     pub(crate) fn port_use(&self) -> PortUse {
         self.port_use
     }
+
+    /// OpenHydra patch (23 Nov 2026): give up on each address of this dial after `timeout` (from
+    /// when its attempt starts), on top of the transports' own limits. For DCUtR's hole punch,
+    /// whose retry waits for the whole dial to fail: a punch that missed is not saved by waiting
+    /// out the transports' 5 s (QUIC) or 8 s (TCP) limits.
+    pub fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.attempt_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn attempt_timeout(&self) -> Option<std::time::Duration> {
+        self.attempt_timeout
+    }
 }
 
 impl From<Multiaddr> for DialOpts {
@@ -221,6 +236,7 @@ impl WithPeerId {
             role_override: self.role_override,
             dial_concurrency_factor_override: self.dial_concurrency_factor_override,
             connection_id: ConnectionId::next(),
+            attempt_timeout: None,
             port_use: self.port_use,
         }
     }
@@ -271,6 +287,7 @@ impl WithPeerIdWithAddresses {
             role_override: self.role_override,
             dial_concurrency_factor_override: self.dial_concurrency_factor_override,
             connection_id: ConnectionId::next(),
+            attempt_timeout: None,
             port_use: self.port_use,
         }
     }
@@ -311,6 +328,7 @@ impl WithoutPeerIdWithAddress {
             role_override: self.role_override,
             dial_concurrency_factor_override: None,
             connection_id: ConnectionId::next(),
+            attempt_timeout: None,
             port_use: self.port_use,
         }
     }

@@ -572,6 +572,7 @@ where
             dial_opts.port_use(),
             dial_opts.dial_concurrency_override(),
             connection_id,
+            dial_opts.attempt_timeout(),
         );
 
         Ok(())

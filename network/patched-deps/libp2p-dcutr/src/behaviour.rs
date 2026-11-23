@@ -43,6 +43,18 @@ use void::Void;
 
 pub(crate) const MAX_NUMBER_OF_UPGRADE_ATTEMPTS: u8 = 3;
 
+/// OpenHydra patch (23 Nov 2026): how long each address of a hole-punch dial may take on the side
+/// that retries, from the round trip `rtt` of the CONNECT exchange through the relay: 5 RTTs, at
+/// least 3 s, at most 8 s. DCUtR retries only once the whole dial has failed, and a punch that
+/// missed is not saved by waiting out the transports' own limits (QUIC 5 s, TCP 8 s): in real-NAT
+/// tests a missed first attempt held the retry back 6-9 s, then it connected in ~0.3 s. The floor
+/// covers every successful punch seen there (at most 2.7 s, on ~0.4-0.5 s relayed round trips);
+/// 5 RTTs leave a slow link time for a couple of resends (QUIC resends its first packet at ~1 s and
+/// ~3 s, Linux a SYN about every second).
+pub(crate) fn punch_attempt_timeout(rtt: std::time::Duration) -> std::time::Duration {
+    (rtt * 5).clamp(std::time::Duration::from_secs(3), std::time::Duration::from_secs(8))
+}
+
 /// The events produced by the [`Behaviour`].
 #[derive(Debug)]
 pub struct Event {
@@ -295,14 +307,16 @@ impl NetworkBehaviour for Behaviour {
 
                 // Maybe treat these as transient and retry?
             }
-            Either::Left(handler::relayed::Event::OutboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener");
+            Either::Left(handler::relayed::Event::OutboundConnectNegotiated { remote_addrs, rtt }) => {
+                let attempt_timeout = punch_attempt_timeout(rtt);
+                tracing::debug!(target=%event_source, addresses=?remote_addrs, ?rtt, ?attempt_timeout, "Attempting to hole-punch as listener");
 
                 let opts = DialOpts::peer_id(event_source)
                     .condition(dial_opts::PeerCondition::Always)
                     .addresses(remote_addrs)
                     .override_role()
-                    .build();
+                    .build()
+                    .with_attempt_timeout(attempt_timeout);
 
                 let maybe_direct_connection_id = opts.connection_id();
 

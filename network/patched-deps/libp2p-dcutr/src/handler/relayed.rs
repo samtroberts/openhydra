@@ -49,7 +49,8 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Event {
     InboundConnectNegotiated { remote_addrs: Vec<Multiaddr> },
-    OutboundConnectNegotiated { remote_addrs: Vec<Multiaddr> },
+    /// OpenHydra patch: `rtt`, the round trip of the CONNECT exchange through the relay.
+    OutboundConnectNegotiated { remote_addrs: Vec<Multiaddr>, rtt: std::time::Duration },
     InboundConnectFailed { error: inbound::Error },
     OutboundConnectFailed { error: outbound::Error },
 }
@@ -69,7 +70,7 @@ pub struct Handler {
     inbound_stream: futures_bounded::FuturesSet<Result<Vec<Multiaddr>, inbound::Error>>,
 
     // Outbound DCUtR handshake.
-    outbound_stream: futures_bounded::FuturesSet<Result<Vec<Multiaddr>, outbound::Error>>,
+    outbound_stream: futures_bounded::FuturesSet<Result<(Vec<Multiaddr>, Duration), outbound::Error>>,
 
     /// The addresses we will send to the other party for hole-punching attempts.
     holepunch_candidates: Vec<Multiaddr>,
@@ -257,10 +258,11 @@ impl ConnectionHandler for Handler {
         }
 
         match self.outbound_stream.poll_unpin(cx) {
-            Poll::Ready(Ok(Ok(addresses))) => {
+            Poll::Ready(Ok(Ok((addresses, rtt)))) => {
                 return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
                     Event::OutboundConnectNegotiated {
                         remote_addrs: addresses,
+                        rtt,
                     },
                 ))
             }

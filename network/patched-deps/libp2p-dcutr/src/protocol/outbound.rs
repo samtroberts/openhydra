@@ -32,7 +32,7 @@ use web_time::Instant;
 pub(crate) async fn handshake(
     stream: Stream,
     candidates: Vec<Multiaddr>,
-) -> Result<Vec<Multiaddr>, Error> {
+) -> Result<(Vec<Multiaddr>, std::time::Duration), Error> {
     let mut stream = Framed::new(
         stream,
         quick_protobuf_codec::Codec::new(super::MAX_MESSAGE_SIZE_BYTES),
@@ -91,7 +91,7 @@ pub(crate) async fn handshake(
 
     Delay::new(rtt / 2).await;
 
-    Ok(obs_addrs)
+    Ok((obs_addrs, rtt))
 }
 
 #[derive(Debug, Error)]

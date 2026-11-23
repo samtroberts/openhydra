@@ -430,7 +430,13 @@ where
         port_use: PortUse,
         dial_concurrency_factor_override: Option<NonZeroU8>,
         connection_id: ConnectionId,
+        // OpenHydra patch: `DialOpts::with_attempt_timeout`.
+        attempt_timeout: Option<std::time::Duration>,
     ) {
+        let dials = match attempt_timeout {
+            Some(limit) => dials.into_iter().map(|(addr, dial)| (addr.clone(), timed_dial(addr, dial, limit))).collect(),
+            None => dials,
+        };
         let concurrency_factor =
             dial_concurrency_factor_override.unwrap_or(self.dial_concurrency_factor);
         let span = tracing::debug_span!(parent: tracing::Span::none(), "new_outgoing_connection", %concurrency_factor, num_dials=%dials.len(), id = %connection_id);
@@ -1043,4 +1049,26 @@ impl PoolConfig {
         self.max_negotiating_inbound_streams = v;
         self
     }
+}
+
+/// OpenHydra patch: `dial`, failing as timed out (`io::ErrorKind::TimedOut`) once `limit` has passed
+/// since it was first polled (when its attempt starts: `ConcurrentDial` may hold it back).
+fn timed_dial(
+    addr: Multiaddr,
+    dial: BoxFuture<'static, (Multiaddr, Result<(PeerId, StreamMuxerBox), TransportError<std::io::Error>>)>,
+    limit: std::time::Duration,
+) -> BoxFuture<'static, (Multiaddr, Result<(PeerId, StreamMuxerBox), TransportError<std::io::Error>>)> {
+    async move {
+        match futures::future::select(dial, futures_timer::Delay::new(limit)).await {
+            futures::future::Either::Left((done, _)) => done,
+            futures::future::Either::Right(_) => (
+                addr,
+                Err(TransportError::Other(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dial attempt timed out (hole punch)",
+                ))),
+            ),
+        }
+    }
+    .boxed()
 }
