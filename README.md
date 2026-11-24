@@ -36,10 +36,6 @@ openhydra serve            # local gateway on http://127.0.0.1:16527
 openhydra launch claude    # run Claude Code against that gateway (start `serve` first)
 ```
 
-> **Until 0.3.23, the CLI has no built-in bootstrap list** (the desktop app has one). On a LAN,
-> nodes find each other by mDNS. To reach peers elsewhere, give a known peer before the
-> subcommand: `openhydra --bootstrap <multiaddr> serve`.
-
 ---
 
 ## How it works
