@@ -135,6 +135,20 @@ impl Behaviour {
             return;
         };
 
+        // OpenHydra patch (25 Nov 2026): our punch dial can give up while the other side's dial,
+        // with its longer limits, is still connecting; when that one lands we already hold a direct
+        // connection. Retrying then only duplicated dials, and running out of attempts reported a
+        // failed punch beside a working direct connection. Count it as the punch's success instead.
+        if let Some(&direct) = self.direct_connections.get(&peer_id).and_then(|c| c.iter().next()) {
+            let relayed = *relayed_connection_id;
+            self.outgoing_direct_connection_attempts.remove(&(relayed, peer_id));
+            self.queued_events.extend([ToSwarm::GenerateEvent(Event {
+                remote_peer_id: peer_id,
+                result: Ok(direct),
+            })]);
+            return;
+        }
+
         if *attempt < MAX_NUMBER_OF_UPGRADE_ATTEMPTS {
             self.queued_events.push_back(ToSwarm::NotifyHandler {
                 handler: NotifyHandler::One(*relayed_connection_id),

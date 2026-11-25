@@ -1,3 +1,12 @@
+## OpenHydra patch (2026-11-25)
+
+- When our hole-punch dial fails but a direct connection to the peer already exists (the other
+  side's dial, with longer limits, got through), the punch counts as a success on that connection:
+  no retry (it only duplicated dials) and no failed punch beside a working direct connection.
+- The retrying side's hole-punch dial gives each address 5 round trips of the CONNECT exchange,
+  3-8 s (`DialOpts::with_attempt_timeout`, our patched libp2p-swarm; feature `openhydra-swarm`, on
+  by default).
+
 ## 0.12.0 + OpenHydra patch (2026-10-29)
 
 Vendored from crates.io `libp2p-dcutr` 0.12.0 (MIT, unchanged apart from this). One addition:
