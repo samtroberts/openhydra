@@ -435,15 +435,30 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          AWS_RETRY_MODE: standard
+          AWS_MAX_ATTEMPTS: "8"
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
+          # Every R2 transfer is retried (25 Nov 2026: one upload timed out and the step stopped with
+          # latest/ half replaced). The CLI retries throttling and 5xx itself (AWS_MAX_ATTEMPTS); this
+          # also covers timeouts and dropped connections. An upload is idempotent, so a retry is safe.
+          r2() {
+            local i
+            for i in 1 2 3 4 5; do
+              aws "$@" && return 0
+              echo "::warning::aws $1 $2 failed (try $i of 5), retrying" >&2
+              sleep $((i * 10))
+            done
+            echo "::error::aws $* failed 5 times" >&2
+            return 1
+          }
           mkdir -p prev
           EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           # Only a manifest that isn't there is "none yet": on any other error, publishing would drop
           # every platform that didn't build this run from it.
           if out="$(aws s3api head-object --bucket "$R2_BUCKET" --key latest.json --endpoint-url "$EP" 2>&1)"; then
-            aws s3 cp "s3://${R2_BUCKET}/latest.json" prev/latest.json --endpoint-url "$EP"
+            r2 s3 cp "s3://${R2_BUCKET}/latest.json" prev/latest.json --endpoint-url "$EP"
           elif echo "$out" | grep -qE '\(404\)|Not Found|NoSuchKey'; then
             echo "no published latest.json yet"
           else
@@ -455,14 +470,14 @@ jobs:
           # replaces a file already published (cached a year as immutable), and publishes only the
           # platforms not there yet (review round 5, R5O-3). Any listing error stops the publish.
           if out="$(aws s3api head-object --bucket "$R2_BUCKET" --key updater/latest.json --endpoint-url "$EP" 2>&1)"; then
-            aws s3 cp "s3://${R2_BUCKET}/updater/latest.json" prev/updater-latest.json --endpoint-url "$EP"
+            r2 s3 cp "s3://${R2_BUCKET}/updater/latest.json" prev/updater-latest.json --endpoint-url "$EP"
           elif ! echo "$out" | grep -qE '\(404\)|Not Found|NoSuchKey'; then
             echo "::error::couldn't read the published updater/latest.json: $out"
             exit 1
           fi
           V="${INPUT_VERSION:-$GITHUB_REF_NAME}"
           V="${V#v}"
-          aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "v${V}/" --endpoint-url "$EP" \
+          r2 s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "v${V}/" --endpoint-url "$EP" \
             --query 'Contents[].Key' --output text > prev/published.txt \
             || { echo "::error::couldn't list the published v${V}/"; exit 1; }
 
@@ -533,6 +548,9 @@ jobs:
             'linux-arm64': lambda n: 'aarch64-unknown-linux-gnu' in n,
           }
           already = [os_ for os_ in PLATFORMS if complete(os_)]
+          # Every file this run has, for the GitHub Release: a re-run after a publish cut short adds
+          # what the release still lacks, including platforms R2 already has (25 Nov 2026).
+          shutil.copytree(src, 'dist-gh', dirs_exist_ok=True)
           for os_ in already:
               print(f'::notice::{os_} is already published for {version}: left as it is')
               for name in os.listdir(src):
@@ -548,8 +566,18 @@ jobs:
           with open('legacy.txt', 'w') as f:
               f.write(' '.join(PLATFORMS[os_] for os_ in already if not marked))
           if not any(built.values()):
-              sys.exit('every platform is already published for this version, or none built: nothing to publish'
-                       if published else 'no platform built: nothing to publish')
+              if not published:
+                  sys.exit('no platform built: nothing to publish')
+              # Every platform built is already on R2 (a re-run): nothing for R2, but the GitHub
+              # Release may still lack files an earlier attempt didn't get up.
+              print('::notice::every platform is already published for this version: R2 left as it is')
+              with open(os.environ['GITHUB_ENV'], 'a') as env:
+                  env.write('NOTHING_NEW=1\nSKIP_LATEST=1\nPRERELEASE=0\n')
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write('skip_latest=1\n')
+              with open('missing.txt', 'w') as f:
+                  f.write(' '.join(missing))
+              sys.exit(0)
 
           # (regex on filename) -> stable "latest/" filename. The CLI binaries, the prompt scorers
           # beside them (install.sh puts them next to `openhydra`, where the agent looks) and each
@@ -686,37 +714,53 @@ jobs:
           PY
 
       - name: Publish to R2
+        if: env.NOTHING_NEW != '1'
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          AWS_RETRY_MODE: standard
+          AWS_MAX_ATTEMPTS: "8"
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
+          # Every R2 transfer is retried (25 Nov 2026: one upload timed out and the step stopped with
+          # latest/ half replaced). The CLI retries throttling and 5xx itself (AWS_MAX_ATTEMPTS); this
+          # also covers timeouts and dropped connections. An upload is idempotent, so a retry is safe.
+          r2() {
+            local i
+            for i in 1 2 3 4 5; do
+              aws "$@" && return 0
+              echo "::warning::aws $1 $2 failed (try $i of 5), retrying" >&2
+              sleep $((i * 10))
+            done
+            echo "::error::aws $* failed 5 times" >&2
+            return 1
+          }
           EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           # Markers (round 8 R8-2): ".publishing" first, so a re-run knows this version uses them;
           # each platform's ".complete-<triple>" once every file of this publish is up.
           : > marker
           mark_complete() {
             for t in $(cat built.txt); do
-              aws s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.complete-${t}" --endpoint-url "$EP"
+              r2 s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.complete-${t}" --endpoint-url "$EP"
             done
           }
-          aws s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.publishing" --endpoint-url "$EP"
+          r2 s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.publishing" --endpoint-url "$EP"
           # What this version held before markers is complete as it is: marked at once, so a run cut
           # short from here on still never overwrites it (round 10 X10-7).
           for t in $(cat legacy.txt); do
-            aws s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.complete-${t}" --endpoint-url "$EP"
+            r2 s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.complete-${t}" --endpoint-url "$EP"
           done
           # Immutable versioned archive — cache hard. (A platform already published for this version
           # was dropped from the tree above, so nothing published is replaced, R5O-3.)
-          aws s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \
+          r2 s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \
             --endpoint-url "$EP" --cache-control "public, max-age=31536000, immutable"
           if [ "${SKIP_LATEST:-0}" = "1" ]; then
             # Its own archive and updater files only; latest/ and the manifests stay as they are.
             if [ -d pub/updater ]; then
-              aws s3 cp "pub/updater/" "s3://${R2_BUCKET}/updater/" --recursive \
+              r2 s3 cp "pub/updater/" "s3://${R2_BUCKET}/updater/" --recursive \
                 --exclude "latest.json" --endpoint-url "$EP" \
                 --cache-control "public, max-age=31536000, immutable"
             fi
@@ -725,7 +769,7 @@ jobs:
             exit 0
           fi
           # Mutable "latest" pointers — do not cache (so a new release is instant).
-          aws s3 cp "pub/latest/" "s3://${R2_BUCKET}/latest/" --recursive \
+          r2 s3 cp "pub/latest/" "s3://${R2_BUCKET}/latest/" --recursive \
             --endpoint-url "$EP" --cache-control "no-store, max-age=0"
           # The Linux .AppImage has no extension→MIME mapping, so the recursive copy above ships
           # it with NO Content-Type — browsers then sniff ~87MB of binary and stall instead of
@@ -734,7 +778,7 @@ jobs:
           # every browser downloads it. Guarded + non-fatal so it can never block the manifests below.
           AI_LOCAL="pub/latest/OpenHydra-linux-x64.AppImage"
           if [ -f "$AI_LOCAL" ]; then
-            aws s3 cp "$AI_LOCAL" "s3://${R2_BUCKET}/latest/OpenHydra-linux-x64.AppImage" \
+            r2 s3 cp "$AI_LOCAL" "s3://${R2_BUCKET}/latest/OpenHydra-linux-x64.AppImage" \
               --endpoint-url "$EP" \
               --content-type "application/octet-stream" \
               --content-disposition "attachment; filename=\"OpenHydra-linux-x64.AppImage\"" \
@@ -743,15 +787,15 @@ jobs:
           else
             echo "::warning::pub/latest AppImage not found; skipping content-type fix"
           fi
-          aws s3 cp "pub/latest.json" "s3://${R2_BUCKET}/latest.json" \
+          r2 s3 cp "pub/latest.json" "s3://${R2_BUCKET}/latest.json" \
             --endpoint-url "$EP" --cache-control "no-store, max-age=0" \
             --content-type "application/json"
           # Updater: signed archives (immutable) + the updater manifest (no-store).
           if [ -d pub/updater ]; then
-            aws s3 cp "pub/updater/" "s3://${R2_BUCKET}/updater/" --recursive \
+            r2 s3 cp "pub/updater/" "s3://${R2_BUCKET}/updater/" --recursive \
               --exclude "latest.json" --endpoint-url "$EP" \
               --cache-control "public, max-age=31536000, immutable"
-            aws s3 cp "pub/updater/latest.json" "s3://${R2_BUCKET}/updater/latest.json" \
+            r2 s3 cp "pub/updater/latest.json" "s3://${R2_BUCKET}/updater/latest.json" \
               --endpoint-url "$EP" --cache-control "no-store, max-age=0" \
               --content-type "application/json"
           fi
@@ -771,19 +815,70 @@ jobs:
             echo "### v${VERSION} published for every platform" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # The GitHub Release, once, after R2 has the same files (it used to be published by each
-      # platform's job, so a failed platform left GitHub "latest" and R2 disagreeing).
+      # The GitHub Release, after R2 has the same files (it used to be published by each platform's
+      # job, so a failed platform left GitHub "latest" and R2 disagreeing). Idempotent, so a re-run
+      # finishes what an earlier attempt left: it creates the release if it isn't there and uploads
+      # only the files it lacks (or holds broken), each retried on GitHub's 5xx errors. v0.3.25's
+      # first publish lost three Mac files to "Error creating policy" and HTTP 500s, and a re-run
+      # couldn't add them (25 Nov 2026).
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         # A tag PUSH is a release; a manual run (even one started from a tag) is not.
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        with:
-          draft: false
-          make_latest: ${{ env.SKIP_LATEST != '1' }}
-          prerelease: ${{ env.PRERELEASE == '1' }}
-          generate_release_notes: true
-          body: ${{ env.MISSING != '' && format('Not built for this release (the previous one stays current there) — {0}.', env.MISSING) || '' }}
-          files: dist/*
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          retry() {
+            local i
+            for i in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "::warning::$1 $2 $3 failed (try $i of 5), retrying" >&2
+              sleep $((i * 15))
+            done
+            return 1
+          }
+          NOTE=""
+          if [ -n "${MISSING:-}" ]; then
+            NOTE="Not built for this release (the previous one stays current there) — ${MISSING}."
+          fi
+          create() {
+            # A create that GitHub completed but answered with an error must not fail the retry.
+            gh release view "$TAG" >/dev/null 2>&1 && return 0
+            local args=(--verify-tag --title "$TAG" --generate-notes)
+            [ -n "$NOTE" ] && args+=(--notes "$NOTE")
+            [ "${PRERELEASE:-0}" = "1" ] && args+=(--prerelease)
+            [ "${SKIP_LATEST:-0}" = "1" ] && args+=(--latest=false) || args+=(--latest)
+            gh release create "$TAG" "${args[@]}"
+          }
+          retry create
+          # Files already up, as name and size; a file missing, of another size or not fully
+          # uploaded (an asset left "starter" by a failed upload) is uploaded again.
+          have="$(retry gh release view "$TAG" --json assets \
+            --jq '.assets[] | select(.state == "uploaded") | "\(.name)\t\(.size)"')"
+          uploaded=0
+          for f in dist-gh/*; do
+            [ -f "$f" ] || continue
+            name="$(basename "$f")"
+            size="$(stat -c %s "$f")"
+            if printf '%s\n' "$have" | grep -qxF "$(printf '%s\t%s' "$name" "$size")"; then
+              continue
+            fi
+            retry gh release upload "$TAG" "$f" --clobber
+            uploaded=$((uploaded + 1))
+          done
+          echo "GitHub Release $TAG: $uploaded file(s) uploaded"
+          # Every platform there now, after a run that published without some: drop the note that
+          # said which were missing.
+          if [ -z "$NOTE" ]; then
+            body="$(retry gh release view "$TAG" --json body --jq .body)"
+            if [[ "$body" == "Not built for this release"* ]]; then
+              printf '%s\n' "$body" | sed '1d' > notes.md
+              retry gh release edit "$TAG" --notes-file notes.md
+            fi
+          fi
 
   # Auto-trim the R2 bucket to the newest 5 releases after a successful publish.
   # Tag runs only (not manual workflow_dispatch re-publishes, which may target an

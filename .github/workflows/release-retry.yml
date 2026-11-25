@@ -1,0 +1,50 @@
+# Retries a tag release whose jobs GitHub never started. When no runner of a kind is free (macOS
+# arm64 especially), the job waits about 15 minutes and is cancelled with "The job was not acquired
+# by Runner of type hosted even after multiple attempts"; the release then publishes without that
+# platform (v0.3.25's Mac build, 25 Nov 2026). This re-runs the run's failed and cancelled jobs once
+# such a job is found, after a pause for capacity to come back, at most twice per release. The
+# Release workflow's publish is idempotent: a re-run adds the missing platform to R2 and the GitHub
+# Release and leaves what is already published as it is.
+#
+# Build failures aren't retried (they would fail the same way), nor a run someone cancelled (its
+# conclusion is "cancelled", not "failure").
+name: Release retry
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  retry:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v') &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Re-run jobs no runner picked up
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          # Jobs that ended without ever getting a runner: cancelled, no runner name.
+          never_started="$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "cancelled" and ((.runner_name // "") == "")) | .name] | join(", ")')"
+          if [ -z "$never_started" ]; then
+            echo "No job was left without a runner: nothing to retry."
+            exit 0
+          fi
+          echo "::warning::No runner picked up: $never_started. Re-running the failed jobs in 15 minutes."
+          sleep 900
+          gh run rerun "$RUN_ID" --failed
+          echo "Re-run of run $RUN_ID requested (attempt $((ATTEMPT + 1)))."
