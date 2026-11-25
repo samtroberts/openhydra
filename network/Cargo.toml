@@ -84,6 +84,8 @@ tempfile = "3"
 # mDNS behaviour uses, and the socket options to share port 5353.
 hickory-proto = { version = "0.24.4", default-features = false, features = ["mdns"] }
 socket2 = { version = "0.5.10", features = ["all"] }
+# tests/quic_peer_certificate.rs makes a libp2p TLS certificate (already in the tree through libp2p-quic).
+libp2p-tls = "=0.5.0"
 
 # NOTE: `[profile.*]` and `[patch.crates-io]` moved to the workspace root manifest
 # (../Cargo.toml) — Cargo honors them only there. The libp2p-quic patch path is now

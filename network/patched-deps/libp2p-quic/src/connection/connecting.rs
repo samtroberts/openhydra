@@ -62,13 +62,28 @@ impl Connecting {
         let certificates: Box<Vec<CertificateDer>> = identity
             .downcast()
             .map_err(|_| transport_err("peer identity is not a rustls certificate chain"))?;
-        let end_entity = certificates
-            .first()
-            .ok_or_else(|| transport_err("no peer certificate"))?;
-        let p2p_cert = libp2p_tls::certificate::parse(end_entity)
-            .map_err(|_| transport_err("peer certificate no longer valid"))?;
-        Ok(p2p_cert.peer_id())
+        peer_id_from_certificates(&certificates)
     }
+}
+
+/// The peer id the end-entity certificate of `certificates` proves; an error (never a panic) when
+/// there is none or it doesn't parse now (expired since the handshake, malformed).
+fn peer_id_from_certificates(certificates: &[CertificateDer]) -> Result<PeerId, Error> {
+    let end_entity = certificates
+        .first()
+        .ok_or_else(|| transport_err("no peer certificate"))?;
+    let p2p_cert = libp2p_tls::certificate::parse(end_entity)
+        .map_err(|_| transport_err("peer certificate no longer valid"))?;
+    Ok(p2p_cert.peer_id())
+}
+
+/// OpenHydra test hook (RUSTSEC-2026-0525 backport): `peer_id_from_certificates` on raw DER
+/// certificates, so the repository's tests can check the failures are errors (the vendored crate's
+/// own tests don't run there).
+#[doc(hidden)]
+pub fn openhydra_peer_id_from_certificate_ders(ders: &[&[u8]]) -> Result<PeerId, Error> {
+    let certificates: Vec<CertificateDer<'static>> = ders.iter().map(|d| CertificateDer::from(d.to_vec())).collect();
+    peer_id_from_certificates(&certificates)
 }
 
 impl Future for Connecting {

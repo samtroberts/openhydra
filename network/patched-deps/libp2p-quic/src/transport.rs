@@ -44,8 +44,6 @@ use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
 use std::{
@@ -83,9 +81,9 @@ pub struct GenTransport<P: Provider> {
     /// answering AutoNAT dial-back requests held 32,942 of them (3.5 GB) after ten minutes of a
     /// 1,500-node simulation. One shared endpoint is still not the listening port, which is all a
     /// "new port" dial needs (an AutoNAT dial-back must not reuse the flow the peer opened).
-    /// The flag is set by a dial that found the endpoint stopped (quinn stops an endpoint for good
-    /// on a socket error); the next such dial then binds a new one (review 22 Nov).
-    new_port_dialer: HashMap<SocketFamily, (quinn::Endpoint, Arc<AtomicBool>)>,
+    /// A dial that finds it stopped (quinn stops an endpoint for good on a socket error) binds a
+    /// new one and goes out from that (review 22 Nov; the dial itself no longer fails, 25 Nov).
+    new_port_dialer: HashMap<SocketFamily, quinn::Endpoint>,
     /// Waker to poll the transport again when a new dialer or listener is added.
     waker: Option<Waker>,
     /// Holepunching attempts
@@ -287,7 +285,7 @@ impl<P: Provider> Transport for GenTransport<P> {
         match (dial_opts.role, dial_opts.port_use) {
             (Endpoint::Dialer, _) | (Endpoint::Listener, PortUse::Reuse) => {
                 // Set when this dial goes out from the shared new-port endpoint.
-                let mut stopped_flag: Option<Arc<AtomicBool>> = None;
+                let mut new_port = false;
                 let endpoint = if let Some(listener) = dial_opts
                     .port_use
                     .eq(&PortUse::Reuse)
@@ -306,16 +304,12 @@ impl<P: Provider> Transport for GenTransport<P> {
                             endpoint
                         }
                     } else {
+                        new_port = true;
                         match self.new_port_dialer.get(&socket_family) {
-                            Some((shared, stopped)) if !stopped.load(Ordering::Relaxed) => {
-                                stopped_flag = Some(Arc::clone(stopped));
-                                shared.clone()
-                            }
-                            _ => {
+                            Some(shared) => shared.clone(),
+                            None => {
                                 let endpoint = self.bound_socket(socket_addr)?;
-                                let stopped = Arc::new(AtomicBool::new(false));
-                                stopped_flag = Some(Arc::clone(&stopped));
-                                self.new_port_dialer.insert(socket_family, (endpoint.clone(), stopped));
+                                self.new_port_dialer.insert(socket_family, endpoint.clone());
                                 endpoint
                             }
                         }
@@ -327,18 +321,31 @@ impl<P: Provider> Transport for GenTransport<P> {
                 if version == ProtocolVersion::Draft29 {
                     client_config.version(0xff00_001d);
                 }
+                // OpenHydra patch: a new-port dial (one address: an AutoNAT or bootstrap dial-back)
+                // connects at once, so a stopped shared endpoint is found here and replaced, and the
+                // dial goes out from the new one instead of failing.
+                if new_port {
+                    let socket_family: SocketFamily = socket_addr.ip().into();
+                    let connecting = match endpoint.connect_with(client_config.clone(), socket_addr, "l") {
+                        Err(quinn::ConnectError::EndpointStopping) => {
+                            let fresh = self.bound_socket(socket_addr)?;
+                            self.new_port_dialer.insert(socket_family, fresh.clone());
+                            fresh
+                                .connect_with(client_config, socket_addr, "l")
+                                .map_err(|e| TransportError::Other(Error::Reach(ConnectError(e))))?
+                        }
+                        Err(e) => return Err(TransportError::Other(Error::Reach(ConnectError(e)))),
+                        Ok(c) => c,
+                    };
+                    return Ok(Box::pin(async move { Connecting::new(connecting, handshake_timeout).await }));
+                }
                 Ok(Box::pin(async move {
                     // This `"l"` seems necessary because an empty string is an invalid domain
                     // name. While we don't use domain names, the underlying rustls library
                     // is based upon the assumption that we do.
                     let connecting = endpoint
                         .connect_with(client_config, socket_addr, "l")
-                        .map_err(|e| {
-                            if let (quinn::ConnectError::EndpointStopping, Some(flag)) = (&e, &stopped_flag) {
-                                flag.store(true, Ordering::Relaxed);
-                            }
-                            ConnectError(e)
-                        })?;
+                        .map_err(ConnectError)?;
                     Connecting::new(connecting, handshake_timeout).await
                 }))
             }

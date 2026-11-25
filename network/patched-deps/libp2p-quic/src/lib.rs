@@ -67,6 +67,8 @@ use std::net::SocketAddr;
 
 pub use config::Config;
 pub use connection::{Connecting, Connection, Stream};
+#[doc(hidden)]
+pub use connection::openhydra_peer_id_from_certificate_ders;
 
 #[cfg(feature = "async-std")]
 pub use provider::async_std;

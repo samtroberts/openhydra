@@ -3143,6 +3143,7 @@ dependencies = [
  "hickory-proto",
  "libp2p",
  "libp2p-stream",
+ "libp2p-tls",
  "openhydra-protocol",
  "prost 0.13.5",
  "prost-build",

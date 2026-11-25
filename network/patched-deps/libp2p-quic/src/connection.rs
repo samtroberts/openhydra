@@ -22,6 +22,8 @@ mod connecting;
 mod stream;
 
 pub use connecting::Connecting;
+#[doc(hidden)]
+pub use connecting::openhydra_peer_id_from_certificate_ders;
 pub use stream::Stream;
 
 use crate::{ConnectionError, Error};
