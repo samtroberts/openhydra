@@ -358,6 +358,8 @@ where
     connected: HashMap<PeerId, SmallVec<[Connection; 2]>>,
     /// Externally managed addresses via `add_address` and `remove_address`.
     addresses: PeerAddresses,
+    /// OpenHydra patch: requests whose stream is open but not yet read (peer, connection, id).
+    oh_reading: HashSet<(PeerId, ConnectionId, InboundRequestId)>,
     /// Requests that have not yet been sent and are waiting for a connection
     /// to be established.
     pending_outbound_requests: HashMap<PeerId, SmallVec<[OutboundMessage<TCodec>; 10]>>,
@@ -407,6 +409,7 @@ where
             connected: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
             addresses: PeerAddresses::default(),
+            oh_reading: Default::default(),
         }
     }
 
@@ -493,6 +496,13 @@ where
     /// Checks whether an outbound request to the peer with the provided
     /// [`PeerId`] initiated by [`Behaviour::send_request`] is still
     /// pending, i.e. waiting for a response.
+    /// OpenHydra patch (25 Nov 2026): whether a request from `peer` is still arriving (its stream is
+    /// open, the request not yet read), which nothing else shows until it is complete. OpenHydra's
+    /// idle sweep must not close a connection while a request comes in on it (review 23 Nov).
+    pub fn oh_receiving_from(&self, peer: &PeerId) -> bool {
+        self.oh_reading.iter().any(|(p, _, _)| p == peer)
+    }
+
     pub fn is_pending_outbound(&self, peer: &PeerId, request_id: &OutboundRequestId) -> bool {
         // Check if request is already sent on established connection.
         let est_conn = self
@@ -650,6 +660,8 @@ where
             ..
         }: ConnectionClosed,
     ) {
+        // OpenHydra patch: requests arriving on this connection won't arrive now.
+        self.oh_reading.retain(|(_, c, _)| *c != connection_id);
         let connections = self
             .connected
             .get_mut(&peer_id)
@@ -829,7 +841,21 @@ where
         connection: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
+        // OpenHydra patch: requests still arriving (`oh_receiving_from`).
+        match &event {
+            handler::Event::OhInboundReading(request_id) => {
+                self.oh_reading.insert((peer, connection, *request_id));
+                return;
+            }
+            handler::Event::Request { request_id, .. }
+            | handler::Event::InboundTimeout(request_id)
+            | handler::Event::InboundStreamFailed { request_id, .. } => {
+                self.oh_reading.remove(&(peer, connection, *request_id));
+            }
+            _ => {}
+        }
         match event {
+            handler::Event::OhInboundReading(_) => {}
             handler::Event::Response {
                 request_id,
                 response,
@@ -1091,6 +1117,40 @@ mod pick_connection_tests {
         b.on_connection_handler_event(peer, d, handler::Event::OutboundTimeout(proven[0].0));
         let after: Vec<ConnectionId> = (0..4).map(|_| send(&mut b).1).collect();
         assert!(after.contains(&r), "after a failure on it, the relay shares again: {after:?}");
+    }
+
+    /// OpenHydra patch (25 Nov): a request whose stream is open but not yet read shows as arriving
+    /// from its peer until it is read, fails or times out.
+    #[test]
+    fn a_request_still_arriving_shows_until_it_is_read_or_fails() {
+        use futures::{AsyncRead, AsyncWrite};
+        #[derive(Clone, Default)]
+        struct Nop;
+        #[async_trait::async_trait]
+        impl crate::Codec for Nop {
+            type Protocol = &'static str;
+            type Request = ();
+            type Response = ();
+            async fn read_request<T: AsyncRead + Unpin + Send>(&mut self, _: &&'static str, _: &mut T) -> std::io::Result<()> { Ok(()) }
+            async fn read_response<T: AsyncRead + Unpin + Send>(&mut self, _: &&'static str, _: &mut T) -> std::io::Result<()> { Ok(()) }
+            async fn write_request<T: AsyncWrite + Unpin + Send>(&mut self, _: &&'static str, _: &mut T, _: ()) -> std::io::Result<()> { Ok(()) }
+            async fn write_response<T: AsyncWrite + Unpin + Send>(&mut self, _: &&'static str, _: &mut T, _: ()) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut b: Behaviour<Nop> = Behaviour::with_codec(Nop, [("/t/1", ProtocolSupport::Full)], Config::default());
+        let peer: PeerId = "12D3KooWDs9HYT9nUGR3RNH1asiyc9uc98i2gXTvRktk316B2v79".parse().unwrap();
+        let other: PeerId = "12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb".parse().unwrap();
+        let direct: Multiaddr = "/ip4/192.168.0.5/tcp/4301".parse().unwrap();
+        let c = ConnectionId::new_unchecked(1);
+        let _ = b.handle_established_inbound_connection(c, peer, &direct, &direct);
+        assert!(!b.oh_receiving_from(&peer));
+        b.on_connection_handler_event(peer, c, handler::Event::OhInboundReading(InboundRequestId(7)));
+        assert!(b.oh_receiving_from(&peer) && !b.oh_receiving_from(&other));
+        b.on_connection_handler_event(peer, c, handler::Event::InboundTimeout(InboundRequestId(7)));
+        assert!(!b.oh_receiving_from(&peer), "timed out");
+        b.on_connection_handler_event(peer, c, handler::Event::OhInboundReading(InboundRequestId(8)));
+        let err = std::io::Error::other("reset");
+        b.on_connection_handler_event(peer, c, handler::Event::InboundStreamFailed { request_id: InboundRequestId(8), error: err });
+        assert!(!b.oh_receiving_from(&peer), "failed");
     }
 
     /// Review 11 Nov: a connection a peer opened to us through a relay must count as relayed (its

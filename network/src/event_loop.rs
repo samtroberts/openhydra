@@ -921,6 +921,11 @@ struct LoopState {
     /// Simulator only (`--kad-slow`): each model's last Kademlia announce (record fingerprint, when).
     kad_announced: HashMap<String, (u64, std::time::Instant)>,
     idle_closes: u64,
+    /// Peers with a reservation on our relay server (opt-in peer relay): never closed as idle, a
+    /// close would end their reservation (review 23 Nov).
+    relay_reserved: std::collections::HashSet<PeerId>,
+    /// Circuits open through our relay server, per peer at either end: never closed as idle.
+    relay_circuits: HashMap<PeerId, usize>,
     /// The relays this node reserves on and dials others through (`relay::relay_addrs`): its
     /// bootstraps, plus the production relays on the public network.
     relays: Vec<Multiaddr>,
@@ -1429,6 +1434,8 @@ impl LoopState {
             app_peers: Default::default(),
             kad_idle_peers: Default::default(),
             idle_closed: Default::default(),
+            relay_reserved: Default::default(),
+            relay_circuits: Default::default(),
             last_idle_sweep: std::time::Instant::now(),
             kad_announced: HashMap::new(),
             idle_closes: 0,
@@ -3583,8 +3590,10 @@ fn expire_direct_external_addrs(
     state
         .external_addrs
         .retain(|a| a.to_string().contains("/p2p-circuit"));
-    // No verified-reachable direct addr remains → back to client; AutoNAT will
-    // re-probe fresh candidates on the new network and re-promote if reachable.
+    // No verified-reachable direct addr remains → back to client. Removing them (above) makes the
+    // patched AutoNAT client test them again, quickly for two minutes (it used to keep a tested
+    // address tested for good, so a node whose address came back unchanged stayed a client), and it
+    // re-promotes once one is confirmed.
     swarm
         .behaviour_mut()
         .kademlia
@@ -4191,6 +4200,7 @@ fn handle_swarm_event(
         // leech trigger: a circuit that blew its byte budget locks the source
         // peer out so the LeechRateLimiter denies its next reservations.
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::RelayServer(relay_srv_event)) => {
+            note_relay_server_use(state, &relay_srv_event);
             if let libp2p::relay::Event::CircuitClosed { src_peer_id, error, .. } = &relay_srv_event {
                 if error
                     .as_ref()
@@ -5309,14 +5319,13 @@ fn handle_kad_event(
                                                 &trusted,
                                             ) {
                                                 Some(ma) => {
-                                                    let update = swarm
-                                                        .behaviour_mut()
-                                                        .kademlia
-                                                        .add_address(&pid, ma.clone());
-                                                    debug!(
-                                                        %pid, %ma, ?update,
-                                                        "discover_auto_added_address"
-                                                    );
+                                                    // The address book, not Kademlia: Kademlia's
+                                                    // filter refuses relay circuits (review 22 Nov:
+                                                    // this address was silently dropped), and the
+                                                    // address book is what our own dials to the peer
+                                                    // use, as `accept_and_install_record` does.
+                                                    swarm.behaviour_mut().address_book.insert(pid, ma.clone());
+                                                    debug!(%pid, %ma, "discover_auto_added_address");
                                                 }
                                                 None => {
                                                     warn!(
@@ -5470,7 +5479,9 @@ fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &m
                 || relays.contains_peer(peer)
                 || pinned.contains(peer)
                 || state.lan_dialer.knows(peer)
-                || mesh.contains(peer),
+                || mesh.contains(peer)
+                || state.relay_reserved.contains(peer)
+                || state.relay_circuits.get(peer).is_some_and(|n| *n > 0),
             app_used: state.app_peers.wanted(peer),
             in_flight: false,
         };
@@ -5478,7 +5489,10 @@ fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &m
         // requests, a response being written, a queued forward; review 22 Nov: counting only our
         // own requests let a connection serving a long job be closed under it).
         if crate::kad_idle::should_close(&facts) {
-            let busy = peer_busy(state, *peer, |id| swarm.behaviour().grpc_proxy.is_pending_outbound(peer, id));
+            // ... and nothing arriving: a request whose stream is open but not yet read shows nowhere
+            // else (review 23 Nov).
+            let busy = peer_busy(state, *peer, |id| swarm.behaviour().grpc_proxy.is_pending_outbound(peer, id))
+                || swarm.behaviour().grpc_proxy.oh_receiving_from(peer);
             if !busy {
                 close.push((*cid, *peer));
             }
@@ -5490,6 +5504,40 @@ fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &m
             state.idle_closes += 1;
             debug!(target: "oh_kad_idle", me = %swarm.local_peer_id(), %peer, connection_id = ?cid, "closed an idle Kademlia connection");
         }
+    }
+}
+
+/// Who uses our relay server (opt-in peer relay), for the idle sweep: a peer with a reservation, and
+/// both ends of every open circuit.
+fn note_relay_server_use(state: &mut LoopState, event: &libp2p::relay::Event) {
+    use libp2p::relay::Event as E;
+    let mut circuit = |p: &PeerId, open: bool| {
+        let n = state.relay_circuits.entry(*p).or_default();
+        if open {
+            *n += 1;
+        } else {
+            *n = n.saturating_sub(1);
+        }
+        if *n == 0 {
+            state.relay_circuits.remove(p);
+        }
+    };
+    match event {
+        E::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
+            circuit(src_peer_id, true);
+            circuit(dst_peer_id, true);
+        }
+        E::CircuitClosed { src_peer_id, dst_peer_id, .. } => {
+            circuit(src_peer_id, false);
+            circuit(dst_peer_id, false);
+        }
+        E::ReservationReqAccepted { src_peer_id, .. } => {
+            state.relay_reserved.insert(*src_peer_id);
+        }
+        E::ReservationTimedOut { src_peer_id } => {
+            state.relay_reserved.remove(src_peer_id);
+        }
+        _ => {}
     }
 }
 

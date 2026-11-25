@@ -168,6 +168,9 @@ where
             .is_err()
         {
             tracing::warn!("Dropping inbound stream because we are at capacity")
+        } else {
+            // OpenHydra patch: tell the behaviour a request is arriving (`Behaviour::oh_receiving_from`).
+            self.pending_events.push_back(Event::OhInboundReading(request_id));
         }
     }
 
@@ -297,6 +300,9 @@ where
         request_id: InboundRequestId,
         error: io::Error,
     },
+    /// OpenHydra patch: an inbound request stream opened and its request is being read (it is
+    /// reported as `Request` once read, or fails or times out).
+    OhInboundReading(InboundRequestId),
 }
 
 impl<TCodec: Codec> fmt::Debug for Event<TCodec> {
@@ -346,6 +352,10 @@ impl<TCodec: Codec> fmt::Debug for Event<TCodec> {
                 .debug_struct("Event::InboundStreamFailed")
                 .field("request_id", &request_id)
                 .field("error", &error)
+                .finish(),
+            Event::OhInboundReading(request_id) => f
+                .debug_tuple("Event::OhInboundReading")
+                .field(request_id)
                 .finish(),
         }
     }

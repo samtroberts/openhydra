@@ -99,11 +99,11 @@ impl AppPeers {
         let at = &mut used.at;
         if at.len() >= MAX_REMEMBERED && !at.contains_key(&peer) {
             at.retain(|_, t| now.saturating_duration_since(*t) < APP_KEEP);
-            // Still full of peers used lately (a busy gateway): forget the least recent rather
-            // than not recording this one, which would leave its connections closable.
-            while at.len() >= MAX_REMEMBERED {
-                let Some(oldest) = at.iter().min_by_key(|(_, t)| **t).map(|(p, _)| *p) else { break };
-                at.remove(&oldest);
+            // Still full of peers used lately (a busy gateway): forget the least recent tenth in one
+            // pass (review 22 Nov: one full scan per new peer) rather than not recording this one,
+            // which would leave its connections closable.
+            if at.len() >= MAX_REMEMBERED {
+                forget_oldest_tenth(at);
             }
         }
         at.insert(peer, now);
@@ -118,6 +118,23 @@ impl AppPeers {
         let used = self.0.lock().unwrap_or_else(|e| e.into_inner());
         used.open.contains_key(peer) || used.at.get(peer).is_some_and(|t| now.saturating_duration_since(*t) < APP_KEEP)
     }
+}
+
+/// Remove the least recently used tenth of `at` (at least one entry), in one pass.
+fn forget_oldest_tenth(at: &mut HashMap<PeerId, Instant>) {
+    let n = (at.len() / 10).max(1);
+    let mut times: Vec<Instant> = at.values().copied().collect();
+    let (_, cutoff, _) = times.select_nth_unstable(n - 1);
+    let cutoff = *cutoff;
+    let mut removed = 0;
+    at.retain(|_, t| {
+        if removed < n && *t <= cutoff {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// What the event loop knows about one direct connection when it sweeps.
@@ -222,6 +239,21 @@ mod tests {
         drop(_second);
         assert!(peers.wanted_at(&p, Instant::now() + APP_KEEP - Duration::from_secs(1)), "kept after the end");
         assert!(!peers.wanted_at(&p, Instant::now() + APP_KEEP + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_full_memory_forgets_its_least_recent_tenth_at_once() {
+        let peers = AppPeers::default();
+        let t0 = Instant::now();
+        let old: Vec<PeerId> = (0..MAX_REMEMBERED).map(|_| PeerId::random()).collect();
+        for (i, p) in old.iter().enumerate() {
+            peers.note_at(*p, t0 + Duration::from_millis(i as u64));
+        }
+        let fresh = PeerId::random();
+        peers.note_at(fresh, t0 + Duration::from_secs(60));
+        let used = peers.0.lock().unwrap();
+        assert_eq!(used.at.len(), MAX_REMEMBERED - MAX_REMEMBERED / 10 + 1, "a tenth forgotten, the new one kept");
+        assert!(!used.at.contains_key(&old[0]) && used.at.contains_key(&old[MAX_REMEMBERED - 1]) && used.at.contains_key(&fresh));
     }
 
     #[test]

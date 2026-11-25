@@ -1,3 +1,9 @@
+## OpenHydra patch (2026-11-25)
+
+- `Behaviour::oh_receiving_from(peer)`: whether a request from the peer is still arriving (its stream
+  open, the request not yet read), which nothing else shows until it is complete; OpenHydra's idle
+  sweep must not close a connection while one comes in.
+
 ## 0.27.0 (OpenHydra patch)
 
 - A request goes on one of the peer's *direct* connections once that connection has carried a reply
