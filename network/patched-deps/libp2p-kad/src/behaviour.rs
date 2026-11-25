@@ -1222,8 +1222,19 @@ where
                     query=?query_id,
                     "Peer reported by source in query"
                 );
-                let addrs = peer.multiaddrs.iter().cloned().collect();
-                query.peers.addresses.insert(peer.node_id, addrs);
+                // OpenHydra patch (25 Nov 2026): merge with what earlier answers gave, not replace it
+                // (upstream overwrote, so a later answer listing only a relay circuit, which the
+                // address filter then drops, left a peer with no address to dial). At most
+                // OH_MAX_QUERY_ADDRS per peer, the first ones kept.
+                let known = query.peers.addresses.entry(peer.node_id).or_default();
+                for a in &peer.multiaddrs {
+                    if known.len() >= OH_MAX_QUERY_ADDRS {
+                        break;
+                    }
+                    if !known.contains(a) {
+                        known.push(a.clone());
+                    }
+                }
             }
             query.on_success(source, others_iter.cloned().map(|kp| kp.node_id))
         }
@@ -3608,6 +3619,9 @@ where
         .join(", ")
 }
 
+/// OpenHydra patch: the most addresses a query keeps for one peer from the answers it gets.
+const OH_MAX_QUERY_ADDRS: usize = 16;
+
 /// OpenHydra patch: note Kademlia traffic with `peer` in `activity` (bounded: past 8,192 peers,
 /// those quiet for ten minutes are forgotten, and past that the quietest go).
 fn oh_note_activity(activity: &mut HashMap<PeerId, std::time::Instant>, peer: PeerId) {
@@ -3615,9 +3629,21 @@ fn oh_note_activity(activity: &mut HashMap<PeerId, std::time::Instant>, peer: Pe
     let now = std::time::Instant::now();
     if activity.len() >= MAX && !activity.contains_key(&peer) {
         activity.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(600));
-        while activity.len() >= MAX {
-            let Some(oldest) = activity.iter().min_by_key(|(_, at)| **at).map(|(p, _)| *p) else { break };
-            activity.remove(&oldest);
+        if activity.len() >= MAX {
+            // The least recent tenth in one pass (review 22 Nov: a full scan per new peer).
+            let n = activity.len() / 10;
+            let mut times: Vec<std::time::Instant> = activity.values().copied().collect();
+            let (_, cutoff, _) = times.select_nth_unstable(n - 1);
+            let cutoff = *cutoff;
+            let mut removed = 0;
+            activity.retain(|_, at| {
+                if removed < n && *at <= cutoff {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
     activity.insert(peer, now);
