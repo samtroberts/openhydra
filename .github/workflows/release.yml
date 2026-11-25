@@ -65,7 +65,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-14 # Apple Silicon
+          # Apple Silicon. macos-14 runners are no longer offered ("The configuration
+          # 'macos-14-arm64-us-default' is not supported", v0.3.25's first run, 25 Nov 2026).
+          - platform: macos-15
             triple: aarch64-apple-darwin
           # Intel macOS (macos-13) intentionally omitted: GitHub is retiring Intel
           # runners (jobs queue indefinitely) and we do not ship an x86_64 macOS build.
