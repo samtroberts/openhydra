@@ -20,6 +20,7 @@ exclude = [
     "network/patched-deps/libp2p-request-response",
     "network/patched-deps/libp2p-swarm",
     "network/patched-deps/libp2p-stream",
+    "network/patched-deps/libp2p-autonat",
     "engine-mlx/rust",
 ]
 
@@ -51,6 +52,9 @@ libp2p-gossipsub = { path = "network/patched-deps/libp2p-gossipsub" }
 # Requests go on a direct connection when the peer has one, never alternating with a relay
 # circuit (see its CHANGELOG.md).
 libp2p-request-response = { path = "network/patched-deps/libp2p-request-response" }
+# AutoNAT re-tests an address once it expires, and probes quickly for the first two minutes (see its
+# CHANGELOG.md).
+libp2p-autonat = { path = "network/patched-deps/libp2p-autonat" }
 # OpenHydra's own request protocols negotiate lazily: one round trip less per request (see its
 # CHANGELOG.md).
 libp2p-swarm = { path = "network/patched-deps/libp2p-swarm" }
