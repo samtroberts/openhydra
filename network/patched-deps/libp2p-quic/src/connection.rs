@@ -31,9 +31,39 @@ use crate::{ConnectionError, Error};
 use futures::{future::BoxFuture, FutureExt};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use std::{
+    net::SocketAddr,
     pin::Pin,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
+
+/// OpenHydra patch (25 Nov 2026): the QUIC application error code a [`Connection`] is closed with
+/// when its owner closes it (`StreamMuxer::poll_close`); 0, upstream's, until set. A handle, so the
+/// code can be set after the connection has gone into a boxed muxer. A connection dropped without
+/// being closed (the process quitting) still goes out with 0, quinn's implicit close.
+#[derive(Clone, Debug, Default)]
+pub struct CloseCode(Arc<AtomicU32>);
+
+impl CloseCode {
+    /// The code to close with from now on.
+    pub fn set(&self, code: u32) {
+        self.0.store(code, Ordering::Relaxed);
+    }
+
+    /// The code the connection will close with.
+    pub fn get(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Whether the connection is still there: a handle held only by whoever asked for it (the
+    /// connection was dropped) is not.
+    pub fn in_use(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+}
 
 /// State for a single opened QUIC connection.
 pub struct Connection {
@@ -49,6 +79,8 @@ pub struct Connection {
     >,
     /// Future to wait for the connection to be closed.
     closing: Option<BoxFuture<'static, quinn::ConnectionError>>,
+    /// OpenHydra: the application error code `poll_close` closes with.
+    close_code: CloseCode,
 }
 
 impl Connection {
@@ -62,7 +94,18 @@ impl Connection {
             incoming: None,
             outgoing: None,
             closing: None,
+            close_code: CloseCode::default(),
         }
+    }
+
+    /// OpenHydra patch: a handle to the code this connection is closed with ([`CloseCode`]).
+    pub fn close_code(&self) -> CloseCode {
+        self.close_code.clone()
+    }
+
+    /// OpenHydra patch: the peer's address (it can change if the peer migrates).
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
     }
 }
 
@@ -117,7 +160,7 @@ impl StreamMuxer for Connection {
         let this = self.get_mut();
 
         let closing = this.closing.get_or_insert_with(|| {
-            this.connection.close(From::from(0u32), &[]);
+            this.connection.close(From::from(this.close_code.get()), &[]);
             let connection = this.connection.clone();
             async move { connection.closed().await }.boxed()
         });

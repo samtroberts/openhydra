@@ -66,7 +66,7 @@ mod transport;
 use std::net::SocketAddr;
 
 pub use config::Config;
-pub use connection::{Connecting, Connection, Stream};
+pub use connection::{CloseCode, Connecting, Connection, Stream};
 #[doc(hidden)]
 pub use connection::openhydra_peer_id_from_certificate_ders;
 
@@ -125,6 +125,16 @@ impl ConnectionError {
             quinn::ConnectionError::ApplicationClosed(_) => true,
             quinn::ConnectionError::ConnectionClosed(c) => c.error_code == quinn::TransportErrorCode::APPLICATION_ERROR,
             _ => false,
+        }
+    }
+
+    /// OpenHydra patch (25 Nov 2026): the application error code the peer closed the connection
+    /// with, if it closed it with an application close. (One sent before the handshake is confirmed
+    /// becomes a transport APPLICATION_ERROR without its code, RFC 9000 §10.2.3: `None`.)
+    pub fn application_code(&self) -> Option<u64> {
+        match &self.0 {
+            quinn::ConnectionError::ApplicationClosed(c) => Some(c.error_code.into_inner()),
+            _ => None,
         }
     }
 }

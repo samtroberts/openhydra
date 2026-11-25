@@ -435,8 +435,12 @@ pub fn dial_means_unreachable(error: &libp2p::swarm::DialError) -> bool {
 ///
 /// QUIC provides 0-RTT connections and is better for NAT hole punching (UDP).
 /// No Noise/Yamux wrapping needed — QUIC handles encryption and muxing natively.
+/// With `close_codes`, each connection is registered there, so the idle sweep can close it with the
+/// idle close code (`kad_idle::QuicCloseCodes`); only a node that sweeps (and so prunes it) passes
+/// one.
 pub fn build_quic_transport(
     keypair: &identity::Keypair,
+    close_codes: Option<crate::kad_idle::QuicCloseCodes>,
 ) -> std::io::Result<libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>>
 {
     let quic_config = libp2p::quic::Config::new(keypair)
@@ -445,7 +449,12 @@ pub fn build_quic_transport(
             quinn::congestion::BbrConfig::default(),
         ));
     let quic_transport = libp2p::quic::tokio::Transport::new(quic_config)
-    .map(|(peer_id, muxer), _| (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)))
+    .map(move |(peer_id, muxer), _| {
+        if let Some(codes) = &close_codes {
+            codes.register(peer_id, &muxer);
+        }
+        (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer))
+    })
     .boxed();
 
     Ok(quic_transport)
@@ -627,7 +636,7 @@ mod dial_failure_tests {
     fn transport() -> BoxedTransport {
         let key = identity::Keypair::generate_ed25519();
         let tcp = build_tcp_transport(&key).unwrap();
-        let quic = build_quic_transport(&key).unwrap();
+        let quic = build_quic_transport(&key, None).unwrap();
         with_setup_timeouts(either_transport(quic, tcp), OUTBOUND_SETUP_TIMEOUT, INBOUND_SETUP_TIMEOUT)
     }
 

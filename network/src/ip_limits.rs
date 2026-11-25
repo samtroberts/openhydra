@@ -396,7 +396,7 @@ mod tests {
     async fn a_burst_of_quic_dials_all_connect_through_the_address_check() {
         let quic_node = || {
             let key = libp2p::identity::Keypair::generate_ed25519();
-            let transport = crate::transport::build_quic_transport(&key).unwrap();
+            let transport = crate::transport::build_quic_transport(&key, None).unwrap();
             let cfg = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_secs(60));
             Swarm::new(transport, Limited { ip: Behaviour::new(IpLimitsConfig::PEER), keep: libp2p::swarm::dummy::Behaviour }, PeerId::from(key.public()), cfg)
         };

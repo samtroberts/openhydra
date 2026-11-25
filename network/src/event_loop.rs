@@ -914,6 +914,11 @@ struct LoopState {
     app_peers: crate::kad_idle::AppPeers,
     /// ... the peers whose identify says they know such closes ([`crate::kad_idle::AGENT_TOKEN`]),
     kad_idle_peers: std::collections::HashSet<PeerId>,
+    /// ... those of them that close an idle QUIC connection with its own code
+    /// ([`crate::kad_idle::CODE_TOKEN`]),
+    kad_idle_code_peers: std::collections::HashSet<PeerId>,
+    /// ... the code each of our QUIC connections will be closed with,
+    quic_close: crate::kad_idle::QuicCloseCodes,
     /// ... the connections this node closed as idle (until their close arrives),
     idle_closed: std::collections::HashSet<libp2p::swarm::ConnectionId>,
     /// ... when it last looked for some, and how many it has closed.
@@ -1433,6 +1438,8 @@ impl LoopState {
             bootstrap_peers: Vec::new(),
             app_peers: Default::default(),
             kad_idle_peers: Default::default(),
+            kad_idle_code_peers: Default::default(),
+            quic_close: Default::default(),
             idle_closed: Default::default(),
             relay_reserved: Default::default(),
             relay_circuits: Default::default(),
@@ -1485,10 +1492,13 @@ pub async fn run_event_loop(
     pinned: crate::pinned::PinnedPeers,
     // The peers this node really uses (requests, push streams), shared with the push streams.
     app_peers: crate::kad_idle::AppPeers,
+    // The code each QUIC connection will be closed with, shared with the transport.
+    quic_close: crate::kad_idle::QuicCloseCodes,
 ) {
     let mut state = LoopState::new();
     state.pinned = pinned;
     state.app_peers = app_peers;
+    state.quic_close = quic_close;
     state.local_libp2p = swarm.local_peer_id().to_base58();
     state.enable_connection_reversal = enable_connection_reversal;
     state.peer_relay_leech = peer_relay_leech; // WS-F F-4
@@ -4025,6 +4035,11 @@ fn handle_swarm_event(
                 } else {
                     state.kad_idle_peers.remove(&peer_id);
                 }
+                if crate::kad_idle::peer_sends_idle_code(&info.agent_version) {
+                    state.kad_idle_code_peers.insert(peer_id);
+                } else {
+                    state.kad_idle_code_peers.remove(&peer_id);
+                }
                 // Its relay circuits are kept for our own dials only (the address book), for every
                 // peer: a DHT server is directly reachable, and its circuits in the routing table made
                 // lookups dial it by relay and hand the circuits on in DHT answers (21 Nov: 23.6% of
@@ -4802,11 +4817,13 @@ fn handle_swarm_event(
             // A connection closed as idle (`kad_idle`), by us or by a peer that does that, says
             // nothing about the peer: below, its routing entry and records stay.
             // A close by the peer counts only when the peer closed on purpose (`closed_by_peer`):
-            // a crash, a reset or a timeout is a loss whatever the peer runs (review 22 Nov).
+            // a crash, a reset or a timeout is a loss whatever the peer runs (review 22 Nov). Over
+            // QUIC, from a peer that closes idle connections with its own code, only that code
+            // counts, so its quit is a loss too (25 Nov; `closed_as_idle_by_peer`).
             let closed_as_idle = state.idle_closed.remove(&connection_id)
                 || (state.kad_idle_peers.contains(&peer_id)
                     && !state.app_peers.wanted(&peer_id)
-                    && closed_by_peer(cause.as_ref()));
+                    && closed_as_idle_by_peer(cause.as_ref(), state.kad_idle_code_peers.contains(&peer_id)));
             state.relay_ping_failures.remove(&connection_id);
             state.relay_conns.remove(&connection_id);
             state.relay_v6_quic_conns.remove(&connection_id);
@@ -4908,6 +4925,7 @@ fn handle_swarm_event(
                     }
                 }
                 state.kad_idle_peers.remove(&peer_id);
+                state.kad_idle_code_peers.remove(&peer_id);
 
                 // E-N3: prune the remaining per-peer maps that keyed off this
                 // peer. These grew unbounded because the disconnect cleanup
@@ -5466,8 +5484,9 @@ fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &m
     let relays = trusted_relay_pids(state);
     let pinned: std::collections::HashSet<PeerId> =
         state.pinned.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+    state.quic_close.prune();
     let mut close = Vec::new();
-    for (cid, (peer, _, opened)) in &state.conn_remote_addrs {
+    for (cid, (peer, remote, opened)) in &state.conn_remote_addrs {
         let kad = &swarm.behaviour().kademlia;
         let age = now.saturating_duration_since(*opened);
         let facts = crate::kad_idle::ConnFacts {
@@ -5494,11 +5513,13 @@ fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &m
             let busy = peer_busy(state, *peer, |id| swarm.behaviour().grpc_proxy.is_pending_outbound(peer, id))
                 || swarm.behaviour().grpc_proxy.oh_receiving_from(peer);
             if !busy {
-                close.push((*cid, *peer));
+                close.push((*cid, *peer, remote.clone()));
             }
         }
     }
-    for (cid, peer) in close {
+    for (cid, peer, remote) in close {
+        // A QUIC one goes out with the idle close code, so the peer can tell it from a quit.
+        state.quic_close.close_as_idle(&peer, &remote);
         if swarm.close_connection(cid) {
             state.idle_closed.insert(cid);
             state.idle_closes += 1;
@@ -6306,9 +6327,33 @@ fn kad_addrs_from_identify(serves_dht: bool, public_network: bool, direct: &[Mul
 /// a close the peer meant from its process dying (the kernel closes the socket either way): such a
 /// crash counts as a close here, and the peer goes with the bootstraps' gone notice, its records'
 /// age or Kademlia's failed dials. A timeout (the host vanished or moved) or our own close is not.
+/// Whether a close by the peer counts as an idle close (`kad_idle`): one it meant
+/// ([`closed_by_peer`]), and over QUIC, from a peer that closes idle connections with its own code
+/// (`code_known`, [`crate::kad_idle::CODE_TOKEN`]), one with that code. TCP (yamux) has no code.
+fn closed_as_idle_by_peer(cause: Option<&libp2p::swarm::ConnectionError>, code_known: bool) -> bool {
+    if code_known {
+        if let Some(libp2p::swarm::ConnectionError::IO(e)) = cause {
+            if let Some(libp2p::quic::Error::Connection(c)) = muxer_error(e).and_then(|i| i.downcast_ref::<libp2p::quic::Error>()) {
+                return c.application_code() == Some(u64::from(crate::kad_idle::IDLE_CLOSE_CODE));
+            }
+        }
+    }
+    closed_by_peer(cause)
+}
+
+/// The muxer's own error under a connection's IO error, through any `io::Error` layers a transport
+/// wrapper added.
+fn muxer_error(e: &std::io::Error) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+    let mut inner = e.get_ref()?;
+    while let Some(io) = inner.downcast_ref::<std::io::Error>() {
+        inner = io.get_ref()?;
+    }
+    Some(inner)
+}
+
 fn closed_by_peer(cause: Option<&libp2p::swarm::ConnectionError>) -> bool {
     let Some(libp2p::swarm::ConnectionError::IO(e)) = cause else { return false };
-    let Some(inner) = e.get_ref() else { return false };
+    let Some(inner) = muxer_error(e) else { return false };
     if let Some(q) = inner.downcast_ref::<libp2p::quic::Error>() {
         return matches!(q, libp2p::quic::Error::Connection(c) if c.closed_by_peer());
     }
@@ -9156,20 +9201,28 @@ mod tests {
     /// The cause the other side sees when a peer closes a connection on purpose over `listen`
     /// (a QUIC or TCP address on loopback), from real swarms.
     async fn cause_seen_when_the_peer_closes(listen: &str) -> Option<libp2p::swarm::ConnectionError> {
+        cause_seen_when_the_peer_closes_as(listen, false).await
+    }
+
+    /// The same, the closer's QUIC built as the agent's (`transport::build_quic_transport`), closing
+    /// as the idle sweep does when `idle` (with the idle close code), or as any other close.
+    async fn cause_seen_when_the_peer_closes_as(listen: &str, idle: bool) -> Option<libp2p::swarm::ConnectionError> {
         use futures::StreamExt;
         use libp2p::swarm::{dummy, SwarmEvent};
-        let build = || {
+        let codes = crate::kad_idle::QuicCloseCodes::default();
+        let build = |codes: Option<crate::kad_idle::QuicCloseCodes>| {
             libp2p::SwarmBuilder::with_new_identity()
                 .with_tokio()
                 .with_tcp(libp2p::tcp::Config::default(), libp2p::noise::Config::new, libp2p::yamux::Config::default)
                 .unwrap()
-                .with_quic()
+                .with_other_transport(|key| crate::transport::build_quic_transport(key, codes).unwrap())
+                .unwrap()
                 .with_behaviour(|_| dummy::Behaviour)
                 .unwrap()
                 .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
                 .build()
         };
-        let (mut a, mut b) = (build(), build());
+        let (mut a, mut b) = (build(Some(codes.clone())), build(None));
         b.listen_on(listen.parse().unwrap()).unwrap();
         let addr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = b.select_next_some().await {
@@ -9183,8 +9236,8 @@ mod tests {
         loop {
             tokio::select! {
                 e = a.select_next_some() => {
-                    if let SwarmEvent::ConnectionEstablished { connection_id, .. } = e {
-                        a_conn = Some(connection_id);
+                    if let SwarmEvent::ConnectionEstablished { connection_id, endpoint, .. } = e {
+                        a_conn = Some((connection_id, endpoint.get_remote_address().clone()));
                     }
                 }
                 e = b.select_next_some() => match e {
@@ -9195,7 +9248,10 @@ mod tests {
                 _ = tokio::time::sleep_until(deadline) => panic!("no close seen over {listen}"),
             }
             if b_up {
-                if let Some(c) = a_conn.take() {
+                if let Some((c, remote)) = a_conn.take() {
+                    if idle {
+                        assert_eq!(codes.close_as_idle(b.local_peer_id(), &remote), remote.to_string().contains("quic"));
+                    }
                     assert!(a.close_connection(c));
                 }
             }
@@ -9215,5 +9271,26 @@ mod tests {
         assert!(!closed_by_peer(Some(&bare)), "not from a muxer");
         let timed_out = ConnectionError::IO(std::io::Error::new(std::io::ErrorKind::Other, "connection timed out"));
         assert!(!closed_by_peer(Some(&timed_out)));
+    }
+
+    /// Over QUIC an idle close carries its own code, and from a peer known to send it only that code
+    /// is an idle close: any other close it meant (a quit) is a loss. Over TCP, which has no code, a
+    /// close the peer meant is idle either way; from a peer not known to send the code, too.
+    #[tokio::test]
+    async fn an_idle_close_is_told_from_a_quit_over_quic() {
+        let quic = "/ip4/127.0.0.1/udp/0/quic-v1";
+        let idle = cause_seen_when_the_peer_closes_as(quic, true).await;
+        assert!(closed_as_idle_by_peer(idle.as_ref(), true), "{idle:?}");
+        assert!(closed_as_idle_by_peer(idle.as_ref(), false), "{idle:?}");
+        let quit = cause_seen_when_the_peer_closes_as(quic, false).await;
+        assert!(!closed_as_idle_by_peer(quit.as_ref(), true), "{quit:?}");
+        assert!(closed_as_idle_by_peer(quit.as_ref(), false), "{quit:?}");
+        for idle in [true, false] {
+            let tcp = cause_seen_when_the_peer_closes_as("/ip4/127.0.0.1/tcp/0", idle).await;
+            assert!(closed_as_idle_by_peer(tcp.as_ref(), true), "{tcp:?}");
+        }
+        assert!(!closed_as_idle_by_peer(None, true));
+        let reset = libp2p::swarm::ConnectionError::IO(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!closed_as_idle_by_peer(Some(&reset), true));
     }
 }

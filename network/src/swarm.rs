@@ -90,6 +90,9 @@ pub struct SwarmOptions {
     /// The addresses this node dials its own provider on ([`crate::pinned`]): shared with the event
     /// loop, and kept out of the routing table.
     pub pinned: crate::pinned::PinnedPeers,
+    /// The code each QUIC connection will be closed with, shared with the event loop's idle sweep
+    /// ([`crate::kad_idle::QuicCloseCodes`]).
+    pub quic_close: crate::kad_idle::QuicCloseCodes,
 }
 
 impl Default for SwarmOptions {
@@ -111,6 +114,7 @@ impl Default for SwarmOptions {
             enable_mdns: true,
             network_id: "public".into(),
             pinned: Default::default(),
+            quic_close: Default::default(),
         }
     }
 }
@@ -235,7 +239,7 @@ pub fn build_swarm(
     let tcp_transport = crate::transport::build_tcp_transport(&keypair)?;
 
     // Transport: QUIC (built-in TLS 1.3 + multiplexing, UDP-based)
-    let quic_transport = crate::transport::build_quic_transport(&keypair)?;
+    let quic_transport = crate::transport::build_quic_transport(&keypair, Some(opts.quic_close.clone()))?;
 
     // Relay client — returns a (Transport, Behaviour) pair.
     // The Transport MUST be combined with the base transport and kept alive;
@@ -395,7 +399,13 @@ pub fn build_swarm(
         identify::Config::new(opts.protocol_version.clone(), keypair.public())
             // Which network we're on (`net=…`), so a node of another one on the same LAN isn't
             // joined to ours (review 2026-10-29).
-            .with_agent_version(format!("openhydra-agent/{} net={} {}", env!("CARGO_PKG_VERSION"), opts.network_id, crate::kad_idle::AGENT_TOKEN))
+            .with_agent_version(format!(
+                "openhydra-agent/{} net={} {} {}",
+                env!("CARGO_PKG_VERSION"),
+                opts.network_id,
+                crate::kad_idle::AGENT_TOKEN,
+                crate::kad_idle::CODE_TOKEN
+            ))
             .with_push_listen_addr_updates(true)
             // No address cache: identify would offer every address a peer claims (its loopback, its
             // LAN) to our dials. The admissible ones reach Kademlia, which offers those (L10).

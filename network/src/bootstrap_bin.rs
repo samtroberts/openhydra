@@ -457,7 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_transport = openhydra_network::transport::build_tcp_transport(&keypair)?;
     // Errors unwrapped, so the dial-failure check can read them (`transport::dial_means_unreachable`).
     let transport = if quic {
-        let quic_transport = openhydra_network::transport::build_quic_transport(&keypair)?;
+        let quic_transport = openhydra_network::transport::build_quic_transport(&keypair, None)?;
         openhydra_network::transport::either_transport(quic_transport, tcp_transport)
     } else {
         tcp_transport

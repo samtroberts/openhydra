@@ -248,6 +248,8 @@ pub fn start_node(
                 .expect("tokio runtime");
             rt.block_on(async move {
                 let bootstrap_peers_for_dial = bootstrap_peers.clone();
+                // Each QUIC connection's close code, so the idle sweep closes with its own (`kad_idle`).
+                let quic_close = crate::kad_idle::QuicCloseCodes::default();
                 let opts = SwarmOptions {
                     listen_addrs,
                     bootstrap_peers,
@@ -258,6 +260,7 @@ pub fn start_node(
                     enable_mdns: mdns_enabled(),
                     network_id,
                     pinned: pinned.clone(),
+                    quic_close: quic_close.clone(),
                 };
 
                 let keypair_for_loop = identity.keypair.clone();
@@ -273,7 +276,7 @@ pub fn start_node(
                             return;
                         }
                         let _ = startup_tx.send(Ok(push));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, peer_rtts_loop, pcp_bind, pinned, app_peers).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, peer_rtts_loop, pcp_bind, pinned, app_peers, quic_close).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {}", crate::transport::error_chain(e.as_ref()))));

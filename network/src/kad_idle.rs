@@ -19,10 +19,11 @@
 //! The six review findings that parked #16 are answered in `docs/IDLE_CLOSE_PLAN_2026-11-21.md`.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
 
 /// How long a Kademlia connection must have gone without Kademlia traffic (and have been open)
 /// before it is closed.
@@ -44,6 +45,100 @@ const MAX_REMEMBERED: usize = 16384;
 /// Whether a peer's identify agent version says it knows idle Kademlia closes ([`AGENT_TOKEN`]).
 pub fn peer_supports(agent_version: &str) -> bool {
     agent_version.split_whitespace().any(|w| w == AGENT_TOKEN)
+}
+
+/// The QUIC application error code an idle close goes out with (25 Nov 2026). Any other close
+/// (code 0: a quit, a close for another reason) isn't one.
+pub const IDLE_CLOSE_CODE: u32 = 0x4f48_1d1e;
+/// Added to identify's agent version, after [`AGENT_TOKEN`], by a node that closes an idle QUIC
+/// connection with [`IDLE_CLOSE_CODE`]. From such a peer only that code is an idle close over QUIC,
+/// so a quit or a crash counts as losing it; from a peer with [`AGENT_TOKEN`] alone (the bootstraps
+/// deployed 24 Nov), any close it meant still counts as idle. TCP has no close code (yamux), so
+/// there a close the peer meant counts as idle either way.
+pub const CODE_TOKEN: &str = "kad-idle-code=1";
+
+/// Whether a peer's identify agent version says it closes idle QUIC connections with
+/// [`IDLE_CLOSE_CODE`] ([`CODE_TOKEN`]).
+pub fn peer_sends_idle_code(agent_version: &str) -> bool {
+    agent_version.split_whitespace().any(|w| w == CODE_TOKEN)
+}
+
+/// The code each of this node's QUIC connections will be closed with, by peer, so the idle sweep
+/// can close one with [`IDLE_CLOSE_CODE`]: the swarm closes a connection by its id and never shows
+/// the QUIC connection behind it, so the transport registers each one here as it comes up
+/// (`transport::build_quic_transport`) and the sweep finds it by the peer and the address.
+#[derive(Clone, Default)]
+pub struct QuicCloseCodes(Arc<Mutex<HashMap<PeerId, Vec<(SocketAddr, libp2p::quic::CloseCode)>>>>);
+
+impl QuicCloseCodes {
+    /// A QUIC connection with `peer` came up.
+    pub fn register(&self, peer: PeerId, connection: &libp2p::quic::Connection) {
+        let mut by_peer = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let codes = by_peer.entry(peer).or_default();
+        codes.retain(|(_, c)| c.in_use());
+        codes.push((connection.remote_address(), connection.close_code()));
+    }
+
+    /// The connection with `peer` at `remote` is about to be closed as idle: it will close with
+    /// [`IDLE_CLOSE_CODE`]. False when `remote` isn't a direct QUIC address or no live connection
+    /// matches it (the close then goes out with code 0, which the peer takes as a loss).
+    pub fn close_as_idle(&self, peer: &PeerId, remote: &Multiaddr) -> bool {
+        let Some(at) = quic_socket_addr(remote) else { return false };
+        let mut by_peer = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(codes) = by_peer.get_mut(peer) else { return false };
+        codes.retain(|(_, c)| c.in_use());
+        let mut set = false;
+        for (addr, code) in codes.iter() {
+            if canonical(*addr) == canonical(at) {
+                code.set(IDLE_CLOSE_CODE);
+                set = true;
+            }
+        }
+        // The peer moved (QUIC follows a NAT rebinding, the swarm's address doesn't): its only
+        // connection is the one.
+        if !set && codes.len() == 1 {
+            codes[0].1.set(IDLE_CLOSE_CODE);
+            set = true;
+        }
+        set
+    }
+
+    /// Forget closed connections, and peers with none left.
+    pub fn prune(&self) {
+        let mut by_peer = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        by_peer.retain(|_, codes| {
+            codes.retain(|(_, c)| c.in_use());
+            !codes.is_empty()
+        });
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().values().map(Vec::len).sum()
+    }
+}
+
+/// The UDP socket address of a direct QUIC multiaddr (`/ip4|ip6/…/udp/…/quic-v1[/p2p/…]`); `None`
+/// for anything else, a relay circuit among them.
+fn quic_socket_addr(addr: &Multiaddr) -> Option<SocketAddr> {
+    use libp2p::multiaddr::Protocol;
+    let mut iter = addr.iter();
+    let ip = match iter.next()? {
+        Protocol::Ip4(ip) => std::net::IpAddr::V4(ip),
+        Protocol::Ip6(ip) => std::net::IpAddr::V6(ip),
+        _ => return None,
+    };
+    let Protocol::Udp(port) = iter.next()? else { return None };
+    let Protocol::QuicV1 = iter.next()? else { return None };
+    match iter.next() {
+        None | Some(Protocol::P2p(_)) if iter.next().is_none() => Some(SocketAddr::new(ip, port)),
+        _ => None,
+    }
+}
+
+/// An IPv4-mapped IPv6 address as IPv4, so a dual-stack socket's view matches the multiaddr's.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// The peers this node has really used lately (sent or served a request, exchanged a push stream),
@@ -172,6 +267,34 @@ pub fn should_close(f: &ConnFacts) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_idle_code_token_is_read_as_its_own_word() {
+        assert!(peer_sends_idle_code("openhydra-agent/0.3.24 net=public kad-idle=1 kad-idle-code=1"));
+        assert!(peer_supports("openhydra-agent/0.3.24 net=public kad-idle=1 kad-idle-code=1"));
+        // The bootstraps deployed 24 Nov: idle closes, but no code.
+        assert!(!peer_sends_idle_code("openhydra-agent/0.3.24 net=public kad-idle=1"));
+        assert!(!peer_sends_idle_code("openhydra-agent/0.3.24 net=public kad-idle-code=10"));
+    }
+
+    #[test]
+    fn only_a_direct_quic_address_names_a_quic_connection() {
+        let at = |s: &str| quic_socket_addr(&s.parse().unwrap());
+        let peer = PeerId::random();
+        assert_eq!(at("/ip4/192.0.2.1/udp/4001/quic-v1"), Some("192.0.2.1:4001".parse().unwrap()));
+        assert_eq!(at(&format!("/ip6/2001:db8::1/udp/4001/quic-v1/p2p/{peer}")), Some("[2001:db8::1]:4001".parse().unwrap()));
+        assert_eq!(at("/ip4/192.0.2.1/tcp/4001"), None);
+        assert_eq!(at("/ip4/192.0.2.1/udp/4001/quic"), None);
+        assert_eq!(at(&format!("/ip4/192.0.2.1/udp/4001/quic-v1/p2p/{peer}/p2p-circuit/p2p/{peer}")), None);
+        assert_eq!(at("/dns4/example.com/udp/4001/quic-v1"), None);
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:4001".parse().unwrap();
+        assert_eq!(canonical(mapped), "192.0.2.1:4001".parse().unwrap());
+        // Nothing registered: nothing to set, nothing kept.
+        let codes = QuicCloseCodes::default();
+        assert!(!codes.close_as_idle(&peer, &"/ip4/192.0.2.1/udp/4001/quic-v1".parse().unwrap()));
+        codes.prune();
+        assert_eq!(codes.len(), 0);
+    }
 
     fn idle_kad_conn() -> ConnFacts {
         ConnFacts {
