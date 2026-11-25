@@ -927,10 +927,13 @@ struct LoopState {
     kad_announced: HashMap<String, (u64, std::time::Instant)>,
     idle_closes: u64,
     /// Peers with a reservation on our relay server (opt-in peer relay): never closed as idle, a
-    /// close would end their reservation (review 23 Nov).
+    /// close would end their reservation (review 23 Nov). Forgotten when it times out or the peer's
+    /// last connection closes (the relay drops a reservation with its connection, silently).
     relay_reserved: std::collections::HashSet<PeerId>,
-    /// Circuits open through our relay server, per peer at either end: never closed as idle.
-    relay_circuits: HashMap<PeerId, usize>,
+    /// Circuits open through our relay server, per (source, destination): their peers are never
+    /// closed as idle. Per pair, not per peer, so a close the relay reports twice (once as the
+    /// connection goes, once as the circuit's stream fails) can't take a live circuit's count to 0.
+    relay_circuits: HashMap<(PeerId, PeerId), usize>,
     /// The relays this node reserves on and dials others through (`relay::relay_addrs`): its
     /// bootstraps, plus the production relays on the public network.
     relays: Vec<Multiaddr>,
@@ -4926,6 +4929,8 @@ fn handle_swarm_event(
                 }
                 state.kad_idle_peers.remove(&peer_id);
                 state.kad_idle_code_peers.remove(&peer_id);
+                // Its reservation on our relay server ended with its connection (review 25 Nov).
+                state.relay_reserved.remove(&peer_id);
 
                 // E-N3: prune the remaining per-peer maps that keyed off this
                 // peer. These grew unbounded because the disconnect cleanup
@@ -5500,7 +5505,7 @@ fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &m
                 || state.lan_dialer.knows(peer)
                 || mesh.contains(peer)
                 || state.relay_reserved.contains(peer)
-                || state.relay_circuits.get(peer).is_some_and(|n| *n > 0),
+                || state.relay_circuits.keys().any(|(src, dst)| src == peer || dst == peer),
             app_used: state.app_peers.wanted(peer),
             in_flight: false,
         };
@@ -5532,25 +5537,18 @@ fn drive_kad_idle_close(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &m
 /// both ends of every open circuit.
 fn note_relay_server_use(state: &mut LoopState, event: &libp2p::relay::Event) {
     use libp2p::relay::Event as E;
-    let mut circuit = |p: &PeerId, open: bool| {
-        let n = state.relay_circuits.entry(*p).or_default();
-        if open {
-            *n += 1;
-        } else {
-            *n = n.saturating_sub(1);
-        }
-        if *n == 0 {
-            state.relay_circuits.remove(p);
-        }
-    };
     match event {
         E::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
-            circuit(src_peer_id, true);
-            circuit(dst_peer_id, true);
+            *state.relay_circuits.entry((*src_peer_id, *dst_peer_id)).or_default() += 1;
         }
         E::CircuitClosed { src_peer_id, dst_peer_id, .. } => {
-            circuit(src_peer_id, false);
-            circuit(dst_peer_id, false);
+            let pair = (*src_peer_id, *dst_peer_id);
+            if let Some(n) = state.relay_circuits.get_mut(&pair) {
+                *n -= 1;
+                if *n == 0 {
+                    state.relay_circuits.remove(&pair);
+                }
+            }
         }
         E::ReservationReqAccepted { src_peer_id, .. } => {
             state.relay_reserved.insert(*src_peer_id);
@@ -9256,6 +9254,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A circuit close the relay reports twice (review 25 Nov) doesn't end another circuit's hold on
+    /// a peer; the last real close does.
+    #[test]
+    fn a_doubled_circuit_close_leaves_other_circuits_counted() {
+        use libp2p::relay::Event as E;
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut state = LoopState::new();
+        let kept = |s: &LoopState, p: &PeerId| s.relay_circuits.keys().any(|(x, y)| x == p || y == p);
+        note_relay_server_use(&mut state, &E::CircuitReqAccepted { src_peer_id: a, dst_peer_id: b });
+        note_relay_server_use(&mut state, &E::CircuitReqAccepted { src_peer_id: a, dst_peer_id: c });
+        for _ in 0..2 {
+            note_relay_server_use(&mut state, &E::CircuitClosed { src_peer_id: a, dst_peer_id: b, error: None });
+        }
+        assert!(kept(&state, &a) && kept(&state, &c) && !kept(&state, &b));
+        note_relay_server_use(&mut state, &E::CircuitClosed { src_peer_id: a, dst_peer_id: c, error: None });
+        assert!(state.relay_circuits.is_empty());
     }
 
     #[tokio::test]

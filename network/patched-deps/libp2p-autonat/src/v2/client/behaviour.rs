@@ -128,11 +128,16 @@ where
             // OpenHydra patch (25 Nov 2026): a confirmed address that expires (a network change, a
             // Wi-Fi blip, sleep) is tested again. Upstream marks a candidate tested once for good,
             // so a node whose public address came back unchanged was never confirmed again and
-            // stayed a Kademlia client until restarted.
+            // stayed a Kademlia client until restarted. Only a confirmed one (review 25 Nov): the
+            // node also expires an address a probe just found unreachable, which must not be
+            // probed again at once nor restart the fast window, and a probe still in flight keeps
+            // its nonce.
             FromSwarm::ExternalAddrExpired(libp2p_swarm::behaviour::ExternalAddrExpired { addr }) => {
                 if let Some(info) = self.address_candidates.get_mut(addr) {
-                    info.status = TestStatus::Untested;
-                    self.oh_start_fast_window();
+                    if matches!(info.status, TestStatus::Received(_)) {
+                        info.status = TestStatus::Untested;
+                        self.oh_start_fast_window();
+                    }
                 }
             }
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
@@ -475,4 +480,34 @@ enum TestStatus {
     Pending(Nonce),
     Failed,
     Received(Nonce),
+}
+
+#[cfg(test)]
+mod openhydra_patch_tests {
+    use super::*;
+    use libp2p_swarm::behaviour::{ExternalAddrExpired, NewExternalAddrCandidate};
+
+    /// An expired address is tested again only if it had been confirmed (review 25 Nov): one a
+    /// probe found unreachable, which the node then expires, stays failed and doesn't restart the
+    /// fast window.
+    #[test]
+    fn only_a_confirmed_address_is_tested_again_when_it_expires() {
+        let mut client = Behaviour::new(rand::rngs::OsRng, Config::default());
+        let (confirmed, failed): (Multiaddr, Multiaddr) =
+            ("/ip4/203.0.113.1/tcp/4001".parse().unwrap(), "/ip4/203.0.113.2/tcp/4001".parse().unwrap());
+        for addr in [&confirmed, &failed] {
+            client.on_swarm_event(FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr }));
+        }
+        client.validate_addr(&confirmed);
+        client.address_candidates.get_mut(&failed).unwrap().status = TestStatus::Failed;
+        client.oh_fast_until = std::time::Instant::now();
+
+        client.on_swarm_event(FromSwarm::ExternalAddrExpired(ExternalAddrExpired { addr: &failed }));
+        assert!(matches!(client.address_candidates[&failed].status, TestStatus::Failed));
+        assert!(client.oh_fast_until <= std::time::Instant::now(), "no fast window for a failed address");
+
+        client.on_swarm_event(FromSwarm::ExternalAddrExpired(ExternalAddrExpired { addr: &confirmed }));
+        assert!(matches!(client.address_candidates[&confirmed].status, TestStatus::Untested));
+        assert!(client.oh_fast_until > std::time::Instant::now());
+    }
 }

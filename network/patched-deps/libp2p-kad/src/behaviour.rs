@@ -1213,6 +1213,7 @@ where
     {
         let local_id = self.kbuckets.local_key().preimage();
         let others_iter = peers.filter(|p| &p.node_id != local_id);
+        let filter = self.address_filter.clone();
         if let Some(query) = self.queries.get_mut(query_id) {
             tracing::trace!(peer=%source, query=?query_id, "Request to peer in query succeeded");
             for peer in others_iter.clone() {
@@ -1225,11 +1226,16 @@ where
                 // OpenHydra patch (25 Nov 2026): merge with what earlier answers gave, not replace it
                 // (upstream overwrote, so a later answer listing only a relay circuit, which the
                 // address filter then drops, left a peer with no address to dial). At most
-                // OH_MAX_QUERY_ADDRS per peer, the first ones kept.
+                // OH_MAX_QUERY_ADDRS per peer, the first ones kept. Only addresses the filter
+                // allows count (review 25 Nov: an answer of 16 circuits or private addresses filled
+                // the cap and shut out a later answer's direct one).
                 let known = query.peers.addresses.entry(peer.node_id).or_default();
                 for a in &peer.multiaddrs {
                     if known.len() >= OH_MAX_QUERY_ADDRS {
                         break;
+                    }
+                    if filter.as_ref().is_some_and(|f| !f.allows(&peer.node_id, a)) {
+                        continue;
                     }
                     if !known.contains(a) {
                         known.push(a.clone());
@@ -3647,4 +3653,40 @@ fn oh_note_activity(activity: &mut HashMap<PeerId, std::time::Instant>, peer: Pe
         }
     }
     activity.insert(peer, now);
+}
+
+#[cfg(test)]
+mod openhydra_patch_tests {
+    use super::*;
+    use crate::record::store::MemoryStore;
+
+    /// Answers' addresses merge, up to the cap, and only those the address filter allows count
+    /// toward it (review 25 Nov): an answer full of circuits doesn't shut out a later direct one.
+    #[test]
+    fn filtered_addresses_dont_fill_a_peers_query_addresses() {
+        let me = PeerId::random();
+        let mut config = Config::new(crate::PROTOCOL_NAME);
+        config.set_address_filter(AddressFilter::new(|_, a| {
+            !a.iter().any(|p| matches!(p, libp2p_core::multiaddr::Protocol::P2pCircuit))
+        }));
+        let mut kad = Behaviour::with_config(me, MemoryStore::new(me), config);
+        let query = kad.get_closest_peers(PeerId::random());
+        let (source, peer, relay) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let answer = |addrs: Vec<Multiaddr>| KadPeer { node_id: peer, multiaddrs: addrs, connection_ty: ConnectionType::NotConnected };
+        let circuits: Vec<Multiaddr> = (0..20)
+            .map(|i| format!("/ip4/198.51.100.{i}/tcp/4001/p2p/{relay}/p2p-circuit").parse().unwrap())
+            .collect();
+        let first = [answer(circuits)];
+        kad.discovered(&query, &source, first.iter());
+        let direct: Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1".parse().unwrap();
+        let second = [answer(vec![direct.clone()])];
+        kad.discovered(&query, &source, second.iter());
+        let kept = kad.queries.get(&query).unwrap().peers.addresses.get(&peer).cloned().unwrap_or_default();
+        assert_eq!(kept.to_vec(), vec![direct]);
+        // Allowed addresses still stop at the cap.
+        let many: Vec<Multiaddr> = (0..40).map(|i| format!("/ip4/203.0.113.{i}/tcp/4001").parse().unwrap()).collect();
+        let third = [answer(many)];
+        kad.discovered(&query, &source, third.iter());
+        assert_eq!(kad.queries.get(&query).unwrap().peers.addresses.get(&peer).unwrap().len(), OH_MAX_QUERY_ADDRS);
+    }
 }

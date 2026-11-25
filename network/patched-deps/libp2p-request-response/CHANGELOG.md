@@ -3,6 +3,9 @@
 - `Behaviour::oh_receiving_from(peer)`: whether a request from the peer is still arriving (its stream
   open, the request not yet read), which nothing else shows until it is complete; OpenHydra's idle
   sweep must not close a connection while one comes in.
+  The notice goes out before any result of the request's read (review 25 Nov: a read that failed at
+  once was reported first, and the notice then left an entry that only the connection's close
+  removed, so any peer could keep its connections from ever being closed as idle).
 
 ## 0.27.0 (OpenHydra patch)
 

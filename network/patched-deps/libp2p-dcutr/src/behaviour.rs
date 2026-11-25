@@ -139,7 +139,10 @@ impl Behaviour {
         // with its longer limits, is still connecting; when that one lands we already hold a direct
         // connection. Retrying then only duplicated dials, and running out of attempts reported a
         // failed punch beside a working direct connection. Count it as the punch's success instead.
-        if let Some(&direct) = self.direct_connections.get(&peer_id).and_then(|c| c.iter().next()) {
+        // Only a connection newer than the relayed one (review 25 Nov): an older direct one is the
+        // stale link the peer came back by relay to replace, and taking it for the punch's result
+        // skipped the retries, leaving only the relay once it timed out.
+        if let Some(direct) = self.oh_direct_since(peer_id, *relayed_connection_id) {
             let relayed = *relayed_connection_id;
             self.outgoing_direct_connection_attempts.remove(&(relayed, peer_id));
             self.queued_events.extend([ToSwarm::GenerateEvent(Event {
@@ -163,6 +166,12 @@ impl Behaviour {
                 }),
             })]);
         }
+    }
+
+    /// OpenHydra patch: the newest direct connection to `peer` opened after `relayed`
+    /// (`ConnectionId`s come from one rising counter).
+    fn oh_direct_since(&self, peer: PeerId, relayed: ConnectionId) -> Option<ConnectionId> {
+        self.direct_connections.get(&peer)?.iter().copied().filter(|c| *c > relayed).max()
     }
 
     fn on_connection_closed(
@@ -496,6 +505,21 @@ fn is_relayed(addr: &Multiaddr) -> bool {
 #[cfg(test)]
 mod openhydra_patch_tests {
     use super::*;
+
+    #[test]
+    fn only_a_direct_connection_newer_than_the_relayed_one_counts_as_the_punch() {
+        let peer: PeerId = "12D3KooWAbLYyX4tHc1TZSBj5hT8nXMYZ1oZMJ5htJGkfBqn2mmr".parse().unwrap();
+        let me: PeerId = "12D3KooWEL5wuLYgmM2yWhDFTb6UyrQvjXaSNZ9MRLEXuCfAiw2a".parse().unwrap();
+        let mut b = Behaviour::new(me);
+        let id = ConnectionId::new_unchecked;
+        assert_eq!(b.oh_direct_since(peer, id(10)), None);
+        // The stale link the peer came back by relay to replace.
+        b.direct_connections.entry(peer).or_default().insert(id(5));
+        assert_eq!(b.oh_direct_since(peer, id(10)), None);
+        // The other side's dial got through after the relayed connection: the newest one counts.
+        b.direct_connections.entry(peer).or_default().extend([id(12), id(14)]);
+        assert_eq!(b.oh_direct_since(peer, id(10)), Some(id(14)));
+    }
 
     fn addrs(c: &Candidates) -> Vec<String> {
         let mut v: Vec<String> = c.iter().map(|a| a.to_string()).collect();

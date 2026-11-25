@@ -3,6 +3,8 @@
 - When our hole-punch dial fails but a direct connection to the peer already exists (the other
   side's dial, with longer limits, got through), the punch counts as a success on that connection:
   no retry (it only duplicated dials) and no failed punch beside a working direct connection.
+  Only a direct connection opened after the relayed one counts (review 25 Nov): an older one is the
+  stale link the peer came back by relay to replace.
 - The retrying side's hole-punch dial gives each address 5 round trips of the CONNECT exchange,
   3-8 s (`DialOpts::with_attempt_timeout`, our patched libp2p-swarm; feature `openhydra-swarm`, on
   by default).

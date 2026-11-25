@@ -2,8 +2,9 @@
 
 - Query dials and the bucket-full liveness dials go only to the addresses Kademlia holds (routing
   table, the query's answers), through the address filter (no relay circuits from other behaviours).
-- A query merges the addresses each answer gives a peer (at most 16) instead of keeping only the
-  last answer's; the second phase of `put_record` / `start_providing` keeps the first phase's.
+- A query merges the addresses each answer gives a peer (at most 16, counting only those the address
+  filter allows) instead of keeping only the last answer's; the second phase of `put_record` /
+  `start_providing` keeps the first phase's.
 - Bookkeeping for closing idle Kademlia connections (which connections Kademlia dialled, last
   activity per peer, bounded) and `MemoryStore::oh_sizes()`.
 

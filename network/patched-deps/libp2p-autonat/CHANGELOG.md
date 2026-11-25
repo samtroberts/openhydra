@@ -5,7 +5,8 @@ Vendored from crates.io `libp2p-autonat` 0.13.0 (MIT, unchanged apart from this)
 - A confirmed address that expires (`FromSwarm::ExternalAddrExpired`: a network change, a Wi-Fi
   blip, sleep) is tested again. Upstream marks a candidate tested for good, so a node whose public
   address came back unchanged was never confirmed again and stayed a Kademlia client until
-  restarted.
+  restarted. Only a confirmed one: an address the node expires because a probe found it unreachable
+  stays failed (review 25 Nov: it was probed again at once and restarted the fast window).
 - Probes run every 10 s for the first 2 minutes after start and after such an expiry, then at the
   configured interval (OpenHydra uses 60 s). A node is promoted to a Kademlia server only once a
   probe confirms it; at 60 s that took 60-120 s after start instead of 5-10 s.

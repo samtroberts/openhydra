@@ -59,6 +59,11 @@ where
     codec: TCodec,
     /// Queue of events to emit in `poll()`.
     pending_events: VecDeque<Event<TCodec>>,
+    /// OpenHydra patch: `OhInboundReading` notices, emitted before any worker result, so the
+    /// behaviour always hears a request is arriving before it hears how its read ended (review 25
+    /// Nov: a read failing on its first poll was reported first, and the later notice left an entry
+    /// nothing removed).
+    oh_reading_events: VecDeque<Event<TCodec>>,
     /// Outbound upgrades waiting to be emitted as an `OutboundSubstreamRequest`.
     pending_outbound: VecDeque<OutboundMessage<TCodec>>,
 
@@ -107,6 +112,7 @@ where
             inbound_receiver,
             inbound_sender,
             pending_events: VecDeque::new(),
+            oh_reading_events: VecDeque::new(),
             inbound_request_id,
             worker_streams: futures_bounded::FuturesMap::new(
                 substream_timeout,
@@ -170,7 +176,7 @@ where
             tracing::warn!("Dropping inbound stream because we are at capacity")
         } else {
             // OpenHydra patch: tell the behaviour a request is arriving (`Behaviour::oh_receiving_from`).
-            self.pending_events.push_back(Event::OhInboundReading(request_id));
+            self.oh_reading_events.push_back(Event::OhInboundReading(request_id));
         }
     }
 
@@ -405,6 +411,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ConnectionHandlerEvent<Protocol<TCodec::Protocol>, (), Self::ToBehaviour>> {
+        // OpenHydra patch: before any worker result (see `oh_reading_events`).
+        if let Some(event) = self.oh_reading_events.pop_front() {
+            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
+        }
         match self.worker_streams.poll_unpin(cx) {
             Poll::Ready((_, Ok(Ok(event)))) => {
                 return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
