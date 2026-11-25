@@ -82,7 +82,7 @@ prost-build = "0.13"
 tempfile = "3"
 # tests/mdns_discovery.rs reads the mDNS packets on the wire: the same DNS crate and features the
 # mDNS behaviour uses, and the socket options to share port 5353.
-hickory-proto = { version = "0.24.4", default-features = false, features = ["mdns"] }
+hickory-proto = { version = "0.26.2", default-features = false, features = ["mdns", "std"] }
 socket2 = { version = "0.5.10", features = ["all"] }
 # tests/quic_peer_certificate.rs makes a libp2p TLS certificate (already in the tree through libp2p-quic).
 libp2p-tls = "=0.5.0"

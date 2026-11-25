@@ -67,9 +67,9 @@ fn wire_listener(packets: Arc<Mutex<Vec<Packet>>>) {
             let at = Instant::now();
             let Ok(msg) = hickory_proto::op::Message::from_vec(&buf[..n]) else { continue };
             let mut peers = Vec::new();
-            for record in msg.answers().iter().chain(msg.additionals()) {
-                if let Some(hickory_proto::rr::RData::TXT(txt)) = record.data() {
-                    for part in txt.iter() {
+            for record in msg.answers.iter().chain(&msg.additionals) {
+                if let hickory_proto::rr::RData::TXT(txt) = &record.data {
+                    for part in txt.txt_data.iter() {
                         let s = String::from_utf8_lossy(part);
                         if let Some(id) = s.rsplit("/p2p/").next().filter(|_| s.contains("/p2p/")) {
                             if let Ok(p) = id.parse::<PeerId>() {
@@ -79,7 +79,7 @@ fn wire_listener(packets: Arc<Mutex<Vec<Packet>>>) {
                     }
                 }
             }
-            packets.lock().unwrap().push(Packet { at, query: !msg.queries().is_empty(), peers, len: n });
+            packets.lock().unwrap().push(Packet { at, query: !msg.queries.is_empty(), peers, len: n });
         }
     });
 }

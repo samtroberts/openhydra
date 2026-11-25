@@ -24,11 +24,13 @@ ignore = [
     "RUSTSEC-2026-0367", # zip 4 SUID bits kept on extract — desktop only, via tauri-plugin-updater 2.10 (latest), which unzips an update only after verifying its signature against our key; fix = updater on zip >=9
     "RUSTSEC-2026-0368", # zip 4 symlink targets outside the destination — same path and reason as -0367
     "RUSTSEC-2026-0369", # zip 4 ZipStreamReader — same path and reason as -0367
-    # hickory-proto 0.24.4 / hickory-resolver 0.24.4 (23 Nov 2026). hickory-proto is used only by our
-    # patched libp2p-mdns, which decodes LAN packets from the binary wire format and never validates
-    # DNSSEC; hickory-resolver is in the lockfile through libp2p-dns but is never compiled. All are fixed
-    # only in 0.26.2 (or not at all), which needs a libp2p upgrade.
-    "RUSTSEC-2026-0491", # wire decode reserves memory for the header's record counts (~18 MB per packet) — MITIGATED: patched libp2p-mdns drops a packet whose header claims more than it can hold (query.rs header_counts_fit)
+    # hickory-proto 0.24.4 / hickory-resolver 0.24.4 — in the lockfile, NEVER COMPILED (25 Nov 2026).
+    # Our patched libp2p-mdns, the only code that decodes DNS, now uses hickory-proto 0.26 (fixed).
+    # 0.24.4 stays in Cargo.lock only because libp2p 0.54's `tokio` feature names `libp2p-dns?/tokio`:
+    # Cargo locks an optional dependency a weak feature names even when nothing enables it
+    # (`cargo tree -i libp2p-dns --target all` prints nothing). libp2p-dns pulls hickory-resolver,
+    # which pulls hickory-proto 0.24. Fixed only in 0.26.2 (or not at all); leaves with a libp2p upgrade.
+    "RUSTSEC-2026-0491", # wire decode reserves memory for the header's record counts — not compiled; the mDNS decoder is on 0.26 (and keeps query.rs header_counts_fit)
     "RUSTSEC-2026-0487", # SVCB/HTTPS alpn panic — text/zone-file parsing only, not wire decoding
     "RUSTSEC-2026-0489", # SVCB/HTTPS lone-quote panic — text/zone-file parsing only, not wire decoding
     "RUSTSEC-2026-0490", # zone-file lexer assert on a 4096+ character token — zone files only

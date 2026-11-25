@@ -35,6 +35,9 @@ libp2p-request-response = { path = "../../network/patched-deps/libp2p-request-re
 libp2p-swarm = { path = "../../network/patched-deps/libp2p-swarm" }
 # A reply's tokens are pushed on a stream of their own (#4); see its CHANGELOG.md.
 libp2p-stream = { path = "../../network/patched-deps/libp2p-stream" }
+# An expired address is tested again, with fast probes after start (see its CHANGELOG.md); same
+# reason.
+libp2p-autonat = { path = "../../network/patched-deps/libp2p-autonat" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

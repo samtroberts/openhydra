@@ -11,7 +11,7 @@
 
 [package]
 edition = "2021"
-rust-version = "1.75.0"
+rust-version = "1.88" # OpenHydra: hickory-proto 0.26 needs 1.88 (upstream 1.75.0)
 name = "libp2p-mdns"
 version = "0.46.0"
 authors = ["Parity Technologies <admin@parity.io>"]
@@ -53,9 +53,12 @@ version = "2.6.0"
 [dependencies.futures]
 version = "0.3.30"
 
+# OpenHydra: hickory-proto 0.26 (upstream libp2p-mdns 0.46 uses 0.24), which fixes RUSTSEC-2026-0491
+# (wire decode reserved memory for the header's record counts) and the other 0.24 advisories. "std"
+# is the default feature, kept: 0.26 builds without it only for no_std targets.
 [dependencies.hickory-proto]
-version = "0.24.1"
-features = ["mdns"]
+version = "0.26.2"
+features = ["mdns", "std"]
 default-features = false
 
 [dependencies.if-watch]

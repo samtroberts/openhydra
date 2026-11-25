@@ -446,8 +446,8 @@ mod tests {
             for packet in &packets {
                 assert!(packet.len() <= MAX_PACKET_SIZE, "{} bytes", packet.len());
                 let message = Message::from_vec(packet).expect("a complete response");
-                assert_eq!(message.answers().len(), 1);
-                seen += message.additionals().len();
+                assert_eq!(message.answers.len(), 1);
+                seen += message.additionals.len();
             }
             assert_eq!(seen, addrs.len());
         }

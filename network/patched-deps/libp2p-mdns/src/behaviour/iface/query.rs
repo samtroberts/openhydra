@@ -23,6 +23,7 @@ use crate::{META_QUERY_SERVICE_FQDN, SERVICE_NAME_FQDN};
 use hickory_proto::{
     op::Message,
     rr::{Name, RData},
+    serialize::binary::DecodeError,
 };
 use libp2p_core::multiaddr::{Multiaddr, Protocol};
 use libp2p_swarm::_address_translation;
@@ -46,36 +47,38 @@ impl MdnsPacket {
     pub(crate) fn new_from_bytes(
         buf: &[u8],
         from: SocketAddr,
-    ) -> Result<Option<MdnsPacket>, hickory_proto::error::ProtoError> {
-        if !header_counts_fit(buf) {
+    ) -> Result<Option<MdnsPacket>, DecodeError> {
+        if !header_counts_fit(buf) || !standard_opcode(buf) {
             return Ok(None);
         }
         let packet = Message::from_vec(buf)?;
 
-        if packet.query().is_none() {
+        // A packet with no question is taken as a response (under hickory-proto 0.24 this read
+        // `packet.query().is_none()`, `query()` being the first question).
+        if packet.queries.is_empty() {
             return Ok(Some(MdnsPacket::Response(MdnsResponse::new(&packet, from))));
         }
 
         if packet
-            .queries()
+            .queries
             .iter()
-            .any(|q| q.name().to_utf8() == SERVICE_NAME_FQDN)
+            .any(|q| q.name.to_utf8() == SERVICE_NAME_FQDN)
         {
             return Ok(Some(MdnsPacket::Query(MdnsQuery {
                 from,
-                query_id: packet.header().id(),
+                query_id: packet.metadata.id,
             })));
         }
 
         if packet
-            .queries()
+            .queries
             .iter()
-            .any(|q| q.name().to_utf8() == META_QUERY_SERVICE_FQDN)
+            .any(|q| q.name.to_utf8() == META_QUERY_SERVICE_FQDN)
         {
             // TODO: what if multiple questions, one with SERVICE_NAME and one with META_QUERY_SERVICE?
             return Ok(Some(MdnsPacket::ServiceDiscovery(MdnsServiceDiscovery {
                 from,
-                query_id: packet.header().id(),
+                query_id: packet.metadata.id,
             })));
         }
 
@@ -151,18 +154,18 @@ impl MdnsResponse {
     /// Creates a new `MdnsResponse` based on the provided `Packet`.
     pub(crate) fn new(packet: &Message, from: SocketAddr) -> MdnsResponse {
         let peers = packet
-            .answers()
+            .answers
             .iter()
             .filter_map(|record| {
-                if record.name().to_string() != SERVICE_NAME_FQDN {
+                if record.name.to_string() != SERVICE_NAME_FQDN {
                     return None;
                 }
 
-                let RData::PTR(record_value) = record.data()? else {
+                let RData::PTR(record_value) = &record.data else {
                     return None;
                 };
 
-                MdnsPeer::new(packet, record_value, record.ttl())
+                MdnsPeer::new(packet, record_value, record.ttl)
             })
             .collect();
 
@@ -240,20 +243,20 @@ impl MdnsPeer {
     pub(crate) fn new(packet: &Message, record_value: &Name, ttl: u32) -> Option<MdnsPeer> {
         let mut my_peer_id: Option<PeerId> = None;
         let addrs = packet
-            .additionals()
+            .additionals
             .iter()
             .filter_map(|add_record| {
-                if add_record.name() != record_value {
+                if &add_record.name != record_value {
                     return None;
                 }
 
-                if let Some(RData::TXT(ref txt)) = add_record.data() {
+                if let RData::TXT(txt) = &add_record.data {
                     Some(txt)
                 } else {
                     None
                 }
             })
-            .flat_map(|txt| txt.iter())
+            .flat_map(|txt| txt.txt_data.iter())
             .filter_map(|txt| {
                 // TODO: wrong, txt can be multiple character strings
                 let addr = dns::decode_character_string(txt).ok()?;
@@ -321,7 +324,16 @@ impl fmt::Debug for MdnsPeer {
 /// send mDNS packets. On the wire a question takes at least 5 bytes (a 1-byte root name, type,
 /// class) and a record at least 11 (name, type, class, TTL, data length), so a header claiming more
 /// than its packet can hold is dropped unread. A packet too short for a header is left to the
-/// decoder, which refuses it. The fix upstream is hickory-proto 0.26.2 (a libp2p upgrade).
+/// decoder, which refuses it. hickory-proto 0.26.2, which this crate now uses, fixes the decoder
+/// itself; the check stays as a cheap pre-filter.
+/// OpenHydra patch (25 Nov 2026): whether the header's OPCODE is 0, a standard query or response.
+/// RFC 6762 §18.3: mDNS messages with any other opcode MUST be silently ignored. hickory-proto 0.24
+/// refused some opcodes as errors and accepted others; 0.26 accepts them all. Too short for a header:
+/// left to the decoder, which refuses it.
+fn standard_opcode(buf: &[u8]) -> bool {
+    buf.len() < 12 || (buf[2] >> 3) & 0x0f == 0
+}
+
 fn header_counts_fit(buf: &[u8]) -> bool {
     if buf.len() < 12 {
         return true;
@@ -359,6 +371,69 @@ mod tests {
         assert!(MdnsPacket::new_from_bytes(&[0u8; 5], from).is_err());
     }
 
+    // OpenHydra: a packet with a non-zero opcode is ignored (RFC 6762 §18.3), our query among them.
+    #[test]
+    fn a_packet_with_a_non_zero_opcode_is_ignored() {
+        let from: SocketAddr = "192.0.2.7:5353".parse().unwrap();
+        for opcode in [1u8, 2, 4, 5, 7, 15] {
+            let mut query = super::super::dns::build_query();
+            query[2] = (query[2] & !0x78) | (opcode << 3);
+            assert!(matches!(MdnsPacket::new_from_bytes(&query, from), Ok(None)), "opcode {opcode}");
+        }
+        assert!(matches!(
+            MdnsPacket::new_from_bytes(&super::super::dns::build_query(), from),
+            Ok(Some(MdnsPacket::Query(_)))
+        ));
+    }
+
+    // OpenHydra: the hickory-proto 0.26 port reads the sections through new accessors; a query for
+    // our service, a service-discovery query and a response are each still told apart.
+    #[test]
+    fn queries_and_responses_are_told_apart() {
+        let from: SocketAddr = "192.0.2.7:5353".parse().unwrap();
+        assert!(matches!(
+            MdnsPacket::new_from_bytes(&super::super::dns::build_query(), from),
+            Ok(Some(MdnsPacket::Query(_)))
+        ));
+        let peer_id = PeerId::random();
+        let addr: Multiaddr = "/ip4/1.2.3.4/tcp/5000".parse().unwrap();
+        for packet in build_query_response(0x1234, peer_id, vec![&addr], Duration::from_secs(60)) {
+            let Ok(Some(MdnsPacket::Response(response))) = MdnsPacket::new_from_bytes(&packet, from) else {
+                panic!("not a response");
+            };
+            assert_eq!(response.discovered_peers().count(), 1);
+        }
+        let discovery = super::super::dns::build_service_discovery_response(0x1234, Duration::from_secs(60));
+        assert!(matches!(
+            MdnsPacket::new_from_bytes(&discovery, from),
+            Ok(Some(MdnsPacket::Response(_)))
+        ));
+        // A service-discovery query: our query with the meta-query name in place of the service's.
+        let query = super::super::dns::build_query();
+        let service = SERVICE_NAME_FQDN.trim_end_matches('.');
+        let meta = META_QUERY_SERVICE_FQDN.trim_end_matches('.');
+        let mut name = Vec::new();
+        for label in service.split('.') {
+            name.push(label.len() as u8);
+            name.extend_from_slice(label.as_bytes());
+        }
+        name.push(0);
+        let mut meta_name = Vec::new();
+        for label in meta.split('.') {
+            meta_name.push(label.len() as u8);
+            meta_name.extend_from_slice(label.as_bytes());
+        }
+        meta_name.push(0);
+        let at = query.windows(name.len()).position(|w| w == name.as_slice()).expect("service name in query");
+        let mut meta_query = query[..at].to_vec();
+        meta_query.extend_from_slice(&meta_name);
+        meta_query.extend_from_slice(&query[at + name.len()..]);
+        assert!(matches!(
+            MdnsPacket::new_from_bytes(&meta_query, from),
+            Ok(Some(MdnsPacket::ServiceDiscovery(_)))
+        ));
+    }
+
     #[test]
     fn test_create_mdns_peer() {
         let ttl = 300;
@@ -379,13 +454,13 @@ mod tests {
         for bytes in packets {
             let packet = Message::from_vec(&bytes).expect("unable to parse packet");
             let record_value = packet
-                .answers()
+                .answers
                 .iter()
                 .filter_map(|record| {
-                    if record.name().to_utf8() != SERVICE_NAME_FQDN {
+                    if record.name.to_utf8() != SERVICE_NAME_FQDN {
                         return None;
                     }
-                    let Some(RData::PTR(record_value)) = record.data() else {
+                    let RData::PTR(record_value) = &record.data else {
                         return None;
                     };
                     Some(record_value)

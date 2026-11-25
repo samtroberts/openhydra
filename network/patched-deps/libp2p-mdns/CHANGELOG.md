@@ -19,10 +19,22 @@ parse ("rdata length too large for remaining bytes").
 - (2026-10-29) Announce at most once a second per interface (RFC 6762 section 6.2): a change within
   a second of the last announcement waits for the one-second mark and goes out then, with the
   newest set, so a burst of changes costs a few packets.
+- (2026-11-23) Drop a packet whose header claims more questions and records than its bytes can
+  hold, before decoding it (RUSTSEC-2026-0491: hickory-proto 0.24 reserved memory for the claimed
+  counts, ~18 MB for a 12-byte packet from any device on the LAN).
+- (2026-11-25) Decode with hickory-proto 0.26 (≥ 0.26.2) instead of 0.24, which fixes
+  RUSTSEC-2026-0491 at its source and the other 0.24 advisories. The header check above is kept as
+  a cheap pre-filter. Packets are classified as before (a packet with no question is a response),
+  and peers, addresses and TTLs are read as before, for every packet libp2p sends and the LAN
+  traffic checked (review 25 Nov: 0.24 and 0.26 compared side by side over fuzzed and captured
+  packets). 0.26 differs on three unusual packets: one carrying a record with empty data, or an OPT
+  record outside the additional section, is now refused whole (0.24 skipped the record); one with a
+  non-zero opcode is now ignored (RFC 6762 §18.3; 0.24 refused some opcodes and answered others).
+  The minimum Rust version becomes 1.88, hickory-proto 0.26's.
 
 Packaging: `Cargo.toml.orig` is upstream's manifest as published, kept to show what the vendored
-`Cargo.toml` changed (an empty `[workspace]`, so the tests run on their own, and test-only
-`libp2p-identity` features); `Cargo.lock` is for running those tests (`cargo test --locked`).
+`Cargo.toml` changed (an empty `[workspace]`, so the tests run on their own, test-only
+`libp2p-identity` features, and hickory-proto 0.26); `Cargo.lock` is for running those tests (`cargo test --locked`).
 
 Drop this patch when moving to a libp2p-mdns that has all of these.
 
